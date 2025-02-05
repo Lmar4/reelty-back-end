@@ -1,0 +1,87 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String          @id @default(uuid()) @db.Uuid
+  email            String          @unique
+  name             String
+  subscriptionTier String          @map("subscription_tier")
+  fcmToken         String?         @map("fcm_token")
+  createdAt        DateTime        @default(now()) @map("created_at")
+  updatedAt        DateTime        @updatedAt @map("updated_at")
+  listingCredits   ListingCredit[]
+  listings         Listing[]
+  videoJobs        VideoJob[]
+
+  @@map("users")
+}
+
+model SubscriptionTier {
+  id          String   @id @map("tier_name")
+  description String
+  pricing     Decimal  @db.Decimal(10, 2) @default(0.00)
+  features    Json
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("subscription_tiers")
+}
+
+model ListingCredit {
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  creditsRemaining Int       @default(0) @map("credits_remaining")
+  purchaseDate     DateTime  @default(now()) @map("purchase_date")
+  expiryDate       DateTime  @map("expiry_date")
+  user             User      @relation(fields: [userId], references: [id])
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  @@map("listing_credits")
+}
+
+model Listing {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  address     String
+  photoLimit  Int      @default(20) @map("photo_limit")
+  photos      Photo[]
+  videoJobs   VideoJob[]
+  user        User     @relation(fields: [userId], references: [id])
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("listings")
+}
+
+model Photo {
+  id          String   @id @default(uuid()) @db.Uuid
+  listingId   String   @map("listing_id") @db.Uuid
+  filePath    String   @map("file_path")
+  uploadedAt  DateTime @default(now()) @map("uploaded_at")
+  listing     Listing  @relation(fields: [listingId], references: [id])
+
+  @@map("photos")
+}
+
+model VideoJob {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  listingId   String    @map("listing_id") @db.Uuid
+  inputFiles  Json      @map("input_files")
+  outputFile  String?   @map("output_file")
+  template    String    @default("crescendo")
+  status      String    @default("pending")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  user        User      @relation(fields: [userId], references: [id])
+  listing     Listing   @relation(fields: [listingId], references: [id])
+
+  @@map("video_jobs")
+}
