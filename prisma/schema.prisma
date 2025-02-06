@@ -85,3 +85,16 @@ model VideoJob {
 
   @@map("video_jobs")
 }
+
+model TempUpload {
+  id        String   @id @default(uuid())
+  sessionId String   @unique
+  files     Json     // Array of file objects
+  address   String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sessionId])
+  @@index([expiresAt])
+}

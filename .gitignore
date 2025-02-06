@@ -52,3 +52,4 @@ coverage/
 *.zip
 
 .cursorrules
+.aider*
