@@ -1,69 +1,83 @@
 import { z } from "zod";
-import { router, publicProcedure, protectedProcedure } from "../types";
+import { getRouteUtils } from "./routeHelper";
 import { prisma } from "../../lib/prisma";
 
-export const userRouter = router({
-  getUser: protectedProcedure
-    .input(z.object({ id: z.string().uuid() }))
-    .query(async ({ input, ctx }) => {
-      // Verify user is accessing their own data
-      if (input.id !== ctx.user.uid) {
-        throw new Error("Unauthorized: You can only access your own user data");
-      }
+// Initialize the router with async tRPC
+const initializeUserRouter = async () => {
+  const { router, publicProcedure, protectedProcedure } = await getRouteUtils();
 
-      const user = await prisma.user.findUnique({
-        where: { id: input.id },
-        include: {
-          listingCredits: true,
-          listings: {
-            include: {
-              photos: true,
-              videoJobs: true,
+  return router({
+    getUser: protectedProcedure
+      .input(z.object({ id: z.string().uuid() }))
+      .query(async ({ input, ctx }) => {
+        // Verify user is accessing their own data
+        if (input.id !== ctx.user.uid) {
+          throw new Error(
+            "Unauthorized: You can only access your own user data"
+          );
+        }
+
+        const user = await prisma.user.findUnique({
+          where: { id: input.id },
+          include: {
+            listingCredits: true,
+            listings: {
+              include: {
+                photos: true,
+                videoJobs: true,
+              },
             },
           },
-        },
-      });
-      if (!user) {
-        throw new Error("User not found");
-      }
-      return user;
-    }),
+        });
+        if (!user) {
+          throw new Error("User not found");
+        }
+        return user;
+      }),
 
-  updateUser: protectedProcedure
-    .input(
-      z.object({
-        id: z.string().uuid(),
-        name: z.string().optional(),
-        email: z.string().email().optional(),
-        fcmToken: z.string().optional(),
-      })
-    )
-    .mutation(async ({ input, ctx }) => {
-      // Verify user is updating their own data
-      if (input.id !== ctx.user.uid) {
-        throw new Error("Unauthorized: You can only update your own user data");
-      }
+    updateUser: protectedProcedure
+      .input(
+        z.object({
+          id: z.string().uuid(),
+          name: z.string().optional(),
+          email: z.string().email().optional(),
+          fcmToken: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        // Verify user is updating their own data
+        if (input.id !== ctx.user.uid) {
+          throw new Error(
+            "Unauthorized: You can only update your own user data"
+          );
+        }
 
-      const { id, ...data } = input;
-      const user = await prisma.user.update({
-        where: { id },
-        data,
-      });
-      return user;
-    }),
+        const { id, ...data } = input;
+        const user = await prisma.user.update({
+          where: { id },
+          data,
+        });
+        return user;
+      }),
 
-  createUser: publicProcedure
-    .input(
-      z.object({
-        email: z.string().email(),
-        name: z.string(),
-        subscriptionTier: z.string().default("free"),
-      })
-    )
-    .mutation(async ({ input }) => {
-      const user = await prisma.user.create({
-        data: input,
-      });
-      return user;
-    }),
-});
+    createUser: publicProcedure
+      .input(
+        z.object({
+          email: z.string().email(),
+          name: z.string(),
+          subscriptionTier: z.string().default("free"),
+        })
+      )
+      .mutation(async ({ input }) => {
+        const user = await prisma.user.create({
+          data: input,
+        });
+        return user;
+      }),
+  });
+};
+
+// Export an async function to get the initialized router
+export const getUserRouter = async () => {
+  return await initializeUserRouter();
+};

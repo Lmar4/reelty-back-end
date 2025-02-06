@@ -2,7 +2,7 @@ import express, { RequestHandler } from "express";
 import cors from "cors";
 import * as trpcExpress from "@trpc/server/adapters/express";
 import { createContext } from "./trpc/types";
-import { appRouter } from "./trpc/router";
+import { getAppRouter } from "./trpc/router";
 
 const app = express();
 
@@ -14,24 +14,35 @@ app.use(
   })
 );
 
-// Middleware to handle API Gateway stage prefix
-app.use((req, res, next) => {
-  const stagePrefix = "/prod"; // Change this according to your stage name
-  if (req.path.startsWith(stagePrefix)) {
-    req.url = req.url.substring(stagePrefix.length);
-  }
-  next();
-});
+// // Middleware to handle API Gateway stage prefix
+// app.use((req, res, next) => {
+//   const stagePrefix = "/prod"; // Change this according to your stage name
+//   if (req.path.startsWith(stagePrefix)) {
+//     req.url = req.url.substring(stagePrefix.length);
+//   }
+//   next();
+// });
 
-// tRPC middleware
-const trpcMiddleware = trpcExpress.createExpressMiddleware({
-  router: appRouter,
-  createContext,
-}) as unknown as RequestHandler;
+// Initialize the server asynchronously
+const initializeServer = async () => {
+  const appRouter = await getAppRouter();
 
-app.use("/api/trpc", trpcMiddleware);
+  // tRPC middleware
+  const trpcMiddleware = trpcExpress.createExpressMiddleware({
+    router: appRouter,
+    createContext,
+  }) as unknown as RequestHandler;
 
-const port = process.env.PORT || 8081; // Changed to match EB default port
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  app.use("/api/trpc", trpcMiddleware);
+
+  const port = process.env.PORT || 8081;
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+};
+
+// Start the server
+initializeServer().catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
 });

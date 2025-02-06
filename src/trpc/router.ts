@@ -1,18 +1,43 @@
-import { router } from "./types";
-import { userRouter } from "./routes/user";
-import { propertyRouter } from "./routes/property";
-import { jobsRouter } from "./routes/jobs";
-import { subscriptionRouter } from "./routes/subscriptions";
-import { adminRouter } from "./routes/admin";
-import { storageRouter } from "./routes/storage";
+import { getTRPC } from "./types";
+import { getUserRouter } from "./routes/user";
+import { getPropertyRouter } from "./routes/property";
+import { getJobsRouter } from "./routes/jobs";
+import { getSubscriptionRouter } from "./routes/subscriptions";
+import { getAdminPanelRouter } from "./routes/admin";
+import { getStorageRouter } from "./routes/storage";
 
-export const appRouter = router({
-  user: userRouter,
-  property: propertyRouter,
-  jobs: jobsRouter,
-  subscription: subscriptionRouter,
-  admin: adminRouter,
-  storage: storageRouter,
-});
+// Initialize the router asynchronously
+const initializeRouter = async () => {
+  const { router } = await getTRPC();
+  const [
+    userRoutes,
+    propertyRoutes,
+    jobsRoutes,
+    subscriptionRoutes,
+    adminPanelRoutes,
+    storageRoutes,
+  ] = await Promise.all([
+    getUserRouter(),
+    getPropertyRouter(),
+    getJobsRouter(),
+    getSubscriptionRouter(),
+    getAdminPanelRouter(),
+    getStorageRouter(),
+  ]);
 
-export type AppRouter = typeof appRouter;
+  return router({
+    user: userRoutes,
+    property: propertyRoutes,
+    jobs: jobsRoutes,
+    subscription: subscriptionRoutes,
+    adminPanel: adminPanelRoutes,
+    storage: storageRoutes,
+  });
+};
+
+export const getAppRouter = async () => {
+  return await initializeRouter();
+};
+
+// This type will be used by the client
+export type AppRouter = Awaited<ReturnType<typeof getAppRouter>>;

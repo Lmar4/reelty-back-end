@@ -1,8 +1,7 @@
 import { inferAsyncReturnType, initTRPC, TRPCError } from "@trpc/server";
 import * as trpcExpress from "@trpc/server/adapters/express";
-import superjson from "superjson";
-import { verifyFirebaseToken, type UserPayload } from "../lib/awsAdmin";
 import { prisma } from "../lib/prisma";
+import { verifyFirebaseToken, type UserPayload } from "../lib/awsAdmin";
 
 // Context type definition
 export const createContext = async ({
@@ -31,70 +30,79 @@ export const createContext = async ({
 
 export type Context = inferAsyncReturnType<typeof createContext>;
 
-// Initialize tRPC
-export const t = initTRPC.context<Context>().create({
-  transformer: superjson,
-});
-
-// Create a middleware that checks for authentication
-const isAuthed = t.middleware(({ ctx, next }) => {
-  if (!ctx.user) {
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: "You must be authenticated to access this resource",
-    });
-  }
-  return next({
-    ctx: {
-      ...ctx,
-      user: ctx.user,
-    },
+// Initialize tRPC with async transformer
+const initializeTRPC = async () => {
+  const { default: superjson } = await import("superjson");
+  return initTRPC.context<Context>().create({
+    transformer: superjson,
   });
-});
+};
 
-// Create a middleware that checks for admin privileges
-const isAdmin = t.middleware(async ({ ctx, next }) => {
-  if (!ctx.user) {
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: "You must be logged in to access this resource",
-    });
-  }
+// Export an async function to get the initialized tRPC instance
+export const getTRPC = async () => {
+  const t = await initializeTRPC();
 
-  const tier = await prisma.subscriptionTier.findFirst({
-    where: {
-      id: {
-        equals: (
-          await prisma.user.findUnique({
-            where: { id: ctx.user.uid },
-            select: { subscriptionTier: true },
-          })
-        )?.subscriptionTier,
+  // Create a middleware that checks for authentication
+  const isAuthed = t.middleware(({ ctx, next }) => {
+    if (!ctx.user) {
+      throw new TRPCError({
+        code: "UNAUTHORIZED",
+        message: "You must be authenticated to access this resource",
+      });
+    }
+    return next({
+      ctx: {
+        ...ctx,
+        user: ctx.user,
       },
-      isAdmin: true,
-    },
+    });
   });
 
-  if (!tier) {
-    throw new TRPCError({
-      code: "FORBIDDEN",
-      message: "You must be an admin to access this resource",
-    });
-  }
+  // Create a middleware that checks for admin privileges
+  const isAdmin = t.middleware(async ({ ctx, next }) => {
+    if (!ctx.user) {
+      throw new TRPCError({
+        code: "UNAUTHORIZED",
+        message: "You must be logged in to access this resource",
+      });
+    }
 
-  return next({
-    ctx: {
-      ...ctx,
-      user: {
-        ...ctx.user,
+    const tier = await prisma.subscriptionTier.findFirst({
+      where: {
+        id: {
+          equals: (
+            await prisma.user.findUnique({
+              where: { id: ctx.user.uid },
+              select: { subscriptionTier: true },
+            })
+          )?.subscriptionTier,
+        },
         isAdmin: true,
       },
-    },
-  });
-});
+    });
 
-// Export reusable router and procedure helpers
-export const router = t.router;
-export const publicProcedure = t.procedure;
-export const protectedProcedure = t.procedure.use(isAuthed);
-export const adminProcedure = t.procedure.use(isAdmin);
+    if (!tier) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: "You must be an admin to access this resource",
+      });
+    }
+
+    return next({
+      ctx: {
+        ...ctx,
+        user: {
+          ...ctx.user,
+          isAdmin: true,
+        },
+      },
+    });
+  });
+
+  return {
+    router: t.router,
+    publicProcedure: t.procedure,
+    protectedProcedure: t.procedure.use(isAuthed),
+    adminProcedure: t.procedure.use(isAdmin),
+  };
+};
