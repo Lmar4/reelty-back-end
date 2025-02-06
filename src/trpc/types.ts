@@ -32,10 +32,7 @@ export type Context = inferAsyncReturnType<typeof createContext>;
 
 // Initialize tRPC with async transformer
 const initializeTRPC = async () => {
-  const { default: superjson } = await import("superjson");
-  return initTRPC.context<Context>().create({
-    transformer: superjson,
-  });
+  return initTRPC.context<Context>().create();
 };
 
 // Export an async function to get the initialized tRPC instance
