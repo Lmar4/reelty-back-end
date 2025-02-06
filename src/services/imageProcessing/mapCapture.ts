@@ -1,4 +1,4 @@
-import puppeteer from "puppeteer";
+import puppeteer, { Page } from "puppeteer";
 import * as fs from "fs/promises";
 import * as path from "path";
 import sharp from "sharp";
@@ -27,7 +27,7 @@ export class MapCapture {
     };
   }
 
-  private async injectGoogleMapsScript(page: puppeteer.Page): Promise<void> {
+  private async injectGoogleMapsScript(page: Page): Promise<void> {
     await page.evaluate(`
       function initMap(address) {
         return new Promise((resolve, reject) => {
@@ -43,7 +43,7 @@ export class MapCapture {
               map.setCenter(results[0].geometry.location);
               resolve(true);
             } else {
-              reject(new Error('Geocoding failed'));
+              reject(new Error("Geocoding failed"));
             }
           });
         });
@@ -51,7 +51,7 @@ export class MapCapture {
     `);
   }
 
-  private async setupPage(page: puppeteer.Page): Promise<void> {
+  private async setupPage(page: Page): Promise<void> {
     await page.setViewport({
       width: this.config.width,
       height: this.config.height,
@@ -107,7 +107,7 @@ export class MapCapture {
 
   async captureMapAnimation(address: string): Promise<string[]> {
     const browser = await puppeteer.launch({
-      headless: "new",
+      headless: true,
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
 
@@ -124,7 +124,7 @@ export class MapCapture {
 
       // Initialize map with address
       await page.evaluate(`initMap("${address}")`);
-      await page.waitForTimeout(1000); // Wait for map to settle
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait for map to settle
 
       // Calculate zoom steps
       const zoomStep =
@@ -140,7 +140,7 @@ export class MapCapture {
         `);
 
         // Wait for map rendering
-        await page.waitForTimeout(100);
+        await new Promise((resolve) => setTimeout(resolve, 100));
 
         const screenshot = await page.screenshot({
           type: "jpeg",

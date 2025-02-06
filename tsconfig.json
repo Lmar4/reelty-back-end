@@ -1,19 +1,18 @@
 {
-  "extends": "@tsconfig/node22/tsconfig.json",
   "compilerOptions": {
-    "target": "ES2017",
-    "module": "Node16",
-    "lib": ["ES2017"],
-    "outDir": "./build",
-    "rootDir": "./src",
-    "strict": true,
-    "moduleResolution": "node",
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "types": ["node"]
+    "target": "ES2020", // Set to a modern ECMAScript version
+    "module": "CommonJS", // Changed to CommonJS
+    "moduleResolution": "node", // You can also use 'classic' here
+    "lib": ["ES2020"], // Include the necessary library features
+    "outDir": "./build", // Output directory for compiled files
+    "rootDir": "./src", // Root directory of the source files
+    "strict": true, // Enable all strict type-checking options
+    "esModuleInterop": true, // Enable interoperability between CommonJS and ES modules
+    "forceConsistentCasingInFileNames": true, // Ensure consistent casing in file names
+    "skipLibCheck": true, // Skip type checking of declaration files
+    "resolveJsonModule": true, // Allow importing JSON files
+    "types": ["node", "puppeteer"] // Include type definitions for Node.js and Puppeteer
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "build"]
+  "include": ["src/**/*"], // Include all TypeScript files in the src directory
+  "exclude": ["node_modules", "build"] // Exclude node_modules and build directories
 }

@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { promisify } from "util";
 import ffmpeg from "fluent-ffmpeg";
-import { RunwayML } from "../runway";
+import { RunwayML } from "../runway.js";
 
 // Add ProcessedImage type
 export interface ProcessedImage {
