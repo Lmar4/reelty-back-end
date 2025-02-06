@@ -7,10 +7,9 @@
     "seed": "ts-node --transpile-only prisma/seed.ts"
   },
   "scripts": {
+    "build": "tsc && pnpm db:generate",
+    "start": "node build/server.js",
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
-    "build": "tsc && npm run db:generate",
-    "start": "node dist/server.js",
-    "test": "jest",
     "db:generate": "npx prisma generate",
     "db:push": "npx prisma db push",
     "db:migrate": "npx prisma migrate dev",
