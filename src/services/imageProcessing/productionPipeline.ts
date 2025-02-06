@@ -1,7 +1,7 @@
 import { PrismaClient } from "@prisma/client";
-import { ImageToVideoConverter } from "./image-to-video-converter";
-import { VisionProcessor } from "./vision-processor";
-import { MapCapture } from "./map-capture/capture";
+import { ImageToVideoConverter } from "./imageToVideoConverter";
+import { VisionProcessor } from "./visionProcessor";
+import { MapCapture } from "./mapCapture";
 
 const prisma = new PrismaClient();
 
@@ -46,12 +46,24 @@ export class ProductionPipeline {
 
       await this.updateJobStatus(jobId, "processing");
 
-      // Process images concurrently
+      // First convert images to WebP format
+      const optimizedImages = await this.visionProcessor.batchConvertToWebP(
+        job.inputFiles as string[],
+        {
+          quality: 80,
+          width: 1080, // Match the video width
+          height: 1920, // Match the video height
+          fit: "cover",
+        }
+      );
+
+      // Process optimized images concurrently
       const [processedImages, mapFrames] = await Promise.all([
         Promise.all(
-          (job.inputFiles as string[]).map(async (imagePath: string) => {
-            const cropCoords =
-              await this.visionProcessor.analyzeImageForCrop(imagePath);
+          optimizedImages.map(async (imagePath: string) => {
+            const cropCoords = await this.visionProcessor.analyzeImageForCrop(
+              imagePath
+            );
             // Apply cropping and return processed image path
             return imagePath; // TODO: Apply actual cropping
           })

@@ -1,8 +1,6 @@
-import * as fs from "fs";
-import { promisify } from "util";
+import { promises as fsPromises } from "fs";
 import sharp from "sharp";
-
-const exists = promisify(fs.exists);
+import path from "path";
 
 export interface CropCoordinates {
   x: number;
@@ -17,9 +15,18 @@ export interface ImageStats {
   brightness: number;
 }
 
+export interface ImageOptimizationOptions {
+  quality?: number;
+  width?: number;
+  height?: number;
+  fit?: "cover" | "contain" | "fill" | "inside" | "outside";
+}
+
 export class VisionProcessor {
   private async validateImage(imagePath: string): Promise<void> {
-    if (!(await exists(imagePath))) {
+    try {
+      await fsPromises.access(imagePath);
+    } catch (error) {
       throw new Error(`Image not found: ${imagePath}`);
     }
   }
@@ -116,7 +123,10 @@ export class VisionProcessor {
       // Analyze multiple regions to find optimal crop
       const regions: CropCoordinates[] = [];
       const steps = 5;
-      const stepSize = Math.floor((metadata.width - cropWidth) / steps);
+      const stepSize = Math.max(
+        1,
+        Math.floor((metadata.width - cropWidth) / steps)
+      );
 
       for (let x = 0; x <= metadata.width - cropWidth; x += stepSize) {
         regions.push({
@@ -149,8 +159,87 @@ export class VisionProcessor {
       return bestRegion;
     } catch (error) {
       throw new Error(
-        `Failed to analyze image: ${error instanceof Error ? error.message : "Unknown error"}`
+        `Failed to analyze image: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
       );
     }
+  }
+
+  /**
+   * Converts an image to WebP format with optimization
+   * @param inputPath Path to the input image
+   * @param outputPath Optional custom output path. If not provided, will use same name with .webp extension
+   * @param options Optimization options for the conversion
+   * @returns Path to the converted WebP image
+   */
+  async convertToWebP(
+    inputPath: string,
+    outputPath?: string,
+    options: ImageOptimizationOptions = {}
+  ): Promise<string> {
+    try {
+      await this.validateImage(inputPath);
+
+      const finalOutputPath = outputPath || this.generateWebPPath(inputPath);
+
+      let imageProcess = sharp(inputPath);
+
+      // Apply resizing if dimensions are provided
+      if (options.width || options.height) {
+        imageProcess = imageProcess.resize({
+          width: options.width,
+          height: options.height,
+          fit: options.fit || "cover",
+          withoutEnlargement: true,
+        });
+      }
+
+      // Convert to WebP with quality setting
+      await imageProcess
+        .webp({
+          quality: options.quality || 80,
+          effort: 6, // Higher compression effort
+        })
+        .toFile(finalOutputPath);
+
+      return finalOutputPath;
+    } catch (error) {
+      throw new Error(
+        `Failed to convert image to WebP: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  /**
+   * Batch converts multiple images to WebP format
+   * @param inputPaths Array of paths to input images
+   * @param options Optimization options for the conversion
+   * @returns Array of paths to the converted WebP images
+   */
+  async batchConvertToWebP(
+    inputPaths: string[],
+    options: ImageOptimizationOptions = {}
+  ): Promise<string[]> {
+    try {
+      const conversionPromises = inputPaths.map((inputPath) =>
+        this.convertToWebP(inputPath, undefined, options)
+      );
+
+      return await Promise.all(conversionPromises);
+    } catch (error) {
+      throw new Error(
+        `Failed to batch convert images to WebP: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  private generateWebPPath(inputPath: string): string {
+    const parsedPath = path.parse(inputPath);
+    return path.join(parsedPath.dir, `${parsedPath.name}.webp`);
   }
 }

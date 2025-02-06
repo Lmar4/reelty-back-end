@@ -1,6 +1,6 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { PrismaClient } from "@prisma/client";
-import { ProductionPipeline } from "../../../core/src/photo-processing/production-pipeline";
+import { ProductionPipeline } from "../../services/imageProcessing/productionPipeline";
 import { z } from "zod";
 
 const prisma = new PrismaClient();
@@ -10,7 +10,9 @@ const submitJobSchema = z.object({
   userId: z.string().uuid(),
   listingId: z.string().uuid(),
   images: z.array(z.string().url()).min(1),
-  template: z.enum(['crescendo', 'wave', 'storyteller', 'googleZoom']).default('crescendo')
+  template: z
+    .enum(["crescendo", "wave", "storyteller", "googleZoom"])
+    .default("crescendo"),
 });
 
 const jobIdSchema = z.string().uuid();
