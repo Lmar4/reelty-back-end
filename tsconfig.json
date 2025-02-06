@@ -14,5 +14,5 @@
     "types": ["node", "puppeteer"] // Include type definitions for Node.js and Puppeteer
   },
   "include": ["src/**/*"], // Include all TypeScript files in the src directory
-  "exclude": ["node_modules", "build"] // Exclude node_modules and build directories
+  "exclude": ["node_modules", "build", "scripts", "**/scripts/**/*"] // Exclude node_modules, build directories, and scripts
 }

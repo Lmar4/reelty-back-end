@@ -1,7 +1,17 @@
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
-import { router, publicProcedure, protectedProcedure } from "../types";
 import { prisma } from "../../lib/prisma";
-import { v4 as uuidv4 } from "uuid";
+import { protectedProcedure, publicProcedure, router } from "../types";
+
+// Common file schema
+const fileSchema = z.object({
+  filePath: z.string(),
+  name: z.string().optional(),
+  size: z.number().optional(),
+  contentType: z.string().optional(),
+});
+
+type FileData = z.infer<typeof fileSchema>;
 
 export const propertyRouter = router({
   getProperties: publicProcedure
@@ -33,9 +43,9 @@ export const propertyRouter = router({
       };
     }),
 
-  getById: publicProcedure
+  getById: protectedProcedure
     .input(z.object({ id: z.string().uuid() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       const listing = await prisma.listing.findUnique({
         where: { id: input.id },
         include: {
@@ -44,7 +54,13 @@ export const propertyRouter = router({
         },
       });
       if (!listing) {
-        throw new Error("Listing not found");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Listing not found",
+        });
+      }
+      if (listing.userId !== ctx.user.uid) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
       return listing;
     }),
@@ -54,7 +70,7 @@ export const propertyRouter = router({
     .query(async ({ input, ctx }) => {
       // Verify user is accessing their own listings
       if (input.userId !== ctx.user.uid) {
-        throw new Error("Unauthorized: You can only access your own listings");
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
 
       const listings = await prisma.listing.findMany({
@@ -73,27 +89,28 @@ export const propertyRouter = router({
       z.object({
         userId: z.string().uuid(),
         address: z.string(),
-        photos: z.array(
-          z.object({
-            filePath: z.string(),
-          })
-        ),
+        photos: z.array(fileSchema),
       })
     )
     .mutation(async ({ input, ctx }) => {
       // Verify user is creating their own listing
       if (input.userId !== ctx.user.uid) {
-        throw new Error(
-          "Unauthorized: You can only create listings for yourself"
-        );
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
 
       const listing = await prisma.listing.create({
         data: {
-          userId: input.userId,
+          userId: ctx.user.uid,
           address: input.address,
+          status: "draft",
           photos: {
-            create: input.photos,
+            create: input.photos.map((photo) => ({
+              userId: ctx.user.uid,
+              filePath: photo.filePath,
+              user: {
+                connect: { id: ctx.user.uid },
+              },
+            })),
           },
         },
         include: {
@@ -115,7 +132,7 @@ export const propertyRouter = router({
     .mutation(async ({ input, ctx }) => {
       // Verify user is updating their own listing
       if (input.userId !== ctx.user.uid) {
-        throw new Error("Unauthorized: You can only update your own listings");
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
 
       const { id, userId, ...data } = input;
@@ -127,11 +144,14 @@ export const propertyRouter = router({
       });
 
       if (!listing) {
-        throw new Error("Listing not found");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Listing not found",
+        });
       }
 
       if (listing.userId !== userId) {
-        throw new Error("Unauthorized: This listing doesn't belong to you");
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
 
       const updatedListing = await prisma.listing.update({
@@ -154,7 +174,7 @@ export const propertyRouter = router({
     .mutation(async ({ input, ctx }) => {
       // Verify user is deleting their own listing
       if (input.userId !== ctx.user.uid) {
-        throw new Error("Unauthorized: You can only delete your own listings");
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
 
       // Verify the listing belongs to the user
@@ -164,11 +184,14 @@ export const propertyRouter = router({
       });
 
       if (!listing) {
-        throw new Error("Listing not found");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Listing not found",
+        });
       }
 
       if (listing.userId !== input.userId) {
-        throw new Error("Unauthorized: This listing doesn't belong to you");
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
 
       await prisma.listing.delete({
@@ -177,82 +200,84 @@ export const propertyRouter = router({
       return true;
     }),
 
-  tempUpload: publicProcedure
+  tempUpload: protectedProcedure
     .input(
       z.object({
-        files: z.array(
-          z.object({
-            filePath: z.string(),
-            fileType: z.string(),
-            fileSize: z.number(),
-          })
-        ),
+        files: z.array(fileSchema),
         address: z.string().optional(),
-        sessionId: z.string().uuid().optional(),
       })
     )
-    .mutation(async ({ input }) => {
-      const sessionId = input.sessionId || uuidv4();
-
-      // Store temporary files info in Redis or temporary DB table
-      await prisma.tempUpload.create({
+    .mutation(async ({ input, ctx }) => {
+      // Store temporary files info
+      const tempUpload = await prisma.tempUpload.create({
         data: {
-          sessionId,
+          userId: ctx.user.uid,
           files: input.files,
           address: input.address,
           expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours expiry
         },
       });
 
-      return { sessionId };
-    }),
-
-  getTempUpload: publicProcedure
-    .input(z.object({ sessionId: z.string().uuid() }))
-    .query(async ({ input }) => {
-      const tempUpload = await prisma.tempUpload.findUnique({
-        where: { sessionId: input.sessionId },
-      });
-
-      if (!tempUpload) {
-        throw new Error("Temporary upload not found or expired");
-      }
-
       return tempUpload;
     }),
+
+  getTempUpload: protectedProcedure.query(async ({ ctx }) => {
+    const tempUpload = await prisma.tempUpload.findFirst({
+      where: {
+        userId: ctx.user.uid,
+        expiresAt: { gt: new Date() },
+      },
+    });
+
+    if (!tempUpload) {
+      throw new TRPCError({
+        code: "NOT_FOUND",
+        message: "Temporary upload not found or expired",
+      });
+    }
+
+    return tempUpload;
+  }),
 
   convertTempToListing: protectedProcedure
     .input(
       z.object({
-        sessionId: z.string().uuid(),
         userId: z.string().uuid(),
       })
     )
     .mutation(async ({ input, ctx }) => {
       // Verify user is creating their own listing
       if (input.userId !== ctx.user.uid) {
-        throw new Error(
-          "Unauthorized: You can only create listings for yourself"
-        );
+        throw new TRPCError({ code: "FORBIDDEN", message: "Access denied" });
       }
 
-      // Get temp upload
-      const tempUpload = await prisma.tempUpload.findUnique({
-        where: { sessionId: input.sessionId },
+      const tempUpload = await prisma.tempUpload.findFirst({
+        where: {
+          userId: ctx.user.uid,
+          expiresAt: { gt: new Date() },
+        },
       });
 
       if (!tempUpload) {
-        throw new Error("Temporary upload not found or expired");
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Temporary upload not found or expired",
+        });
       }
 
-      // Create actual listing
+      // Create the listing
       const listing = await prisma.listing.create({
         data: {
-          userId: input.userId,
+          userId: ctx.user.uid,
           address: tempUpload.address || "",
+          status: "draft",
           photos: {
-            create: tempUpload.files.map((file) => ({
+            create: (tempUpload.files as FileData[]).map((file) => ({
+              userId: ctx.user.uid,
               filePath: file.filePath,
+              user: {
+                connect: { id: ctx.user.uid },
+              },
             })),
           },
         },
@@ -261,9 +286,9 @@ export const propertyRouter = router({
         },
       });
 
-      // Delete temp upload
+      // Clean up temp upload
       await prisma.tempUpload.delete({
-        where: { sessionId: input.sessionId },
+        where: { id: tempUpload.id },
       });
 
       return listing;

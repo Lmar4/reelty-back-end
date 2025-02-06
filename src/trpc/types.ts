@@ -2,6 +2,7 @@ import { inferAsyncReturnType, initTRPC, TRPCError } from "@trpc/server";
 import * as trpcExpress from "@trpc/server/adapters/express";
 import superjson from "superjson";
 import { verifyFirebaseToken, type UserPayload } from "../lib/awsAdmin";
+import { prisma } from "../lib/prisma";
 
 // Context type definition
 export const createContext = async ({
@@ -31,13 +32,9 @@ export const createContext = async ({
 export type Context = inferAsyncReturnType<typeof createContext>;
 
 // Initialize tRPC
-const t = initTRPC.context<Context>().create({
+export const t = initTRPC.context<Context>().create({
   transformer: superjson,
 });
-
-// Export reusable router and procedure helpers
-export const router = t.router;
-export const publicProcedure = t.procedure;
 
 // Create a middleware that checks for authentication
 const isAuthed = t.middleware(({ ctx, next }) => {
@@ -50,11 +47,54 @@ const isAuthed = t.middleware(({ ctx, next }) => {
   return next({
     ctx: {
       ...ctx,
-      // Adds user information to the context
       user: ctx.user,
     },
   });
 });
 
-// Protected procedure that requires authentication
+// Create a middleware that checks for admin privileges
+const isAdmin = t.middleware(async ({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "You must be logged in to access this resource",
+    });
+  }
+
+  const tier = await prisma.subscriptionTier.findFirst({
+    where: {
+      id: {
+        equals: (
+          await prisma.user.findUnique({
+            where: { id: ctx.user.uid },
+            select: { subscriptionTier: true },
+          })
+        )?.subscriptionTier,
+      },
+      isAdmin: true,
+    },
+  });
+
+  if (!tier) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "You must be an admin to access this resource",
+    });
+  }
+
+  return next({
+    ctx: {
+      ...ctx,
+      user: {
+        ...ctx.user,
+        isAdmin: true,
+      },
+    },
+  });
+});
+
+// Export reusable router and procedure helpers
+export const router = t.router;
+export const publicProcedure = t.procedure;
 export const protectedProcedure = t.procedure.use(isAuthed);
+export const adminProcedure = t.procedure.use(isAdmin);

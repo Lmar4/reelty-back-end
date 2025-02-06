@@ -2,7 +2,9 @@ import * as fs from "fs";
 import * as path from "path";
 import { promisify } from "util";
 import ffmpeg from "fluent-ffmpeg";
-import { RunwayML } from "../runway.js";
+import { RunwayML } from "../runway";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { ReelTemplate, TemplateKey, reelTemplates } from "./templates/types";
 
 // Add ProcessedImage type
 export interface ProcessedImage {
@@ -118,7 +120,9 @@ export class ImageToVideoConverter {
 
       command
         .on("end", () => resolve(outputPath))
-        .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
+        .on("error", (err: Error) =>
+          reject(new Error(`FFmpeg error: ${err.message}`))
+        )
         .complexFilter([
           {
             filter: "concat",
@@ -154,22 +158,44 @@ export class ImageToVideoConverter {
       this.videoFiles = [...videoSegments];
 
       // Stitch segments together using ffmpeg
-      const finalVideo = await this.stitchVideoSegments(
+      const finalVideoPath = await this.stitchVideoSegments(
         videoSegments,
         template
       );
 
-      // Cleanup temporary segments
-      await Promise.all(
-        videoSegments.map((segment) => fs.promises.unlink(segment))
-      );
+      // Upload final video to S3
+      await this.uploadVideoToS3(finalVideoPath);
 
-      return finalVideo;
+      return finalVideoPath;
     } catch (error) {
       if (error instanceof Error) {
         throw new Error(`Failed to convert images to video: ${error.message}`);
       }
       throw new Error("Failed to convert images to video");
+    }
+  }
+
+  private async uploadVideoToS3(videoPath: string): Promise<void> {
+    const s3Client = new S3Client({ region: process.env.AWS_REGION });
+    const bucketName = process.env.VIDEOS_BUCKET_NAME;
+    const key = `videos/${path.basename(videoPath)}`;
+
+    const command = new PutObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+      Body: await fs.promises.readFile(videoPath),
+      ContentType: "video/mp4",
+    });
+
+    try {
+      await s3Client.send(command);
+      console.log(`Video uploaded to S3: ${key}`);
+    } catch (error) {
+      throw new Error(
+        `Failed to upload video to S3: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
     }
   }
 
@@ -284,7 +310,7 @@ export class ImageToVideoConverter {
           .videoCodec("libx264")
           .outputOptions(["-pix_fmt", "yuv420p"])
           .on("end", () => resolve())
-          .on("error", (err) =>
+          .on("error", (err: Error) =>
             reject(
               new Error(
                 `Failed to generate map frame video for ${mapFrameImage}: ${err.message}`
@@ -315,7 +341,7 @@ export class ImageToVideoConverter {
       });
       command
         .on("end", () => resolve())
-        .on("error", (err) =>
+        .on("error", (err: Error) =>
           reject(new Error(`FFmpeg concatenation error: ${err.message}`))
         )
         .complexFilter([
@@ -342,7 +368,7 @@ export class ImageToVideoConverter {
           .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
           .audioFilters(`volume=${musicVolume}`)
           .on("end", () => resolve())
-          .on("error", (err) =>
+          .on("error", (err: Error) =>
             reject(new Error(`FFmpeg music overlay error: ${err.message}`))
           )
           .save(outputPath);
@@ -364,6 +390,257 @@ export class ImageToVideoConverter {
         }
       })
     );
+  }
+
+  async createTemplate(
+    templateKey: TemplateKey,
+    videoFiles: string[],
+    mapVideoPath?: string,
+    subscriptionTier: string = "free",
+    watermarkAsset?: { path: string; opacity?: number }
+  ): Promise<string> {
+    if (!videoFiles.length) {
+      throw new Error("No videos provided for template creation");
+    }
+
+    await this.ensureDirectoryExists(this.outputDir);
+    const template = reelTemplates[templateKey];
+    const uniqueId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const outputPath = path.join(
+      this.outputDir,
+      `${templateKey}-${uniqueId}.mp4`
+    );
+
+    console.log(
+      `Creating template ${templateKey} with ${videoFiles.length} videos...`
+    );
+
+    // Add watermark for free tier if watermarkAsset is provided
+    const watermark = subscriptionTier === "free" ? watermarkAsset : undefined;
+
+    // Handle different template types
+    if (templateKey === "googlezoomintro") {
+      if (!mapVideoPath) {
+        throw new Error(
+          "Map video path is required for googlezoomintro template"
+        );
+      }
+
+      const orderedVideos: string[] = [];
+      const orderedDurations: number[] = [];
+      const durations = template.durations as Record<string | number, number>;
+
+      // Process each item in the sequence
+      for (const key of template.sequence) {
+        if (key === "map") {
+          orderedVideos.push(mapVideoPath);
+          orderedDurations.push(durations["map"]);
+        } else {
+          const index = typeof key === "string" ? parseInt(key) : key;
+          if (index < 0 || index >= videoFiles.length) {
+            throw new Error(
+              `Invalid video index ${index} for template ${templateKey}`
+            );
+          }
+          orderedVideos.push(videoFiles[index]);
+          orderedDurations.push(durations[key]);
+        }
+      }
+
+      await this.stitchVideos(
+        orderedVideos,
+        orderedDurations,
+        outputPath,
+        template.music,
+        watermark
+      );
+    } else {
+      // Regular template processing
+      const durations = template.durations as number[];
+      const orderedVideos = template.sequence.map((index) => {
+        const videoIndex = typeof index === "number" ? index : parseInt(index);
+        if (videoIndex < 0 || videoIndex >= videoFiles.length) {
+          throw new Error(
+            `Invalid video index ${videoIndex} for template ${templateKey}`
+          );
+        }
+        return videoFiles[videoIndex];
+      });
+
+      await this.stitchVideos(
+        orderedVideos,
+        durations,
+        outputPath,
+        template.music,
+        watermark
+      );
+    }
+
+    console.log(`${templateKey} video created at: ${outputPath}`);
+    return outputPath;
+  }
+
+  private async stitchVideos(
+    videoFiles: string[],
+    durations: number[],
+    outputPath: string,
+    music?: { path: string; volume?: number; startTime?: number },
+    watermark?: { path: string; opacity?: number }
+  ): Promise<void> {
+    console.log("Starting video stitching with:", {
+      videoCount: videoFiles.length,
+      durations,
+      outputPath,
+      hasMusicTrack: !!music,
+      hasWatermark: !!watermark,
+    });
+
+    // Create filter complex for trimming and scaling videos
+    const filterComplex: string[] = [];
+    const inputs: string[] = [];
+
+    // Add input files
+    for (let i = 0; i < videoFiles.length; i++) {
+      inputs.push("-i", videoFiles[i]);
+    }
+
+    // Add music input if provided
+    if (music) {
+      const musicPath = path.resolve(__dirname, music.path);
+      if (await exists(musicPath)) {
+        inputs.push("-i", musicPath);
+      } else {
+        console.warn(`Music file not found: ${musicPath}`);
+      }
+    }
+
+    // Add watermark input if provided
+    let watermarkInputIndex = videoFiles.length;
+    if (watermark) {
+      const watermarkPath = watermark.path;
+      if (await exists(watermarkPath)) {
+        inputs.push("-i", watermarkPath);
+        watermarkInputIndex = inputs.length / 2 - 1; // Calculate the input index for watermark
+      } else {
+        console.warn(`Watermark file not found: ${watermarkPath}`);
+      }
+    }
+
+    // Add trim and scale filters for each video
+    for (let i = 0; i < videoFiles.length; i++) {
+      filterComplex.push(
+        `[${i}:v]setpts=PTS-STARTPTS,scale=768:1280:force_original_aspect_ratio=decrease,` +
+          `pad=768:1280:(ow-iw)/2:(oh-ih)/2,trim=duration=${durations[i]},` +
+          `setpts=PTS-STARTPTS[v${i}]`
+      );
+    }
+
+    // Create concat inputs string
+    const concatInputs = Array.from(
+      { length: videoFiles.length },
+      (_, i) => `[v${i}]`
+    ).join("");
+
+    // Add concat filter
+    filterComplex.push(
+      `${concatInputs}concat=n=${videoFiles.length}:v=1:a=0[concat]`
+    );
+
+    // Add watermark if provided
+    if (watermark) {
+      const opacity = watermark.opacity || 0.5;
+      filterComplex.push(
+        `[concat][${watermarkInputIndex}:v]overlay=W-w-10:H-h-10:enable='between(t,0,${durations.reduce(
+          (a, b) => a + b,
+          0
+        )})':alpha=${opacity}[outv]`
+      );
+    } else {
+      filterComplex.push(`[concat]copy[outv]`);
+    }
+
+    // Calculate total duration
+    const totalDuration = durations.reduce((sum, d) => sum + d, 0);
+
+    // Add audio filters if music is provided
+    if (music) {
+      const volume = music.volume || 0.5;
+      const startTime = music.startTime || 0;
+      const fadeStart = Math.max(0, totalDuration - 1);
+      filterComplex.push(
+        `[${videoFiles.length}:a]asetpts=PTS-STARTPTS,` +
+          `atrim=start=${startTime}:duration=${totalDuration},` +
+          `volume=${volume}:eval=frame,` +
+          `afade=t=out:st=${fadeStart}:d=1[outa]`
+      );
+    }
+
+    // Build ffmpeg command
+    const command = [
+      "ffmpeg",
+      "-y",
+      ...inputs,
+      "-filter_complex",
+      filterComplex.join(";"),
+      "-map",
+      "[outv]",
+    ];
+
+    // Add audio mapping if music is provided
+    if (music) {
+      command.push("-map", "[outa]");
+    }
+
+    // Add output options
+    command.push(
+      "-c:v",
+      "libx264",
+      "-preset",
+      "slow",
+      "-crf",
+      "18",
+      "-r",
+      "24",
+      "-c:a",
+      "aac",
+      "-shortest",
+      "-t",
+      totalDuration.toString(),
+      outputPath
+    );
+
+    // Execute ffmpeg
+    const { spawn } = require("child_process");
+    const ffmpeg = spawn(command[0], command.slice(1));
+
+    return new Promise((resolve, reject) => {
+      let errorOutput = "";
+      ffmpeg.stderr.on("data", (data: Buffer) => {
+        const message = data.toString();
+        errorOutput += message;
+        console.log(`ffmpeg: ${message}`);
+      });
+
+      ffmpeg.on("close", (code: number) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(
+            new Error(
+              `ffmpeg exited with code ${code}\nError output: ${errorOutput}`
+            )
+          );
+        }
+      });
+
+      ffmpeg.on("error", (err: Error) => {
+        reject(
+          new Error(
+            `ffmpeg process error: ${err.message}\nError output: ${errorOutput}`
+          )
+        );
+      });
+    });
   }
 }
 

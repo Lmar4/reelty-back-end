@@ -1,3 +1,6 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -7,41 +10,134 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id               String          @id @default(uuid()) @db.Uuid
-  email            String          @unique
-  name             String
-  subscriptionTier String          @map("subscription_tier")
-  fcmToken         String?         @map("fcm_token")
-  createdAt        DateTime        @default(now()) @map("created_at")
-  updatedAt        DateTime        @updatedAt @map("updated_at")
-  listingCredits   ListingCredit[]
-  listings         Listing[]
-  videoJobs        VideoJob[]
+enum AssetType {
+  MUSIC
+  WATERMARK
+  LOTTIE
+}
 
+model User {
+  id              String    @id @default(uuid()) @db.Uuid
+  email           String    @unique
+  name            String
+  subscriptionTier String
+  fcmToken        String?   @map("fcm_token")
+  lastLoginAt     DateTime? @map("last_login_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  creditLogs      CreditLog[]    @relation("UserCreditLogs")
+  adminCreditLogs CreditLog[]    @relation("AdminCreditLogs")
+  tierChanges     TierChange[]   @relation("UserTierChanges")
+  adminTierChanges TierChange[]  @relation("AdminTierChanges")
+  listingCredits  ListingCredit[]
+  listings        Listing[]
+  photos          Photo[]
+  videoJobs       VideoJob[]
+  searchHistory   SearchHistory[]
+  errorLogs       ErrorLog[]
+  tempUploads     TempUpload[]
+  tier            SubscriptionTier @relation(fields: [subscriptionTier], references: [id])
+
+  @@index([subscriptionTier])
   @@map("users")
 }
 
 model SubscriptionTier {
-  id          String   @id @map("tier_name")
+  id          String    @id
   description String
-  pricing     Decimal  @db.Decimal(10, 2) @default(0.00)
-  features    Json
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  pricing     Decimal   @default(0.00) @db.Decimal(10, 2)
+  isAdmin     Boolean   @default(false) @map("is_admin")
+  features    Json      @default("[]")
+
+  // Relations
+  templates   Template[]
+  assets      Asset[]
+  users       User[]
 
   @@map("subscription_tiers")
 }
 
+model Template {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String
+  description     String
+  sequence        Json
+  durations       Json
+  musicPath       String?  @map("music_path")
+  musicVolume     Float?   @default(1.0) @map("music_volume")
+  subscriptionTier String  @map("subscription_tier")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tier            SubscriptionTier @relation(fields: [subscriptionTier], references: [id])
+
+  @@index([subscriptionTier])
+  @@map("templates")
+}
+
+model CreditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  amount    Int
+  reason    String
+  adminId   String?  @map("admin_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  user      User     @relation("UserCreditLogs", fields: [userId], references: [id])
+  admin     User?    @relation("AdminCreditLogs", fields: [adminId], references: [id])
+
+  @@map("credit_logs")
+}
+
+model TierChange {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  oldTier   String   @map("old_tier")
+  newTier   String   @map("new_tier")
+  reason    String
+  adminId   String?  @map("admin_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  user      User     @relation("UserTierChanges", fields: [userId], references: [id])
+  admin     User?    @relation("AdminTierChanges", fields: [adminId], references: [id])
+
+  @@map("tier_changes")
+}
+
+model Asset {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String
+  description     String?
+  filePath        String   @map("file_path")
+  type            AssetType
+  subscriptionTier String  @map("subscription_tier")
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  tier            SubscriptionTier @relation(fields: [subscriptionTier], references: [id])
+
+  @@index([type, subscriptionTier])
+  @@map("assets")
+}
+
 model ListingCredit {
-  id               String    @id @default(uuid()) @db.Uuid
-  userId           String    @map("user_id") @db.Uuid
-  creditsRemaining Int       @default(0) @map("credits_remaining")
-  purchaseDate     DateTime  @default(now()) @map("purchase_date")
-  expiryDate       DateTime  @map("expiry_date")
-  user             User      @relation(fields: [userId], references: [id])
-  createdAt        DateTime  @default(now()) @map("created_at")
-  updatedAt        DateTime  @updatedAt @map("updated_at")
+  id               String   @id @default(uuid()) @db.Uuid
+  userId           String   @map("user_id") @db.Uuid
+  creditsRemaining Int      @map("credits_remaining")
+  expiryDate       DateTime @map("expiry_date")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user             User     @relation(fields: [userId], references: [id])
 
   @@map("listing_credits")
 }
@@ -50,51 +146,90 @@ model Listing {
   id          String   @id @default(uuid()) @db.Uuid
   userId      String   @map("user_id") @db.Uuid
   address     String
-  photoLimit  Int      @default(20) @map("photo_limit")
-  photos      Photo[]
-  videoJobs   VideoJob[]
-  user        User     @relation(fields: [userId], references: [id])
+  description String?
+  status      String
+  photoLimit  Int      @default(10) @map("photo_limit")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user        User     @relation(fields: [userId], references: [id])
+  photos      Photo[]
+  videoJobs   VideoJob[]
 
   @@map("listings")
 }
 
 model Photo {
   id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
   listingId   String   @map("listing_id") @db.Uuid
   filePath    String   @map("file_path")
-  uploadedAt  DateTime @default(now()) @map("uploaded_at")
+  order       Int      @default(0)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user        User     @relation(fields: [userId], references: [id])
   listing     Listing  @relation(fields: [listingId], references: [id])
 
   @@map("photos")
 }
 
 model VideoJob {
-  id          String    @id @default(uuid()) @db.Uuid
-  userId      String    @map("user_id") @db.Uuid
-  listingId   String    @map("listing_id") @db.Uuid
-  inputFiles  Json      @map("input_files")
-  outputFile  String?   @map("output_file")
-  template    String    @default("crescendo")
-  status      String    @default("pending")
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime  @updatedAt @map("updated_at")
-  user        User      @relation(fields: [userId], references: [id])
-  listing     Listing   @relation(fields: [listingId], references: [id])
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  listingId   String   @map("listing_id") @db.Uuid
+  status      String
+  template    String?
+  inputFiles  Json?    @map("input_files")
+  outputFile  String?  @map("output_file")
+  error       String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user        User     @relation(fields: [userId], references: [id])
+  listing     Listing  @relation(fields: [listingId], references: [id])
 
   @@map("video_jobs")
 }
 
-model TempUpload {
-  id        String   @id @default(uuid())
-  sessionId String   @unique
-  files     Json     // Array of file objects
-  address   String?
-  expiresAt DateTime
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model SearchHistory {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  query     String
+  createdAt DateTime @default(now()) @map("created_at")
 
-  @@index([sessionId])
-  @@index([expiresAt])
+  // Relations
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@map("search_history")
+}
+
+model ErrorLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String?  @map("user_id") @db.Uuid
+  error     String
+  stack     String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@map("error_logs")
+}
+
+model TempUpload {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+  address     String?
+  files       Json     @default("[]")
+  createdAt   DateTime @default(now()) @map("created_at")
+  expiresAt   DateTime @map("expires_at")
+
+  // Relations
+  user        User     @relation(fields: [userId], references: [id])
+
+  @@map("temp_uploads")
 }
