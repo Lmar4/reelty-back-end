@@ -60,8 +60,8 @@ importers:
         specifier: ^17.6.0
         version: 17.6.0
       superjson:
-        specifier: ^2.2.2
-        version: 2.2.2
+        specifier: 1.13.3
+        version: 1.13.3
       uuid:
         specifier: ^11.0.5
         version: 11.0.5
@@ -2367,9 +2367,9 @@ packages:
   stubs@3.0.0:
     resolution: {integrity: sha512-PdHt7hHUJKxvTCgbKX9C1V/ftOcjJQgz8BZwNfV5c4B6dcGqlpelTbJ999jBGZ2jYiPAwcX5dP6oBwVlBlUbxw==}
 
-  superjson@2.2.2:
-    resolution: {integrity: sha512-5JRxVqC8I8NuOUjzBbvVJAKNM8qoVuH0O77h4WInc/qC2q5IreqKxYwgkga3PfA22OayK2ikceb/B26dztPl+Q==}
-    engines: {node: '>=16'}
+  superjson@1.13.3:
+    resolution: {integrity: sha512-mJiVjfd2vokfDxsQPOwJ/PtanO87LhpYY88ubI5dUB1Ab58Txbyje3+jpm+/83R/fevaq/107NNhtYBLuoTrFg==}
+    engines: {node: '>=10'}
 
   tar-fs@3.0.8:
     resolution: {integrity: sha512-ZoROL70jptorGAlgAYiLoBLItEKw/fUxg9BSYK/dF/GAGYFJOJJJMvjPAKDJraCXFwadD456FCuvLWgfhMsPwg==}
@@ -5600,7 +5600,7 @@ snapshots:
   stubs@3.0.0:
     optional: true
 
-  superjson@2.2.2:
+  superjson@1.13.3:
     dependencies:
       copy-anything: 3.0.5
 
