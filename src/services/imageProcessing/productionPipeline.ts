@@ -53,7 +53,7 @@ export class ProductionPipeline {
       await new Promise((resolve, reject) => {
         if (response.Body instanceof Readable) {
           response.Body.pipe(writeStream)
-            .on("finish", resolve)
+            .on("finish", () => resolve(localPath))
             .on("error", reject);
         }
       });
