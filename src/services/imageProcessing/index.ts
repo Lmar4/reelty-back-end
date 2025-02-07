@@ -1,5 +1,5 @@
 import { PrismaClient } from "@prisma/client";
-import { AllowedMimeTypes } from "../../constants/storage";
+import { AllowedMimeTypes } from "../../config/storage";
 import { StorageService } from "../storage";
 import { ProductionPipeline } from "./productionPipeline";
 import { MapCapture } from "./mapCapture";

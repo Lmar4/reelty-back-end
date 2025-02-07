@@ -9,7 +9,7 @@ import {
   StoragePathParams,
   StoragePathSchema,
   STORAGE_BUCKET_NAME,
-} from "../constants/storage";
+} from "../config/storage";
 
 const s3Client = new S3Client({
   region: process.env.AWS_REGION || "us-east-1",

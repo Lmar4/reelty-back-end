@@ -1,9 +1,15 @@
-import { TRPCError } from "@trpc/server";
 import { getAuth } from "@clerk/express";
 import type { Request } from "express";
 
 if (!process.env.CLERK_SECRET_KEY) {
   throw new Error("Missing CLERK_SECRET_KEY environment variable");
+}
+
+export class AuthError extends Error {
+  constructor(public statusCode: number, message: string) {
+    super(message);
+    this.name = "AuthError";
+  }
 }
 
 export async function validateRequest(req: Request) {
@@ -12,10 +18,7 @@ export async function validateRequest(req: Request) {
     const auth = getAuth(req);
 
     if (!auth.sessionId) {
-      throw new TRPCError({
-        code: "UNAUTHORIZED",
-        message: "Invalid or missing session",
-      });
+      throw new AuthError(401, "Invalid or missing session");
     }
 
     return {
@@ -23,10 +26,9 @@ export async function validateRequest(req: Request) {
       sessionId: auth.sessionId,
     };
   } catch (error) {
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: "Authentication failed",
-      cause: error,
-    });
+    if (error instanceof AuthError) {
+      throw error;
+    }
+    throw new AuthError(401, "Authentication failed");
   }
 }

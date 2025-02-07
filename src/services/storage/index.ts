@@ -7,7 +7,7 @@ import {
   MaxFileSizes,
   STORAGE_BUCKET_NAME,
   AssetType,
-} from "../../constants/storage";
+} from "../../config/storage";
 import {
   generateStoragePath,
   generatePresignedUploadUrl,
@@ -60,6 +60,8 @@ export class StorageService {
       case "document":
         pathTemplate = StoragePathSchema.PROPERTY.DOCUMENTS;
         break;
+      default:
+        throw new Error(`Unsupported file type: ${file.type}`);
     }
 
     const fileKey = `${generateStoragePath(pathTemplate, {

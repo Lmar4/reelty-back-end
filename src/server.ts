@@ -1,9 +1,17 @@
-import express, { RequestHandler } from "express";
+import express, {
+  NextFunction,
+  Request,
+  Response,
+  ErrorRequestHandler,
+} from "express";
 import cors from "cors";
-import * as trpcExpress from "@trpc/server/adapters/express";
-import { createContext } from "./trpc/types";
-import { getAppRouter } from "./trpc/router";
-import { clerkMiddleware } from "@clerk/express";
+import { clerkMiddleware, requireAuth } from "@clerk/express";
+import userRoutes from "./routes/user";
+import storageRoutes from "./routes/storage";
+import jobRoutes from "./routes/job";
+import subscriptionRoutes from "./routes/subscription";
+import authRoutes from "./routes/auth";
+import adminRoutes from "./routes/admin";
 
 const app = express();
 
@@ -15,31 +23,59 @@ app.use(
   })
 );
 
-// Apply Clerk middleware for authentication
-app.use(clerkMiddleware());
+// Parse JSON bodies
+app.use(express.json());
 
-// Initialize the server asynchronously
-const initializeServer = async () => {
-  const appRouter = await getAppRouter();
+// Public routes (no auth required)
+app.get("/api/health", (_req: Request, res: Response) => {
+  res.status(200).json({ status: "ok" });
+});
 
-  // Apply tRPC middleware
-  const trpcMiddleware = trpcExpress.createExpressMiddleware({
-    router: appRouter,
-    createContext,
-  }) as unknown as RequestHandler;
+// Auth routes (some might be public)
+app.use("/api/auth", authRoutes);
 
-  // Set up the tRPC route
-  app.use("/api/trpc", trpcMiddleware);
+// Apply Clerk middleware for all protected routes
+const authenticatedRouter = express.Router();
+authenticatedRouter.use(clerkMiddleware());
+authenticatedRouter.use(requireAuth());
 
-  // Start the server
-  const port = process.env.PORT || 8081;
-  app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+// Protected routes
+authenticatedRouter.use("/users", userRoutes);
+authenticatedRouter.use("/storage", storageRoutes);
+authenticatedRouter.use("/jobs", jobRoutes);
+authenticatedRouter.use("/subscription", subscriptionRoutes);
+
+// Admin routes (requires additional admin check)
+authenticatedRouter.use("/admin", adminRoutes);
+
+// Mount authenticated routes under /api
+app.use("/api", authenticatedRouter);
+
+// Error handling middleware
+const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
+  console.error("Error:", err);
+
+  if (err.name === "ClerkError") {
+    res.status(401).json({
+      error: "Authentication failed",
+      status: 401,
+    });
+    return;
+  }
+
+  res.status(500).json({
+    error: "Internal server error",
+    status: 500,
   });
+  return;
 };
 
-// Start the server and handle any initialization errors
-initializeServer().catch((error) => {
-  console.error("Failed to start server:", error);
-  process.exit(1);
+app.use(errorHandler);
+
+// Start the server
+const port = parseInt(process.env.PORT || "3001", 10);
+const host = "127.0.0.1"; // Use localhost instead of 0.0.0.0
+
+app.listen(port, host, () => {
+  console.log(`Server running on http://${host}:${port}`);
 });
