@@ -1,8 +1,10 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
-import { getMessaging } from "firebase-admin/messaging";
+import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 import { z } from "zod";
 import { PrismaClient } from "@prisma/client";
+
 const prisma = new PrismaClient();
+const snsClient = new SNSClient({ region: process.env.AWS_REGION });
 
 const notificationSchema = z.object({
   userId: z.string().uuid(),
@@ -24,15 +26,20 @@ export async function sendJobStatusNotification(
     const body = JSON.parse(event.body);
     const validatedData = notificationSchema.parse(body);
 
-    // Get user's FCM token from database
+    // Get user's notification settings from database
     const user = await prisma.user.findUnique({
       where: { id: validatedData.userId },
+      select: {
+        email: true,
+        name: true,
+        fcmToken: true,
+      },
     });
 
-    if (!user?.fcmToken) {
+    if (!user?.email) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: "User has no FCM token registered" }),
+        body: JSON.stringify({ error: "User has no email registered" }),
       };
     }
 
@@ -51,26 +58,37 @@ export async function sendJobStatusNotification(
 
     // Prepare notification message
     const message = {
-      notification: {
-        title: "Video Job Update",
-        body: `Your video for ${job.listing.address} is ${validatedData.jobStatus}`,
-      },
-      data: {
-        jobId: validatedData.jobId,
-        status: validatedData.jobStatus,
-        timestamp: new Date().toISOString(),
-      },
-      token: user.fcmToken,
+      default: `Your video for ${job.listing.address} is ${validatedData.jobStatus}`,
+      email: `
+        <h2>Video Job Update</h2>
+        <p>Your video for ${job.listing.address} is now ${
+        validatedData.jobStatus
+      }.</p>
+        <p>Job Details:</p>
+        <ul>
+          <li>Job ID: ${validatedData.jobId}</li>
+          <li>Status: ${validatedData.jobStatus}</li>
+          <li>Updated: ${new Date().toLocaleString()}</li>
+        </ul>
+      `,
+      sms: `Reelty: Your video for ${job.listing.address} is ${validatedData.jobStatus}`,
     };
 
-    // Send notification
-    const response = await getMessaging().send(message);
+    // Send notification through SNS
+    const command = new PublishCommand({
+      TopicArn: process.env.SNS_TOPIC_ARN,
+      Message: JSON.stringify(message),
+      MessageStructure: "json",
+      Subject: "Video Job Update",
+    });
+
+    const response = await snsClient.send(command);
 
     return {
       statusCode: 200,
       body: JSON.stringify({
         success: true,
-        messageId: response,
+        messageId: response.MessageId,
       }),
     };
   } catch (error) {

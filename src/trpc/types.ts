@@ -1,7 +1,7 @@
 import { inferAsyncReturnType, initTRPC, TRPCError } from "@trpc/server";
 import * as trpcExpress from "@trpc/server/adapters/express";
 import { prisma } from "../lib/prisma";
-import { verifyFirebaseToken, type UserPayload } from "../lib/awsAdmin";
+import { verifyUserSession, type UserPayload } from "../lib/auth";
 
 // Context type definition
 export const createContext = async ({
@@ -15,7 +15,7 @@ export const createContext = async ({
   if (authHeader && authHeader.startsWith("Bearer ")) {
     const token = authHeader.substring(7);
     try {
-      user = await verifyFirebaseToken(token);
+      user = await verifyUserSession(token);
     } catch (error) {
       console.error("Error verifying token:", error);
     }
