@@ -10,23 +10,23 @@ The backend service for the Reelty real estate management platform.
 - Payment processing integration
 - Real-time notifications
 - Database management
-- Caching system
-- Background job processing
-- API rate limiting
-- Logging and monitoring
+- Video processing
+- Image optimization
+- AWS integration
+- Analytics tracking
 
 ## 🛠️ Tech Stack
 
-- **Framework:** FastAPI
+- **Runtime:** Node.js
+- **Framework:** Express.js
 - **Database:** PostgreSQL
-- **ORM:** SQLAlchemy
-- **Authentication:** Firebase Admin SDK
-- **Task Queue:** Celery
-- **Cache:** Redis
-- **Storage:** Firebase Storage
+- **ORM:** Prisma
+- **Authentication:** Clerk
+- **Cloud Services:** AWS (S3, SNS)
 - **Payment Processing:** Stripe
-- **Testing:** pytest
-- **Documentation:** OpenAPI (Swagger)
+- **Media Processing:** FFmpeg, Sharp
+- **Analytics:** PostHog
+- **Language:** TypeScript
 
 ## 📦 Installation
 
@@ -37,44 +37,74 @@ git clone <repository-url>
 cd reelty_backend
 ```
 
-2. Create and activate a virtual environment:
+2. Install dependencies:
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+pnpm install
 ```
 
-3. Install dependencies:
+3. Set up environment variables:
+   Create a `.env` file in the root directory and add necessary environment variables.
+
+4. Initialize the database:
 
 ```bash
-pip install -r requirements.txt
-```
-
-4. Set up environment variables:
-   Create a `.env` file in the root directory and add:
-
-```env
-DATABASE_URL=postgresql://user:password@localhost:5432/reelty
-FIREBASE_CREDENTIALS_PATH=path/to/firebase-credentials.json
-STRIPE_SECRET_KEY=your_stripe_secret_key
-REDIS_URL=redis://localhost:6379
-```
-
-5. Initialize the database:
-
-```bash
-alembic upgrade head
+pnpm db:generate
+pnpm db:push
 ```
 
 ## 🚀 Development
 
-Start the development server:
+Available scripts:
 
 ```bash
-uvicorn app.main:app --reload
+pnpm dev          # Start development server with hot reload
+pnpm build        # Build the project
+pnpm start        # Start production server
+pnpm db:generate  # Generate Prisma client
+pnpm db:push      # Push database changes
+pnpm db:migrate   # Run database migrations
+pnpm db:seed      # Seed the database
 ```
 
-The API will be available at `http://localhost:8000`
+## 🏗️ Project Structure
+
+```
+reelty_backend/
+├── prisma/            # Database schema and migrations
+├── src/
+│   ├── api/          # API routes and controllers
+│   ├── lib/          # Shared libraries and utilities
+│   ├── services/     # Business logic
+│   ├── types/        # TypeScript type definitions
+│   └── server.ts     # Server entry point
+├── tests/            # Test files
+└── package.json      # Project dependencies and scripts
+```
+
+## 🔒 Environment Variables
+
+| Variable            | Description                     |
+| ------------------- | ------------------------------- |
+| `DATABASE_URL`      | PostgreSQL connection string    |
+| `CLERK_SECRET_KEY`  | Clerk authentication secret key |
+| `STRIPE_SECRET_KEY` | Stripe secret key               |
+| `AWS_ACCESS_KEY_ID` | AWS access key ID               |
+| `AWS_SECRET_KEY`    | AWS secret access key           |
+| `AWS_REGION`        | AWS region                      |
+| `POSTHOG_API_KEY`   | PostHog analytics API key       |
+| `RUNWAY_API_KEY`    | Runway ML API key               |
+
+## 📝 Main Dependencies
+
+- `@clerk/backend`, `@clerk/express` - Authentication and user management
+- `@prisma/client` - Database ORM
+- `@aws-sdk/*` - AWS services integration
+- `stripe` - Payment processing
+- `sharp` - Image processing
+- `fluent-ffmpeg` - Video processing
+- `posthog-node` - Analytics
+- `winston` - Logging
 
 ## 📚 API Documentation
 
@@ -88,69 +118,14 @@ Once the server is running, you can access:
 Run tests:
 
 ```bash
-pytest
+pnpm test
 ```
 
 Run tests with coverage:
 
 ```bash
-pytest --cov=app
+pnpm test:cov
 ```
-
-## 🏗️ Project Structure
-
-```
-reelty_backend/
-├── alembic/            # Database migrations
-├── app/
-│   ├── api/           # API endpoints
-│   ├── core/          # Core functionality
-│   ├── models/        # Database models
-│   ├── schemas/       # Pydantic schemas
-│   ├── services/      # Business logic
-│   └── utils/         # Utility functions
-├── tests/             # Test files
-├── alembic.ini        # Alembic configuration
-└── requirements.txt   # Project dependencies
-```
-
-## 🔒 Environment Variables
-
-| Variable                    | Description                                  |
-| --------------------------- | -------------------------------------------- |
-| `DATABASE_URL`              | PostgreSQL connection string                 |
-| `FIREBASE_CREDENTIALS_PATH` | Path to Firebase service account key         |
-| `STRIPE_SECRET_KEY`         | Stripe secret key                            |
-| `REDIS_URL`                 | Redis connection string                      |
-| `LOG_LEVEL`                 | Logging level (default: INFO)                |
-| `ENVIRONMENT`               | Runtime environment (development/production) |
-
-## 📝 API Endpoints
-
-### Authentication
-
-- `POST /api/auth/verify` - Verify Firebase token
-- `POST /api/auth/refresh` - Refresh access token
-
-### Properties
-
-- `GET /api/properties` - List properties
-- `POST /api/properties` - Create property
-- `GET /api/properties/{id}` - Get property details
-- `PUT /api/properties/{id}` - Update property
-- `DELETE /api/properties/{id}` - Delete property
-
-### Users
-
-- `GET /api/users/me` - Get current user
-- `PUT /api/users/me` - Update current user
-- `GET /api/users/{id}` - Get user details
-
-### Subscriptions
-
-- `GET /api/subscriptions` - List subscriptions
-- `POST /api/subscriptions` - Create subscription
-- `DELETE /api/subscriptions/{id}` - Cancel subscription
 
 ## 🤝 Contributing
 

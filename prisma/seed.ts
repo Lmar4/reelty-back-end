@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { PrismaClient, AssetType } from "@prisma/client";
 
 const prisma = new PrismaClient();
@@ -6,6 +7,7 @@ const prisma = new PrismaClient();
 const TIER_BASIC_ID = "550e8400-e29b-41d4-a716-446655440000";
 const TIER_PRO_ID = "550e8400-e29b-41d4-a716-446655440001";
 const TIER_ENTERPRISE_ID = "550e8400-e29b-41d4-a716-446655440002";
+const TIER_ADMIN_ID = "550e8400-e29b-41d4-a716-446655440003";
 
 async function main() {
   console.log("Starting database seed...");
@@ -49,15 +51,50 @@ async function main() {
       ],
       monthlyPrice: 99.99,
     },
+    {
+      id: TIER_ADMIN_ID,
+      name: "Admin",
+      description: "Administrative access",
+      stripePriceId: "price_admin",
+      stripeProductId: "prod_admin",
+      features: ["Full administrative access", "All features"],
+      monthlyPrice: 0,
+    },
   ];
 
   console.log("Seeding subscription tiers...");
   for (const tier of tiers) {
-    const created = await prisma.subscriptionTier.create({
-      data: tier,
+    await prisma.subscriptionTier.upsert({
+      where: { id: tier.id },
+      update: tier,
+      create: tier,
     });
-    console.log(`Created subscription tier: ${created.id}`);
+    console.log(`Created/updated subscription tier: ${tier.id}`);
   }
+
+  // Create admin user
+  console.log("Creating admin user...");
+  const adminUser = await prisma.user.upsert({
+    where: { id: "user_2siThAOP4AfhLAITRyB9lsy9hw5" },
+    update: {
+      email: "admin@reelty.com",
+      firstName: "Admin",
+      lastName: "User",
+      password: "$2b$10$dGQI7Ut8.M/BzMgvx5Y8UOEFVtD9yvD3FIp0Fs9RDvWRvYXGw3bLG",
+      currentTierId: TIER_ADMIN_ID,
+      subscriptionStatus: "active",
+    },
+    create: {
+      id: "user_2siThAOP4AfhLAITRyB9lsy9hw5",
+      email: "admin@reelty.com",
+      firstName: "Admin",
+      lastName: "User",
+      password: "$2b$10$dGQI7Ut8.M/BzMgvx5Y8UOEFVtD9yvD3FIp0Fs9RDvWRvYXGw3bLG",
+      currentTierId: TIER_ADMIN_ID,
+      subscriptionStatus: "active",
+    },
+  });
+  console.log(`Created/updated admin user: ${adminUser.email}`);
 
   // Create templates
   const templates = [
@@ -121,21 +158,6 @@ async function main() {
     });
     console.log(`Created asset: ${created.name}`);
   }
-
-  // Create a test user
-  const user = await prisma.user.create({
-    data: {
-      id: "user_2YBnXvtZtkXH1KZJ", // Test Clerk ID
-      email: "test@example.com",
-      password: "$2b$10$dGQI7Ut8.M/BzMgvx5Y8UOEFVtD9yvD3FIp0Fs9RDvWRvYXGw3bLG",
-      firstName: "Test",
-      lastName: "User",
-      stripeCustomerId: "cus_test123",
-      currentTierId: TIER_BASIC_ID,
-      subscriptionStatus: "active",
-    },
-  });
-  console.log(`Created test user: ${user.email}`);
 
   console.log("Seeding completed successfully!");
 }
