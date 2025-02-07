@@ -14,7 +14,7 @@ async function main() {
       stripePriceId: "price_basic_monthly",
       stripeProductId: "prod_basic",
       features: ["5 listings", "Basic templates", "Email support"],
-      monthlyPrice: 0.0,
+      monthlyPrice: 0,
     },
     {
       id: "tier_pro",
