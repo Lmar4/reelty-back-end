@@ -31,8 +31,8 @@ export async function sendJobStatusNotification(
       where: { id: validatedData.userId },
       select: {
         email: true,
-        name: true,
-        fcmToken: true,
+        firstName: true,
+        lastName: true,
       },
     });
 

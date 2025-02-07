@@ -1,8 +1,12 @@
-import express, { RequestHandler } from "express";
+import { getAuth } from "@clerk/express";
 import { PrismaClient } from "@prisma/client";
+import express, { RequestHandler } from "express";
 import { z } from "zod";
 import { validateRequest } from "../middleware/validate";
-import { getAuth } from "@clerk/express";
+import {
+  SUBSCRIPTION_TIERS,
+  isValidTierId,
+} from "../constants/subscription-tiers";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -10,7 +14,23 @@ const prisma = new PrismaClient();
 // Validation schemas
 const updateTierSchema = z.object({
   body: z.object({
-    tierId: z.string().min(1),
+    tierId: z
+      .string()
+      .uuid()
+      .refine((val) => isValidTierId(val), {
+        message: "Invalid subscription tier ID",
+      }),
+  }),
+});
+
+const updateSubscriptionSchema = z.object({
+  body: z.object({
+    userId: z.string().min(1),
+    stripeSubscriptionId: z.string().min(1),
+    stripePriceId: z.string().min(1),
+    stripeProductId: z.string().min(1),
+    status: z.string().min(1),
+    currentPeriodEnd: z.number(),
   }),
 });
 
@@ -18,12 +38,11 @@ const updateTierSchema = z.object({
 const getTiers: RequestHandler = async (_req, res) => {
   try {
     const tiers = await prisma.subscriptionTier.findMany({
-      where: {
-        isAdmin: false, // Don't expose admin tiers
-      },
-      orderBy: {
-        pricing: "asc",
-      },
+      orderBy: [
+        {
+          createdAt: "asc",
+        },
+      ],
     });
 
     res.json({
@@ -53,11 +72,19 @@ const updateTier: RequestHandler = async (req, res) => {
 
     const { tierId } = req.body;
 
-    // Verify tier exists and is not an admin tier
-    const tier = await prisma.subscriptionTier.findFirst({
+    // Additional validation using the constant
+    if (!isValidTierId(tierId)) {
+      res.status(400).json({
+        success: false,
+        error: "Invalid subscription tier",
+      });
+      return;
+    }
+
+    // Verify tier exists
+    const tier = await prisma.subscriptionTier.findUnique({
       where: {
         id: tierId,
-        isAdmin: false,
       },
     });
 
@@ -69,24 +96,42 @@ const updateTier: RequestHandler = async (req, res) => {
       return;
     }
 
+    // Get current user data
+    const currentUser = await prisma.user.findUnique({
+      where: { id: auth.userId },
+      select: {
+        id: true,
+        currentTierId: true,
+      },
+    });
+
+    if (!currentUser) {
+      res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+      return;
+    }
+
     // Update user's tier
     const user = await prisma.user.update({
       where: {
         id: auth.userId,
       },
       data: {
-        subscriptionTier: tierId,
+        currentTierId: tierId,
       },
-      include: {
-        tier: true,
+      select: {
+        id: true,
+        currentTier: true,
       },
     });
 
     // Log the tier change
     await prisma.tierChange.create({
       data: {
-        userId: auth.userId,
-        oldTier: user.subscriptionTier,
+        userId: user.id,
+        oldTier: currentUser.currentTierId || tierId,
         newTier: tierId,
         reason: "User initiated change",
       },
@@ -96,7 +141,7 @@ const updateTier: RequestHandler = async (req, res) => {
       success: true,
       data: {
         userId: user.id,
-        tier: user.tier,
+        tier: user.currentTier,
       },
     });
   } catch (error) {
@@ -138,9 +183,103 @@ const initiateCheckout: RequestHandler = async (req, res) => {
   }
 };
 
+// Update subscription from Stripe
+const updateSubscriptionFromStripe: RequestHandler = async (req, res) => {
+  try {
+    const {
+      userId,
+      stripeSubscriptionId,
+      stripePriceId,
+      stripeProductId,
+      status,
+      currentPeriodEnd,
+    } = req.body;
+
+    // Update user's subscription
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        stripeSubscriptionId,
+        stripePriceId,
+        stripeProductId,
+        subscriptionStatus: status,
+        subscriptionPeriodEnd: new Date(currentPeriodEnd * 1000),
+        updatedAt: new Date(),
+      },
+    });
+
+    // Log the subscription update
+    await prisma.subscriptionLog.create({
+      data: {
+        userId: updatedUser.id,
+        action: "update",
+        stripeSubscriptionId,
+        stripePriceId,
+        stripeProductId,
+        status,
+        periodEnd: new Date(currentPeriodEnd * 1000),
+      },
+    });
+
+    res.json({
+      success: true,
+      data: updatedUser,
+    });
+  } catch (error) {
+    console.error("Update subscription error:", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+  }
+};
+
+// Cancel subscription
+const cancelSubscription: RequestHandler = async (req, res) => {
+  try {
+    const { userId, stripeSubscriptionId } = req.body;
+
+    // Update user's subscription status
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        subscriptionStatus: "canceled",
+        updatedAt: new Date(),
+      },
+    });
+
+    // Log the cancellation
+    await prisma.subscriptionLog.create({
+      data: {
+        userId: updatedUser.id,
+        action: "cancel",
+        stripeSubscriptionId,
+        status: "canceled",
+      },
+    });
+
+    res.json({
+      success: true,
+      data: updatedUser,
+    });
+  } catch (error) {
+    console.error("Cancel subscription error:", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+  }
+};
+
 // Route handlers
 router.get("/tiers", getTiers);
 router.patch("/tier", validateRequest(updateTierSchema), updateTier);
 router.post("/checkout", initiateCheckout);
+router.post(
+  "/update",
+  validateRequest(updateSubscriptionSchema),
+  updateSubscriptionFromStripe
+);
+router.post("/cancel", cancelSubscription);
 
 export default router;

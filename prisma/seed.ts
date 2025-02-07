@@ -2,13 +2,18 @@ import { PrismaClient, AssetType } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
+// Generate UUIDs for tiers
+const TIER_BASIC_ID = "550e8400-e29b-41d4-a716-446655440000";
+const TIER_PRO_ID = "550e8400-e29b-41d4-a716-446655440001";
+const TIER_ENTERPRISE_ID = "550e8400-e29b-41d4-a716-446655440002";
+
 async function main() {
   console.log("Starting database seed...");
 
   // Create subscription tiers
   const tiers = [
     {
-      id: "tier_basic",
+      id: TIER_BASIC_ID,
       name: "Basic",
       description: "Essential features for getting started",
       stripePriceId: "price_basic_monthly",
@@ -17,21 +22,31 @@ async function main() {
       monthlyPrice: 0,
     },
     {
-      id: "tier_pro",
+      id: TIER_PRO_ID,
       name: "Professional",
       description: "Advanced features for real estate professionals",
       stripePriceId: "price_pro_monthly",
       stripeProductId: "prod_pro",
-      features: ["20 listings", "Pro templates", "Priority support", "Analytics"],
+      features: [
+        "20 listings",
+        "Pro templates",
+        "Priority support",
+        "Analytics",
+      ],
       monthlyPrice: 29.99,
     },
     {
-      id: "tier_enterprise",
+      id: TIER_ENTERPRISE_ID,
       name: "Enterprise",
       description: "Custom solutions for large teams",
       stripePriceId: "price_enterprise_monthly",
       stripeProductId: "prod_enterprise",
-      features: ["Unlimited listings", "Custom templates", "Dedicated support", "API access"],
+      features: [
+        "Unlimited listings",
+        "Custom templates",
+        "Dedicated support",
+        "API access",
+      ],
       monthlyPrice: 99.99,
     },
   ];
@@ -41,7 +56,7 @@ async function main() {
     const created = await prisma.subscriptionTier.create({
       data: tier,
     });
-    console.log(`Created subscription tier: ${created.name}`);
+    console.log(`Created subscription tier: ${created.id}`);
   }
 
   // Create templates
@@ -53,17 +68,20 @@ async function main() {
       durations: { intro: 2, main: 15, outro: 3 },
       musicPath: "/assets/music/minimal.mp3",
       musicVolume: 0.8,
-      subscriptionTier: "tier_basic",
+      subscriptionTier: TIER_BASIC_ID,
       isActive: true,
     },
     {
       name: "Dynamic Pro",
       description: "Professional template with dynamic transitions",
-      sequence: { transitions: ["dissolve", "wipe"], effects: ["blur", "rotate"] },
+      sequence: {
+        transitions: ["dissolve", "wipe"],
+        effects: ["blur", "rotate"],
+      },
       durations: { intro: 3, main: 20, outro: 4 },
       musicPath: "/assets/music/upbeat.mp3",
       musicVolume: 0.9,
-      subscriptionTier: "tier_pro",
+      subscriptionTier: TIER_PRO_ID,
       isActive: true,
     },
   ];
@@ -83,7 +101,7 @@ async function main() {
       description: "Relaxing background music",
       filePath: "/assets/music/smooth.mp3",
       type: AssetType.MUSIC,
-      subscriptionTier: "tier_basic",
+      subscriptionTier: TIER_BASIC_ID,
       isActive: true,
     },
     {
@@ -91,7 +109,7 @@ async function main() {
       description: "Professional watermark overlay",
       filePath: "/assets/watermarks/premium.png",
       type: AssetType.WATERMARK,
-      subscriptionTier: "tier_pro",
+      subscriptionTier: TIER_PRO_ID,
       isActive: true,
     },
   ];
@@ -107,12 +125,13 @@ async function main() {
   // Create a test user
   const user = await prisma.user.create({
     data: {
+      id: "user_2YBnXvtZtkXH1KZJ", // Test Clerk ID
       email: "test@example.com",
-      password: "$2b$10$dGQI7Ut8.M/BzMgvx5Y8UOEFVtD9yvD3FIp0Fs9RDvWRvYXGw3bLG", // hashed "password123"
+      password: "$2b$10$dGQI7Ut8.M/BzMgvx5Y8UOEFVtD9yvD3FIp0Fs9RDvWRvYXGw3bLG",
       firstName: "Test",
       lastName: "User",
       stripeCustomerId: "cus_test123",
-      currentTierId: "tier_basic",
+      currentTierId: TIER_BASIC_ID,
       subscriptionStatus: "active",
     },
   });

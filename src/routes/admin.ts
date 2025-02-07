@@ -3,6 +3,7 @@ import { getAuth } from "@clerk/express";
 import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { validateRequest } from "../middleware/validate";
+import { SUBSCRIPTION_TIERS } from "../constants/subscription-tiers";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -19,7 +20,9 @@ const assetSchema = z.object({
   }),
 });
 
-const assetUpdateSchema = assetSchema.deepPartial();
+const assetUpdateSchema = z.object({
+  body: assetSchema.shape.body.partial(),
+});
 
 // Middleware to check if user is admin
 const requireAdmin: RequestHandler = async (req, res, next) => {
@@ -35,12 +38,15 @@ const requireAdmin: RequestHandler = async (req, res, next) => {
 
     const user = await prisma.user.findUnique({
       where: { id: auth.userId },
-      include: {
-        tier: true,
+      select: {
+        currentTierId: true,
       },
     });
 
-    if (!user?.tier?.isAdmin) {
+    if (
+      !user?.currentTierId ||
+      user.currentTierId !== SUBSCRIPTION_TIERS.ADMIN
+    ) {
       res.status(403).json({
         error: "Forbidden: Admin access required",
         status: 403,
@@ -183,7 +189,7 @@ const getUserStats: RequestHandler = async (_req, res) => {
         },
       }),
       prisma.user.groupBy({
-        by: ["subscriptionTier"],
+        by: ["currentTierId"],
         _count: true,
       }),
     ]);
@@ -194,7 +200,7 @@ const getUserStats: RequestHandler = async (_req, res) => {
         totalUsers,
         activeUsers,
         usersByTier: usersByTier.map((tier) => ({
-          tier: tier.subscriptionTier,
+          tier: tier.currentTierId,
           count: tier._count,
         })),
       },

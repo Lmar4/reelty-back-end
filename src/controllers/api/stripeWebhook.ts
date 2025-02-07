@@ -1,10 +1,10 @@
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { PrismaClient } from '@prisma/client';
-import Stripe from 'stripe';
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
+import { PrismaClient } from "@prisma/client";
+import Stripe from "stripe";
 
 const prisma = new PrismaClient();
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '', {
-  apiVersion: '2025-01-27.acacia'
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
+  apiVersion: "2025-01-27.acacia",
 });
 
 const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -16,15 +16,15 @@ export async function handleStripeWebhook(
     if (!event.body) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: 'Request body is required' })
+        body: JSON.stringify({ error: "Request body is required" }),
       };
     }
 
-    const sig = event.headers['stripe-signature'];
+    const sig = event.headers["stripe-signature"];
     if (!sig || !webhookSecret) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: 'Stripe signature is required' })
+        body: JSON.stringify({ error: "Stripe signature is required" }),
       };
     }
 
@@ -39,13 +39,13 @@ export async function handleStripeWebhook(
     } catch (err) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: 'Invalid signature' })
+        body: JSON.stringify({ error: "Invalid signature" }),
       };
     }
 
     // Handle different event types
     switch (stripeEvent.type) {
-      case 'payment_intent.succeeded': {
+      case "payment_intent.succeeded": {
         const paymentIntent = stripeEvent.data.object as Stripe.PaymentIntent;
         const { userId, subscriptionPlan } = paymentIntent.metadata;
 
@@ -53,17 +53,17 @@ export async function handleStripeWebhook(
         await prisma.user.update({
           where: { id: userId },
           data: {
-            subscriptionTier: subscriptionPlan,
-            updatedAt: new Date()
-          }
+            currentTierId: subscriptionPlan,
+            updatedAt: new Date(),
+          },
         });
 
         break;
       }
 
-      case 'payment_intent.payment_failed': {
+      case "payment_intent.payment_failed": {
         const paymentIntent = stripeEvent.data.object as Stripe.PaymentIntent;
-        console.error('Payment failed:', paymentIntent.id);
+        console.error("Payment failed:", paymentIntent.id);
         // Optionally notify the user or take other actions
         break;
       }
@@ -75,14 +75,13 @@ export async function handleStripeWebhook(
 
     return {
       statusCode: 200,
-      body: JSON.stringify({ received: true })
+      body: JSON.stringify({ received: true }),
     };
-
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error("Webhook error:", error);
     return {
       statusCode: 500,
-      body: JSON.stringify({ error: 'Webhook handler failed' })
+      body: JSON.stringify({ error: "Webhook handler failed" }),
     };
   }
 }

@@ -17,7 +17,7 @@ enum AssetType {
 }
 
 model User {
-  id                    String      @id @default(uuid())
+  id                    String      @id // Clerk ID
   email                 String      @unique
   firstName            String?
   lastName             String?
@@ -28,12 +28,13 @@ model User {
   stripeProductId      String?
   subscriptionStatus   String?     @default("inactive")
   subscriptionPeriodEnd DateTime?
-  currentTierId        String?
+  currentTierId        String?     @db.Uuid
+  lastLoginAt         DateTime?
   createdAt           DateTime    @default(now())
   updatedAt           DateTime    @updatedAt
-  subscriptionLogs    SubscriptionLog[]
 
   // Relations
+  subscriptionLogs    SubscriptionLog[]
   creditLogs      CreditLog[]    @relation("UserCreditLogs")
   adminCreditLogs CreditLog[]    @relation("AdminCreditLogs")
   tierChanges     TierChange[]   @relation("UserTierChanges")
@@ -52,7 +53,7 @@ model User {
 }
 
 model SubscriptionTier {
-  id              String   @id @default(uuid())
+  id              String   @id @default(uuid()) @db.Uuid
   name            String
   description     String
   stripePriceId   String   @unique
@@ -61,11 +62,11 @@ model SubscriptionTier {
   monthlyPrice    Float
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
-  users          User[]
 
   // Relations
-  templates   Template[]
-  assets      Asset[]
+  users          User[]
+  templates      Template[]
+  assets         Asset[]
 
   @@map("subscription_tiers")
 }
@@ -78,7 +79,7 @@ model Template {
   durations       Json
   musicPath       String?  @map("music_path")
   musicVolume     Float?   @default(1.0) @map("music_volume")
-  subscriptionTier String  @map("subscription_tier")
+  subscriptionTier String  @map("subscription_tier") @db.Uuid
   isActive        Boolean  @default(true) @map("is_active")
   createdAt       DateTime @default(now()) @map("created_at")
   updatedAt       DateTime @updatedAt @map("updated_at")
@@ -92,10 +93,10 @@ model Template {
 
 model CreditLog {
   id        String   @id @default(uuid()) @db.Uuid
-  userId    String   @map("user_id") @db.Uuid
+  userId    String   @map("user_id")
   amount    Int
   reason    String
-  adminId   String?  @map("admin_id") @db.Uuid
+  adminId   String?  @map("admin_id")
   createdAt DateTime @default(now()) @map("created_at")
 
   // Relations
@@ -107,11 +108,11 @@ model CreditLog {
 
 model TierChange {
   id        String   @id @default(uuid()) @db.Uuid
-  userId    String   @map("user_id") @db.Uuid
-  oldTier   String   @map("old_tier")
-  newTier   String   @map("new_tier")
+  userId    String   @map("user_id")
+  oldTier   String   @map("old_tier") @db.Uuid
+  newTier   String   @map("new_tier") @db.Uuid
   reason    String
-  adminId   String?  @map("admin_id") @db.Uuid
+  adminId   String?  @map("admin_id")
   createdAt DateTime @default(now()) @map("created_at")
 
   // Relations
@@ -127,7 +128,7 @@ model Asset {
   description     String?
   filePath        String   @map("file_path")
   type            AssetType
-  subscriptionTier String  @map("subscription_tier")
+  subscriptionTier String  @map("subscription_tier") @db.Uuid
   isActive        Boolean  @default(true) @map("is_active")
   createdAt       DateTime @default(now()) @map("created_at")
   updatedAt       DateTime @updatedAt @map("updated_at")
@@ -141,7 +142,7 @@ model Asset {
 
 model ListingCredit {
   id               String   @id @default(uuid()) @db.Uuid
-  userId           String   @map("user_id") @db.Uuid
+  userId           String   @map("user_id")
   creditsRemaining Int      @map("credits_remaining")
   expiryDate       DateTime @map("expiry_date")
   createdAt        DateTime @default(now()) @map("created_at")
@@ -155,7 +156,7 @@ model ListingCredit {
 
 model Listing {
   id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @map("user_id") @db.Uuid
+  userId      String   @map("user_id")
   address     String
   description String?
   status      String
@@ -173,7 +174,7 @@ model Listing {
 
 model Photo {
   id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @map("user_id") @db.Uuid
+  userId      String   @map("user_id")
   listingId   String   @map("listing_id") @db.Uuid
   filePath    String   @map("file_path")
   order       Int      @default(0)
@@ -189,7 +190,7 @@ model Photo {
 
 model VideoJob {
   id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @map("user_id") @db.Uuid
+  userId      String   @map("user_id")
   listingId   String   @map("listing_id") @db.Uuid
   status      String
   template    String?
@@ -208,7 +209,7 @@ model VideoJob {
 
 model SearchHistory {
   id        String   @id @default(uuid()) @db.Uuid
-  userId    String   @map("user_id") @db.Uuid
+  userId    String   @map("user_id")
   query     String
   createdAt DateTime @default(now()) @map("created_at")
 
@@ -220,7 +221,7 @@ model SearchHistory {
 
 model ErrorLog {
   id        String   @id @default(uuid()) @db.Uuid
-  userId    String?  @map("user_id") @db.Uuid
+  userId    String?  @map("user_id")
   error     String
   stack     String?
   createdAt DateTime @default(now()) @map("created_at")
@@ -233,7 +234,7 @@ model ErrorLog {
 
 model TempUpload {
   id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @map("user_id") @db.Uuid
+  userId      String   @map("user_id")
   address     String?
   files       Json     @default("[]")
   createdAt   DateTime @default(now()) @map("created_at")
@@ -246,7 +247,7 @@ model TempUpload {
 }
 
 model SubscriptionLog {
-  id                  String   @id @default(uuid())
+  id                  String   @id @default(uuid()) @db.Uuid
   userId              String
   action              String
   stripeSubscriptionId String
@@ -255,6 +256,8 @@ model SubscriptionLog {
   status              String
   periodEnd           DateTime?
   createdAt           DateTime @default(now())
+
+  // Relations
   user                User     @relation(fields: [userId], references: [id])
 
   @@index([userId])

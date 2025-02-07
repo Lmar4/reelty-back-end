@@ -1,27 +1,28 @@
 import { z } from "zod";
+import { SubscriptionTier } from "@prisma/client";
 
 // User schemas
 export const createUserSchema = z.object({
   body: z.object({
     id: z.string(),
     email: z.string().email(),
-    name: z.string().min(2),
-    subscriptionTier: z.string(),
-    fcmToken: z.string().nullable().optional(),
+    firstName: z.string().nullable(),
+    lastName: z.string().nullable(),
+    password: z.string(),
   }),
 });
 
 export const updateUserSchema = z.object({
   body: z.object({
     email: z.string().email().optional(),
-    name: z.string().min(2).optional(),
-    subscriptionTier: z.string().optional(),
-    fcmToken: z.string().nullable().optional(),
+    firstName: z.string().nullable().optional(),
+    lastName: z.string().nullable().optional(),
+    password: z.string().optional(),
   }),
 });
 
 export const getUserSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string(),
 });
 
 // Types
@@ -33,9 +34,16 @@ export type GetUserInput = z.infer<typeof getUserSchema>;
 export interface UserResponse {
   id: string;
   email: string;
-  name: string;
-  subscriptionTier: string;
-  fcmToken: string | null;
+  firstName: string | null;
+  lastName: string | null;
+  stripeCustomerId: string | null;
+  stripeSubscriptionId: string | null;
+  stripePriceId: string | null;
+  stripeProductId: string | null;
+  subscriptionStatus: string | null;
+  subscriptionPeriodEnd: Date | null;
+  currentTierId: string | null;
+  currentTier: SubscriptionTier | null;
   lastLoginAt: Date | null;
   createdAt: Date;
   updatedAt: Date;

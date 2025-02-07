@@ -26,14 +26,24 @@ router.post(
       const userData = req.body;
       const user = await prisma.user.create({
         data: userData,
+        include: {
+          currentTier: true,
+        },
       });
 
       const response: UserResponse = {
         id: user.id,
         email: user.email,
-        name: user.name,
-        subscriptionTier: user.subscriptionTier,
-        fcmToken: user.fcmToken,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        stripeCustomerId: user.stripeCustomerId,
+        stripeSubscriptionId: user.stripeSubscriptionId,
+        stripePriceId: user.stripePriceId,
+        stripeProductId: user.stripeProductId,
+        subscriptionStatus: user.subscriptionStatus,
+        subscriptionPeriodEnd: user.subscriptionPeriodEnd,
+        currentTierId: user.currentTierId,
+        currentTier: user.currentTier,
         lastLoginAt: user.lastLoginAt,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
@@ -66,14 +76,24 @@ router.put(
       const user = await prisma.user.update({
         where: { id: userId },
         data: userData,
+        include: {
+          currentTier: true,
+        },
       });
 
       const response: UserResponse = {
         id: user.id,
         email: user.email,
-        name: user.name,
-        subscriptionTier: user.subscriptionTier,
-        fcmToken: user.fcmToken,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        stripeCustomerId: user.stripeCustomerId,
+        stripeSubscriptionId: user.stripeSubscriptionId,
+        stripePriceId: user.stripePriceId,
+        stripeProductId: user.stripeProductId,
+        subscriptionStatus: user.subscriptionStatus,
+        subscriptionPeriodEnd: user.subscriptionPeriodEnd,
+        currentTierId: user.currentTierId,
+        currentTier: user.currentTier,
         lastLoginAt: user.lastLoginAt,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
@@ -100,6 +120,9 @@ router.get("/:userId", async (req: Request, res: Response) => {
     const { userId } = req.params;
     const user = await prisma.user.findUnique({
       where: { id: userId },
+      include: {
+        currentTier: true,
+      },
     });
 
     if (!user) {
@@ -113,9 +136,16 @@ router.get("/:userId", async (req: Request, res: Response) => {
     const response: UserResponse = {
       id: user.id,
       email: user.email,
-      name: user.name,
-      subscriptionTier: user.subscriptionTier,
-      fcmToken: user.fcmToken,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      stripeCustomerId: user.stripeCustomerId,
+      stripeSubscriptionId: user.stripeSubscriptionId,
+      stripePriceId: user.stripePriceId,
+      stripeProductId: user.stripeProductId,
+      subscriptionStatus: user.subscriptionStatus,
+      subscriptionPeriodEnd: user.subscriptionPeriodEnd,
+      currentTierId: user.currentTierId,
+      currentTier: user.currentTier,
       lastLoginAt: user.lastLoginAt,
       createdAt: user.createdAt,
       updatedAt: user.updatedAt,
@@ -146,6 +176,9 @@ router.get("/", async (req: Request, res: Response) => {
         skip,
         take: limit,
         orderBy: { createdAt: "desc" },
+        include: {
+          currentTier: true,
+        },
       }),
       prisma.user.count(),
     ]);
@@ -154,9 +187,16 @@ router.get("/", async (req: Request, res: Response) => {
       users: users.map((user) => ({
         id: user.id,
         email: user.email,
-        name: user.name,
-        subscriptionTier: user.subscriptionTier,
-        fcmToken: user.fcmToken,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        stripeCustomerId: user.stripeCustomerId,
+        stripeSubscriptionId: user.stripeSubscriptionId,
+        stripePriceId: user.stripePriceId,
+        stripeProductId: user.stripeProductId,
+        subscriptionStatus: user.subscriptionStatus,
+        subscriptionPeriodEnd: user.subscriptionPeriodEnd,
+        currentTierId: user.currentTierId,
+        currentTier: user.currentTier,
         lastLoginAt: user.lastLoginAt,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
