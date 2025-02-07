@@ -17,14 +17,21 @@ enum AssetType {
 }
 
 model User {
-  id              String    @id @map("clerk_id")
-  email           String    @unique
-  name            String
-  subscriptionTier String
-  fcmToken        String?   @map("fcm_token")
-  lastLoginAt     DateTime? @map("last_login_at")
-  createdAt       DateTime  @default(now()) @map("created_at")
-  updatedAt       DateTime  @updatedAt @map("updated_at")
+  id                    String      @id @default(uuid())
+  email                 String      @unique
+  firstName            String?
+  lastName             String?
+  password             String
+  stripeCustomerId     String?     @unique
+  stripeSubscriptionId String?
+  stripePriceId        String?
+  stripeProductId      String?
+  subscriptionStatus   String?     @default("inactive")
+  subscriptionPeriodEnd DateTime?
+  currentTierId        String?
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+  subscriptionLogs    SubscriptionLog[]
 
   // Relations
   creditLogs      CreditLog[]    @relation("UserCreditLogs")
@@ -38,23 +45,27 @@ model User {
   searchHistory   SearchHistory[]
   errorLogs       ErrorLog[]
   tempUploads     TempUpload[]
-  tier            SubscriptionTier @relation(fields: [subscriptionTier], references: [id])
+  currentTier     SubscriptionTier? @relation(fields: [currentTierId], references: [id])
 
-  @@index([subscriptionTier])
+  @@index([currentTierId])
   @@map("users")
 }
 
 model SubscriptionTier {
-  id          String    @id
-  description String
-  pricing     Decimal   @default(0.00) @db.Decimal(10, 2)
-  isAdmin     Boolean   @default(false) @map("is_admin")
-  features    Json      @default("[]")
+  id              String   @id @default(uuid())
+  name            String
+  description     String
+  stripePriceId   String   @unique
+  stripeProductId String   @unique
+  features        String[]
+  monthlyPrice    Float
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  users          User[]
 
   // Relations
   templates   Template[]
   assets      Asset[]
-  users       User[]
 
   @@map("subscription_tiers")
 }
@@ -232,4 +243,20 @@ model TempUpload {
   user        User     @relation(fields: [userId], references: [id])
 
   @@map("temp_uploads")
+}
+
+model SubscriptionLog {
+  id                  String   @id @default(uuid())
+  userId              String
+  action              String
+  stripeSubscriptionId String
+  stripePriceId       String?
+  stripeProductId     String?
+  status              String
+  periodEnd           DateTime?
+  createdAt           DateTime @default(now())
+  user                User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("subscription_logs")
 }
