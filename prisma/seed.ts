@@ -37,10 +37,12 @@ async function main() {
   ];
 
   console.log("Seeding subscription tiers...");
-  await prisma.subscriptionTier.createMany({
-    data: tiers,
-  });
-  console.log(`Created ${tiers.length} subscription tiers`);
+  for (const tier of tiers) {
+    const created = await prisma.subscriptionTier.create({
+      data: tier,
+    });
+    console.log(`Created subscription tier: ${created.name}`);
+  }
 
   // Create templates
   const templates = [
