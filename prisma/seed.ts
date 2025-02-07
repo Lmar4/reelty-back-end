@@ -37,14 +37,10 @@ async function main() {
   ];
 
   console.log("Seeding subscription tiers...");
-  for (const tier of tiers) {
-    const existingTier = await prisma.subscriptionTier.upsert({
-      where: { id: tier.id },
-      update: tier,
-      create: tier,
-    });
-    console.log(`Upserted tier: ${existingTier.name}`);
-  }
+  await prisma.subscriptionTier.createMany({
+    data: tiers,
+  });
+  console.log(`Created ${tiers.length} subscription tiers`);
 
   // Create templates
   const templates = [
