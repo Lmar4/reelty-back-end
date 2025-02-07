@@ -63,14 +63,18 @@ const initializeUserRouter = async () => {
     createUser: publicProcedure
       .input(
         z.object({
+          id: z.string().uuid(),
           email: z.string().email(),
           name: z.string(),
           subscriptionTier: z.string().default("free"),
+          fcmToken: z.string().optional(),
         })
       )
       .mutation(async ({ input }) => {
         const user = await prisma.user.create({
-          data: input,
+          data: {
+            ...input,
+          },
         });
         return user;
       }),
