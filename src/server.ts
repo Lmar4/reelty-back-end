@@ -3,6 +3,7 @@ import express, {
   Request,
   Response,
   ErrorRequestHandler,
+  RequestHandler,
 } from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -20,6 +21,17 @@ import { timeoutMiddleware } from "./middleware/timeout";
 import { DatabaseMonitor } from "./utils/db-monitor";
 import { logger } from "./utils/logger";
 import { basePrisma } from "./config/database";
+
+// Extend Express Request to include auth
+declare global {
+  namespace Express {
+    interface Request {
+      auth?: {
+        userId: string;
+      };
+    }
+  }
+}
 
 // Add global error handlers
 process.on("uncaughtException", (error) => {
@@ -77,19 +89,25 @@ app.use(express.json({ limit: "10mb" }));
 // Initialize authenticated router with Clerk middleware
 const authenticatedRouter = express.Router();
 
-// Initialize Clerk
-authenticatedRouter.use((req: Request, res: Response, next: NextFunction) => {
-  try {
-    requireAuth()(req, res, next);
-  } catch (error) {
-    logger.error("Clerk Authentication Error:", error);
-    res.status(401).json({
-      success: false,
-      code: "UNAUTHORIZED",
-      message: "Authentication required",
-    });
-  }
-});
+// Custom error handler for auth failures
+const handleAuthError = (
+  err: Error,
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  logger.error("Authentication Error:", err);
+  res.status(401).json({
+    success: false,
+    code: "UNAUTHORIZED",
+    message: "Authentication failed",
+    error: err.message,
+  });
+};
+
+// Use Clerk auth middleware with error handling
+authenticatedRouter.use(requireAuth());
+authenticatedRouter.use(handleAuthError);
 
 // Mount all authenticated routes under /api FIRST
 app.use("/api", authenticatedRouter);
