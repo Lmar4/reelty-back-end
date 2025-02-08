@@ -12,8 +12,14 @@ import jobRoutes from "./routes/job";
 import subscriptionRoutes from "./routes/subscription";
 import authRoutes from "./routes/auth";
 import adminRoutes from "./routes/admin";
-
+import { timeoutMiddleware } from "./middleware/timeout";
+import { DatabaseMonitor } from "./utils/db-monitor";
+import { logger } from "./utils/logger";
+import { basePrisma } from "./config/database";
 const app = express();
+
+// Add timeout middleware first
+app.use(timeoutMiddleware(15000)); // 15 second timeout
 
 // Apply CORS middleware
 app.use(
@@ -74,8 +80,10 @@ app.use(errorHandler);
 
 // Start the server
 const port = parseInt(process.env.PORT || "3001", 10);
-const host = "127.0.0.1"; // Use localhost instead of 0.0.0.0
 
-app.listen(port, host, () => {
-  console.log(`Server running on http://${host}:${port}`);
+const dbMonitor = new DatabaseMonitor(basePrisma, logger);
+dbMonitor.start();
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
