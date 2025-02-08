@@ -84,6 +84,6 @@ const port = parseInt(process.env.PORT || "3001", 10);
 const dbMonitor = new DatabaseMonitor(basePrisma, logger);
 dbMonitor.start();
 
-app.listen(port, () => {
+app.listen(port, "0.0.0.0", () => {
   console.log(`Server running on port ${port}`);
 });
