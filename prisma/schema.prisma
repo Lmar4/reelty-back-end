@@ -159,6 +159,7 @@ model Listing {
   userId      String   @map("user_id")
   address     String
   description String?
+  coordinates Json?    @default("{}")
   status      String
   photoLimit  Int      @default(10) @map("photo_limit")
   createdAt   DateTime @default(now()) @map("created_at")

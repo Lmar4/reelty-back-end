@@ -5,12 +5,16 @@ import express, {
   ErrorRequestHandler,
 } from "express";
 import cors from "cors";
-import { clerkMiddleware, requireAuth } from "@clerk/express";
-import userRoutes from "./routes/user";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import compression from "compression";
+import { clerkClient, requireAuth } from "@clerk/express";
+import router from "./routes";
+import usersRoutes from "./routes/users";
+import subscriptionRoutes from "./routes/subscription";
 import storageRoutes from "./routes/storage";
 import jobRoutes from "./routes/job";
-import subscriptionRoutes from "./routes/subscription";
-import authRoutes from "./routes/auth";
+import creditsRoutes from "./routes/credits";
 import adminRoutes from "./routes/admin";
 import { timeoutMiddleware } from "./middleware/timeout";
 import { DatabaseMonitor } from "./utils/db-monitor";
@@ -72,88 +76,77 @@ app.use(express.json({ limit: "10mb" }));
 
 // Add basic root route handler
 app.get("/", (_req: Request, res: Response) => {
-  res.status(200).json({ message: "API is running" });
+  res.status(200).json({
+    success: true,
+    message: "API is running",
+    version: process.env.API_VERSION || "1.0.0",
+  });
 });
 
 // Health check endpoint
 app.get("/api/health", (_req: Request, res: Response) => {
   res.status(200).json({
-    status: "ok",
+    success: true,
+    message: "Service is healthy",
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
   });
 });
 
-// Auth routes (some might be public)
-app.use("/api/auth", authRoutes);
-
-// Apply Clerk middleware for all protected routes
+// Initialize authenticated router with Clerk middleware
 const authenticatedRouter = express.Router();
-authenticatedRouter.use(clerkMiddleware());
-authenticatedRouter.use(requireAuth());
 
-// Protected routes with better error handling
-authenticatedRouter.use("/users", userRoutes);
-authenticatedRouter.use("/storage", storageRoutes);
-authenticatedRouter.use("/jobs", jobRoutes);
+// Initialize Clerk
+authenticatedRouter.use((req: Request, res: Response, next: NextFunction) => {
+  try {
+    requireAuth()(req, res, next);
+  } catch (error) {
+    logger.error("Clerk Authentication Error:", error);
+    res.status(401).json({
+      success: false,
+      code: "UNAUTHORIZED",
+      message: "Authentication required",
+    });
+  }
+});
+
+// Mount feature routes
+authenticatedRouter.use("/users", usersRoutes);
 authenticatedRouter.use("/subscription", subscriptionRoutes);
+authenticatedRouter.use("/storage", storageRoutes);
+authenticatedRouter.use("/job", jobRoutes);
+authenticatedRouter.use("/credits", creditsRoutes);
 authenticatedRouter.use("/admin", adminRoutes);
 
-// Mount authenticated routes under /api
+// Mount base router that includes listings and other base routes
+authenticatedRouter.use("/", router);
+
+// Mount all authenticated routes under /api
 app.use("/api", authenticatedRouter);
+
+// Global error handler
+app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+  logger.error("Unhandled error", {
+    error: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+  });
+
+  res.status(500).json({
+    success: false,
+    code: "INTERNAL_SERVER_ERROR",
+    message: "An unexpected error occurred",
+  });
+});
 
 // 404 handler
 app.use((_req: Request, res: Response) => {
   res.status(404).json({
-    error: "Not Found",
-    status: 404,
+    success: false,
+    code: "NOT_FOUND",
     message: "The requested resource was not found",
   });
 });
-
-// Error handling middleware
-const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
-  const errorDetails = {
-    name: err.name,
-    message: err.message,
-    path: req.path,
-    method: req.method,
-    timestamp: new Date().toISOString(),
-  };
-
-  logger.error("Request error:", errorDetails);
-
-  if (err.name === "ClerkError") {
-    res.status(401).json({
-      error: "Authentication failed",
-      status: 401,
-      message: err.message,
-    });
-    return;
-  }
-
-  // Handle CORS errors
-  if (err.message.includes("Not allowed by CORS")) {
-    res.status(403).json({
-      error: "CORS Error",
-      status: 403,
-      message: "Origin not allowed",
-    });
-    return;
-  }
-
-  res.status(500).json({
-    error: "Internal server error",
-    status: 500,
-    message:
-      process.env.NODE_ENV === "development"
-        ? err.message
-        : "An unexpected error occurred",
-  });
-  return;
-};
-
-app.use(errorHandler);
 
 // Start the server
 const port = parseInt(process.env.PORT || "8080", 10);
