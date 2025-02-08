@@ -1,26 +1,17 @@
-import express, {
-  NextFunction,
-  Request,
-  Response,
-  ErrorRequestHandler,
-  RequestHandler,
-} from "express";
+import { requireAuth } from "@clerk/express";
 import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
-import compression from "compression";
-import { clerkClient, requireAuth } from "@clerk/express";
-import router from "./routes";
-import usersRoutes from "./routes/users";
-import subscriptionRoutes from "./routes/subscription";
-import storageRoutes from "./routes/storage";
-import jobRoutes from "./routes/job";
-import creditsRoutes from "./routes/credits";
-import adminRoutes from "./routes/admin";
+import express, { NextFunction, Request, Response } from "express";
+import { basePrisma } from "./config/database";
 import { timeoutMiddleware } from "./middleware/timeout";
+import router from "./routes";
+import adminRoutes from "./routes/admin";
+import creditsRoutes from "./routes/credits";
+import jobRoutes from "./routes/job";
+import storageRoutes from "./routes/storage";
+import subscriptionRoutes from "./routes/subscription";
+import usersRoutes from "./routes/users";
 import { DatabaseMonitor } from "./utils/db-monitor";
 import { logger } from "./utils/logger";
-import { basePrisma } from "./config/database";
 
 // Extend Express Request to include auth
 declare global {
@@ -109,19 +100,23 @@ const handleAuthError = (
 authenticatedRouter.use(requireAuth());
 authenticatedRouter.use(handleAuthError);
 
-// Mount all authenticated routes under /api FIRST
+// Mount all authenticated routes under /api
 app.use("/api", authenticatedRouter);
 
+// Mount the base router which includes all core routes
+authenticatedRouter.use(router);
+
+// Mount admin routes separately (not included in base router)
+authenticatedRouter.use("/admin", adminRoutes);
+
 // Mount feature routes in the authenticated router
-authenticatedRouter.use("/listings", router);
 authenticatedRouter.use("/users", usersRoutes);
 authenticatedRouter.use("/subscription", subscriptionRoutes);
 authenticatedRouter.use("/storage", storageRoutes);
 authenticatedRouter.use("/job", jobRoutes);
 authenticatedRouter.use("/credits", creditsRoutes);
-authenticatedRouter.use("/admin", adminRoutes);
 
-// Health check endpoint (mounted AFTER API routes)
+// Health check endpoint
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
