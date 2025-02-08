@@ -74,24 +74,6 @@ app.use(
 // Parse JSON bodies with size limit
 app.use(express.json({ limit: "10mb" }));
 
-// Add basic root route handler
-app.get("/", (_req: Request, res: Response) => {
-  res.status(200).json({
-    success: true,
-    message: "API is running",
-    version: process.env.API_VERSION || "1.0.0",
-  });
-});
-
-// Health check endpoint
-app.get("/api/health", (_req: Request, res: Response) => {
-  res.status(200).json({
-    success: true,
-    message: "Service is healthy",
-    timestamp: new Date().toISOString(),
-  });
-});
-
 // Initialize authenticated router with Clerk middleware
 const authenticatedRouter = express.Router();
 
@@ -109,7 +91,10 @@ authenticatedRouter.use((req: Request, res: Response, next: NextFunction) => {
   }
 });
 
-// Mount feature routes
+// Mount base router that includes listings and templates first
+authenticatedRouter.use("/", router);
+
+// Then mount feature routes
 authenticatedRouter.use("/users", usersRoutes);
 authenticatedRouter.use("/subscription", subscriptionRoutes);
 authenticatedRouter.use("/storage", storageRoutes);
@@ -117,11 +102,26 @@ authenticatedRouter.use("/job", jobRoutes);
 authenticatedRouter.use("/credits", creditsRoutes);
 authenticatedRouter.use("/admin", adminRoutes);
 
-// Mount base router that includes listings and other base routes
-authenticatedRouter.use("/", router);
-
 // Mount all authenticated routes under /api
 app.use("/api", authenticatedRouter);
+
+// Add basic root route handler
+app.get("/", (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    message: "API is running",
+    version: process.env.API_VERSION || "1.0.0",
+  });
+});
+
+// Health check endpoint
+app.get("/api/health", (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    message: "Service is healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // Global error handler
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
