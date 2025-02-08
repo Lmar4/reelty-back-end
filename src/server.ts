@@ -79,11 +79,12 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
 app.use(errorHandler);
 
 // Start the server
-const port = parseInt(process.env.PORT || "3001", 10);
+const port = parseInt(process.env.PORT || "8081", 10);
 
 const dbMonitor = new DatabaseMonitor(basePrisma, logger);
 dbMonitor.start();
 
-app.listen(port, "0.0.0.0", () => {
+app.listen(port, "::", () => {
+  // "::" is equivalent to 0.0.0.0 but works better with IPv6
   console.log(`Server running on port ${port}`);
 });
