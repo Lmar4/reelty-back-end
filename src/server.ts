@@ -166,8 +166,15 @@ authenticatedRouter.use("/admin", adminRoutes);
 app.use("/api", authenticatedRouter);
 
 // Error handling middleware
-const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
-  console.error("Error:", err);
+const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
+  console.error("Error details:", {
+    name: err.name,
+    message: err.message,
+    stack: err.stack,
+    path: req.path,
+    method: req.method,
+    headers: req.headers,
+  });
 
   if (err.name === "ClerkError") {
     res.status(401).json({
