@@ -91,10 +91,11 @@ authenticatedRouter.use((req: Request, res: Response, next: NextFunction) => {
   }
 });
 
-// Mount base router that includes listings and templates first
-authenticatedRouter.use("/", router);
+// Mount all authenticated routes under /api FIRST
+app.use("/api", authenticatedRouter);
 
-// Then mount feature routes
+// Mount feature routes in the authenticated router
+authenticatedRouter.use("/listings", router);
 authenticatedRouter.use("/users", usersRoutes);
 authenticatedRouter.use("/subscription", subscriptionRoutes);
 authenticatedRouter.use("/storage", storageRoutes);
@@ -102,24 +103,21 @@ authenticatedRouter.use("/job", jobRoutes);
 authenticatedRouter.use("/credits", creditsRoutes);
 authenticatedRouter.use("/admin", adminRoutes);
 
-// Mount all authenticated routes under /api
-app.use("/api", authenticatedRouter);
+// Health check endpoint (mounted AFTER API routes)
+app.get("/health", (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    message: "Service is healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
 
-// Add basic root route handler
+// Add basic root route handler (mounted LAST)
 app.get("/", (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
     message: "API is running",
     version: process.env.API_VERSION || "1.0.0",
-  });
-});
-
-// Health check endpoint
-app.get("/api/health", (_req: Request, res: Response) => {
-  res.status(200).json({
-    success: true,
-    message: "Service is healthy",
-    timestamp: new Date().toISOString(),
   });
 });
 
