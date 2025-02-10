@@ -1,23 +1,11 @@
 import {
-  S3Client,
   PutObjectCommand,
   GetObjectCommand,
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import {
-  StoragePathParams,
-  StoragePathSchema,
-  STORAGE_BUCKET_NAME,
-} from "../config/storage";
-
-const s3Client = new S3Client({
-  region: process.env.AWS_REGION || "us-east-1",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
-});
+import { StoragePathParams } from "../config/storage";
+import { s3Client, AWS_CONFIG } from "../config/s3";
 
 export const generateStoragePath = (
   pathTemplate: string,
@@ -38,7 +26,7 @@ export const generatePresignedUploadUrl = async (
   expiresIn = 3600
 ): Promise<string> => {
   const command = new PutObjectCommand({
-    Bucket: STORAGE_BUCKET_NAME,
+    Bucket: AWS_CONFIG.bucket,
     Key: key,
     ContentType: contentType,
   });
@@ -51,7 +39,7 @@ export const generatePresignedDownloadUrl = async (
   expiresIn = 3600
 ): Promise<string> => {
   const command = new GetObjectCommand({
-    Bucket: STORAGE_BUCKET_NAME,
+    Bucket: AWS_CONFIG.bucket,
     Key: key,
   });
 
@@ -60,7 +48,7 @@ export const generatePresignedDownloadUrl = async (
 
 export const deleteFile = async (key: string): Promise<void> => {
   const command = new DeleteObjectCommand({
-    Bucket: STORAGE_BUCKET_NAME,
+    Bucket: AWS_CONFIG.bucket,
     Key: key,
   });
 
@@ -81,12 +69,13 @@ export const getFileExtension = (filename: string): string => {
 
 export const generateUniqueFilename = (
   originalFilename: string,
-  prefix = ""
+  prefix?: string
 ): string => {
   const timestamp = Date.now();
   const sanitized = sanitizeFilename(originalFilename);
-  const extension = getFileExtension(sanitized);
-  const basename = sanitized.replace(`.${extension}`, "");
+  const parts = sanitized.split(".");
+  const extension = parts.pop() || "";
+  const basename = parts.join(".");
 
-  return `${prefix}${basename}-${timestamp}.${extension}`;
+  return `${prefix || ""}${basename}-${timestamp}.${extension}`;
 };

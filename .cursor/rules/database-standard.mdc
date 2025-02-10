@@ -1,0 +1,17 @@
+---
+description: Enforces Prisma and PostgreSQL best practices
+globs: prisma/**/*.prisma, src/models/**/*.ts
+---
+This rule helps with:
+@prisma/schema - Schema definitions
+@src/models - Model types
+@migrations - Database migrations
+@seeds - Seed data
+@src/services - Database operations
+
+Key tasks:
+- Schema design
+- Migration management
+- Query optimization
+- Data modeling
+- Index management

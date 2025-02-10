@@ -242,4 +242,34 @@ export class VisionProcessor {
     const parsedPath = path.parse(inputPath);
     return path.join(parsedPath.dir, `${parsedPath.name}.webp`);
   }
+
+  async convertBufferToWebP(
+    buffer: Buffer,
+    options: {
+      quality?: number;
+      width?: number;
+      height?: number;
+      fit?: "cover" | "contain" | "fill" | "inside" | "outside";
+    }
+  ): Promise<Buffer> {
+    let imageProcess = sharp(buffer);
+
+    // Apply resizing if dimensions are provided
+    if (options.width || options.height) {
+      imageProcess = imageProcess.resize({
+        width: options.width,
+        height: options.height,
+        fit: options.fit || "cover",
+        withoutEnlargement: true,
+      });
+    }
+
+    // Convert to WebP with quality setting
+    return imageProcess
+      .webp({
+        quality: options.quality || 80,
+        effort: 6, // Higher compression effort
+      })
+      .toBuffer();
+  }
 }

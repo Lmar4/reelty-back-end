@@ -93,7 +93,7 @@ reelty_backend/
 | `AWS_SECRET_KEY`    | AWS secret access key           |
 | `AWS_REGION`        | AWS region                      |
 | `POSTHOG_API_KEY`   | PostHog analytics API key       |
-| `RUNWAY_API_KEY`    | Runway ML API key               |
+| `RUNWAYML_API_KEY`  | Runway ML API key               |
 
 ## 📝 Main Dependencies
 

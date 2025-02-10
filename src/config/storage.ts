@@ -1,22 +1,16 @@
 import { z } from "zod";
 
-export const STORAGE_BUCKET_NAME =
-  process.env.STORAGE_BUCKET_NAME || "reelty-storage";
-
+// Storage path templates
 export const StoragePathSchema = {
-  USER: {
-    PROFILE: "users/{userId}/profile",
-    DOCUMENTS: "users/{userId}/documents",
-  },
   PROPERTY: {
     PHOTOS: "properties/{propertyId}/photos",
-    VIDEOS: "properties/{propertyId}/videos",
-    DOCUMENTS: "properties/{propertyId}/documents",
-    VIRTUAL_TOURS: "properties/{propertyId}/virtual-tours",
+  },
+  USER: {
+    DOCUMENTS: "users/{userId}/documents",
+    PROFILE: "users/{userId}/profile",
   },
   ORGANIZATION: {
     LOGO: "organizations/{orgId}/logo",
-    DOCUMENTS: "organizations/{orgId}/documents",
   },
   ASSETS: {
     MUSIC: "assets/music",
@@ -25,30 +19,26 @@ export const StoragePathSchema = {
   },
 } as const;
 
-export const FileTypeSchema = z.enum(["image", "video", "document"]);
+// File types
+export const FileTypeSchema = z.enum([
+  "image",
+  "video",
+  "document",
+  "MUSIC",
+  "WATERMARK",
+  "LOTTIE",
+]);
 export type FileType = z.infer<typeof FileTypeSchema>;
 
+// Asset types
 export const AssetTypeSchema = z.enum(["MUSIC", "WATERMARK", "LOTTIE"]);
 export type AssetType = z.infer<typeof AssetTypeSchema>;
-
-export const StoragePathParamsSchema = z.object({
-  userId: z.string().optional(),
-  propertyId: z.string().optional(),
-  orgId: z.string().optional(),
-  filename: z.string().optional(),
-});
-
-export type StoragePathParams = z.infer<typeof StoragePathParamsSchema>;
 
 export const AllowedMimeTypes = {
   image: ["image/jpeg", "image/png", "image/webp"] as const,
   video: ["video/mp4", "video/webm"] as const,
-  document: [
-    "application/pdf",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  ] as const,
-  MUSIC: ["audio/mpeg", "audio/wav", "audio/ogg"] as const,
+  document: ["application/pdf"] as const,
+  MUSIC: ["audio/mpeg", "audio/mp3", "audio/wav"] as const,
   WATERMARK: ["image/png", "image/webp"] as const,
   LOTTIE: ["application/json"] as const,
 } as const;
@@ -56,8 +46,22 @@ export const AllowedMimeTypes = {
 export type AllowedMimeType =
   (typeof AllowedMimeTypes)[keyof typeof AllowedMimeTypes][number];
 
+export type StoragePathParams = {
+  propertyId?: string;
+  userId?: string;
+  orgId?: string;
+  filename?: string;
+};
+
+// File size limits in bytes
 export const MaxFileSizes = {
-  image: 5 * 1024 * 1024, // 5MB
+  image: 15 * 1024 * 1024, // 15MB
   video: 100 * 1024 * 1024, // 100MB
   document: 10 * 1024 * 1024, // 10MB
+  MUSIC: 20 * 1024 * 1024, // 20MB
+  WATERMARK: 5 * 1024 * 1024, // 5MB
+  LOTTIE: 1 * 1024 * 1024, // 1MB
 } as const;
+
+export const STORAGE_BUCKET_NAME =
+  process.env.AWS_S3_BUCKET || "reelty-storage";

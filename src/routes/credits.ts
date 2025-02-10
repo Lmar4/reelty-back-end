@@ -1,34 +1,45 @@
-import { Router, Request, Response, NextFunction } from "express";
+import { Router, Request, Response } from "express";
 import {
   checkCredits,
   deductCredits,
   getCreditHistory,
   purchaseCredits,
 } from "../controllers/api/credits";
-import { validateRequest } from "../middleware/auth";
+import { isAuthenticated } from "../middleware/auth";
+import { z } from "zod";
+import { validateRequest } from "../middleware/validate";
 
 const router = Router();
 
-// Apply authentication middleware to all routes
-const authMiddleware = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
-  try {
-    await validateRequest(req);
-    next();
-  } catch (error) {
-    res.status(401).json({ error: "Unauthorized" });
-  }
-};
+// Validation schemas
+const deductCreditsSchema = z.object({
+  body: z.object({
+    amount: z.number().min(1),
+    reason: z.string().min(1),
+  }),
+});
 
-router.use(authMiddleware);
+const purchaseCreditsSchema = z.object({
+  body: z.object({
+    amount: z.number().min(1),
+    paymentMethodId: z.string().optional(),
+  }),
+});
 
 // Credit management routes
-router.post("/check", checkCredits);
-router.post("/deduct", deductCredits);
-router.get("/history/:userId", getCreditHistory);
-router.post("/purchase", purchaseCredits);
+router.post("/check", isAuthenticated, checkCredits);
+router.post(
+  "/deduct",
+  isAuthenticated,
+  validateRequest(deductCreditsSchema),
+  deductCredits
+);
+router.get("/history", isAuthenticated, getCreditHistory);
+router.post(
+  "/purchase",
+  isAuthenticated,
+  validateRequest(purchaseCreditsSchema),
+  purchaseCredits
+);
 
 export default router;

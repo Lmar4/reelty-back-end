@@ -1,13 +1,51 @@
 /// <reference types="node" />
 import { PrismaClient, AssetType } from "@prisma/client";
+import { SUBSCRIPTION_TIERS } from "../src/constants/subscription-tiers";
 
 const prisma = new PrismaClient();
 
-// Generate UUIDs for tiers
-const TIER_BASIC_ID = "550e8400-e29b-41d4-a716-446655440000";
-const TIER_PRO_ID = "550e8400-e29b-41d4-a716-446655440001";
-const TIER_ENTERPRISE_ID = "550e8400-e29b-41d4-a716-446655440002";
-const TIER_ADMIN_ID = "550e8400-e29b-41d4-a716-446655440003";
+async function seedTemplates() {
+  await prisma.template.deleteMany();
+
+  const templates = [
+    {
+      name: "Google Zoom Intro",
+      description:
+        "Start with a dramatic Google Maps zoom into the property location, followed by property highlights",
+      tiers: ["free", "pro", "enterprise", "admin"],
+      order: 1,
+    },
+    {
+      name: "Crescendo",
+      description:
+        "A dynamic template that builds momentum with progressively longer clips",
+      tiers: ["pro", "enterprise", "admin"],
+      order: 2,
+    },
+    {
+      name: "Wave",
+      description:
+        "An engaging rhythm that alternates between quick glimpses and lingering views",
+      tiers: ["pro", "enterprise", "admin"],
+      order: 3,
+    },
+    {
+      name: "Storyteller",
+      description:
+        "A narrative-driven template that guides viewers through the property story",
+      tiers: ["enterprise", "admin"],
+      order: 4,
+    },
+  ];
+
+  for (const template of templates) {
+    await prisma.template.create({
+      data: template,
+    });
+  }
+
+  console.log("Templates seeded successfully");
+}
 
 async function main() {
   console.log("Starting database seed...");
@@ -15,7 +53,7 @@ async function main() {
   // Create subscription tiers
   const tiers = [
     {
-      id: TIER_BASIC_ID,
+      id: SUBSCRIPTION_TIERS.BASIC,
       name: "Basic",
       description: "Essential features for getting started",
       stripePriceId: "price_basic_monthly",
@@ -24,7 +62,7 @@ async function main() {
       monthlyPrice: 0,
     },
     {
-      id: TIER_PRO_ID,
+      id: SUBSCRIPTION_TIERS.PRO,
       name: "Professional",
       description: "Advanced features for real estate professionals",
       stripePriceId: "price_pro_monthly",
@@ -38,7 +76,7 @@ async function main() {
       monthlyPrice: 29.99,
     },
     {
-      id: TIER_ENTERPRISE_ID,
+      id: SUBSCRIPTION_TIERS.ENTERPRISE,
       name: "Enterprise",
       description: "Custom solutions for large teams",
       stripePriceId: "price_enterprise_monthly",
@@ -52,7 +90,7 @@ async function main() {
       monthlyPrice: 99.99,
     },
     {
-      id: TIER_ADMIN_ID,
+      id: SUBSCRIPTION_TIERS.ADMIN,
       name: "Admin",
       description: "Administrative access",
       stripePriceId: "price_admin",
@@ -69,67 +107,43 @@ async function main() {
       update: tier,
       create: tier,
     });
-    console.log(`Created/updated subscription tier: ${tier.id}`);
+    console.log(`Created/updated subscription tier: ${tier.name}`);
   }
 
-  // Create admin user
-  console.log("Creating admin user...");
-  const adminUser = await prisma.user.upsert({
-    where: { id: "user_2siThAOP4AfhLAITRyB9lsy9hw5" },
-    update: {
-      email: "admin@reelty.com",
-      firstName: "Admin",
-      lastName: "User",
-      password: "$2b$10$dGQI7Ut8.M/BzMgvx5Y8UOEFVtD9yvD3FIp0Fs9RDvWRvYXGw3bLG",
-      currentTierId: TIER_ADMIN_ID,
-      subscriptionStatus: "active",
-    },
-    create: {
-      id: "user_2siThAOP4AfhLAITRyB9lsy9hw5",
-      email: "admin@reelty.com",
-      firstName: "Admin",
-      lastName: "User",
-      password: "$2b$10$dGQI7Ut8.M/BzMgvx5Y8UOEFVtD9yvD3FIp0Fs9RDvWRvYXGw3bLG",
-      currentTierId: TIER_ADMIN_ID,
-      subscriptionStatus: "active",
+  // Create or update admin user
+  const existingAdmin = await prisma.user.findFirst({
+    where: {
+      OR: [
+        { id: "user_2siThAOP4AfhLAITRyB9lsy9hw5" },
+        { email: "admin@reelty.app" },
+      ],
     },
   });
-  console.log(`Created/updated admin user: ${adminUser.email}`);
+
+  const adminUser = existingAdmin
+    ? await prisma.user.update({
+        where: { id: existingAdmin.id },
+        data: {
+          currentTierId: SUBSCRIPTION_TIERS.ADMIN,
+          subscriptionStatus: "active",
+        },
+      })
+    : await prisma.user.create({
+        data: {
+          id: "user_2siThAOP4AfhLAITRyB9lsy9hw5",
+          email: "admin@reelty.app",
+          password: "admin", // In production, this should be properly hashed
+          firstName: "Admin",
+          lastName: "User",
+          currentTierId: SUBSCRIPTION_TIERS.ADMIN,
+          subscriptionStatus: "active",
+        },
+      });
+
+  console.log("Created/updated admin user:", adminUser);
 
   // Create templates
-  const templates = [
-    {
-      name: "Modern Minimal",
-      description: "Clean and modern template for luxury properties",
-      sequence: { transitions: ["fade", "slide"], effects: ["zoom", "pan"] },
-      durations: { intro: 2, main: 15, outro: 3 },
-      musicPath: "/assets/music/minimal.mp3",
-      musicVolume: 0.8,
-      subscriptionTier: TIER_BASIC_ID,
-      isActive: true,
-    },
-    {
-      name: "Dynamic Pro",
-      description: "Professional template with dynamic transitions",
-      sequence: {
-        transitions: ["dissolve", "wipe"],
-        effects: ["blur", "rotate"],
-      },
-      durations: { intro: 3, main: 20, outro: 4 },
-      musicPath: "/assets/music/upbeat.mp3",
-      musicVolume: 0.9,
-      subscriptionTier: TIER_PRO_ID,
-      isActive: true,
-    },
-  ];
-
-  console.log("Seeding templates...");
-  for (const template of templates) {
-    const created = await prisma.template.create({
-      data: template,
-    });
-    console.log(`Created template: ${created.name}`);
-  }
+  await seedTemplates();
 
   // Create assets
   const assets = [
@@ -138,7 +152,7 @@ async function main() {
       description: "Relaxing background music",
       filePath: "/assets/music/smooth.mp3",
       type: AssetType.MUSIC,
-      subscriptionTier: TIER_BASIC_ID,
+      subscriptionTier: SUBSCRIPTION_TIERS.BASIC,
       isActive: true,
     },
     {
@@ -146,7 +160,7 @@ async function main() {
       description: "Professional watermark overlay",
       filePath: "/assets/watermarks/premium.png",
       type: AssetType.WATERMARK,
-      subscriptionTier: TIER_PRO_ID,
+      subscriptionTier: SUBSCRIPTION_TIERS.PRO,
       isActive: true,
     },
   ];

@@ -54,12 +54,12 @@ const checkRunwayML = async (
   const runwayStart = Date.now();
   try {
     const runwayClient = new RunwayML({
-      apiKey: process.env.RUNWAY_API_KEY || "",
+      apiKey: process.env.RUNWAYML_API_KEY || "",
     });
     // Instead of using a non-existent `tasks.list()` method,
-    // we perform a simple GET request to the API’s base endpoint.
+    // we perform a simple GET request to the API's base endpoint.
     // This assumes that a GET request to "/" is valid for checking
-    // the service’s health. Adjust the path if your API provides
+    // the service's health. Adjust the path if your API provides
     // a dedicated health check endpoint.
     await Promise.race([
       runwayClient.request({ method: "get", path: "/" }),

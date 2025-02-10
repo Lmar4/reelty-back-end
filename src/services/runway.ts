@@ -6,6 +6,7 @@ export class RunwayML {
   private readonly baseURL = "https://api.runwayml.com/v1";
 
   constructor(apiKey: string) {
+    console.log("Initializing RunwayML client...");
     this.apiKey = apiKey;
     this.client = axios.create({
       baseURL: this.baseURL,
@@ -17,8 +18,10 @@ export class RunwayML {
   }
 
   async getStatus(): Promise<{ status: string }> {
+    console.log("Checking RunwayML API status...");
     try {
       const response = await this.client.get("/health");
+      console.log("RunwayML API is online");
       return { status: "online" };
     } catch (error) {
       console.error("RunwayML health check failed:", error);
@@ -38,6 +41,13 @@ export class RunwayML {
     status: "pending" | "processing" | "completed" | "failed";
     output?: { url: string };
   }> {
+    console.log("Generating video with RunwayML:", {
+      model: params.model,
+      imageCount: params.input.images.length,
+      prompt: params.input.prompt,
+      duration: params.input.duration,
+    });
+
     try {
       const response = await this.client.post("/inference", {
         model: params.model,
@@ -48,13 +58,21 @@ export class RunwayML {
         },
       });
 
+      console.log("RunwayML video generation initiated:", {
+        jobId: response.data.id,
+        status: response.data.status,
+      });
+
       return {
         id: response.data.id,
         status: response.data.status,
         output: response.data.output,
       };
     } catch (error) {
-      console.error("RunwayML video generation failed:", error);
+      console.error("RunwayML video generation failed:", {
+        error: error instanceof Error ? error.message : error,
+        params,
+      });
       throw new Error("Failed to generate video");
     }
   }
@@ -63,24 +81,39 @@ export class RunwayML {
     status: "pending" | "processing" | "completed" | "failed";
     output?: { url: string };
   }> {
+    console.log("Checking RunwayML job status:", { jobId });
     try {
       const response = await this.client.get(`/inference/${jobId}`);
+
+      console.log("RunwayML job status retrieved:", {
+        jobId,
+        status: response.data.status,
+        hasOutput: !!response.data.output,
+      });
 
       return {
         status: response.data.status,
         output: response.data.output,
       };
     } catch (error) {
-      console.error("RunwayML job status check failed:", error);
+      console.error("RunwayML job status check failed:", {
+        jobId,
+        error: error instanceof Error ? error.message : error,
+      });
       throw new Error("Failed to check job status");
     }
   }
 
   async cancelJob(jobId: string): Promise<void> {
+    console.log("Cancelling RunwayML job:", { jobId });
     try {
       await this.client.delete(`/inference/${jobId}`);
+      console.log("RunwayML job cancelled successfully:", { jobId });
     } catch (error) {
-      console.error("RunwayML job cancellation failed:", error);
+      console.error("RunwayML job cancellation failed:", {
+        jobId,
+        error: error instanceof Error ? error.message : error,
+      });
       throw new Error("Failed to cancel job");
     }
   }
@@ -93,11 +126,17 @@ export class RunwayML {
       type: string;
     }>
   > {
+    console.log("Fetching available RunwayML models...");
     try {
       const response = await this.client.get("/models");
+      console.log("RunwayML models retrieved:", {
+        modelCount: response.data.models.length,
+      });
       return response.data.models;
     } catch (error) {
-      console.error("RunwayML models listing failed:", error);
+      console.error("RunwayML models listing failed:", {
+        error: error instanceof Error ? error.message : error,
+      });
       throw new Error("Failed to list models");
     }
   }

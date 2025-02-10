@@ -55,7 +55,7 @@ export async function healthCheck(
     const runwayStart = Date.now();
     try {
       const runwayClient = new RunwayML({
-        apiKey: process.env.RUNWAY_API_KEY || "",
+        apiKey: process.env.RUNWAYML_API_KEY || "",
       });
       await runwayClient.request({ method: "get", path: "/" }); // Assuming this method exists
       status.details.runwayML.latency = Date.now() - runwayStart;

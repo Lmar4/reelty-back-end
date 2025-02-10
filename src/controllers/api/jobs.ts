@@ -43,8 +43,14 @@ export async function submitJob(
     });
 
     // Start processing pipeline asynchronously
-    const pipeline = new ProductionPipeline(process.env.RUNWAY_API_KEY || "");
-    pipeline.runProductionPipeline(job.id).catch(console.error);
+    const pipeline = new ProductionPipeline();
+    pipeline
+      .execute({
+        jobId: job.id,
+        inputFiles: validatedData.images,
+        template: validatedData.template,
+      })
+      .catch(console.error);
 
     return {
       statusCode: 201,

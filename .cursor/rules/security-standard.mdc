@@ -1,0 +1,16 @@
+---
+description: Enforces security practices and authentication flows
+globs: src/middleware/**/*.ts, src/config/**/*.ts
+---
+This rule helps with:
+@src/middleware/auth - Auth middleware
+@src/config/security - Security config
+@src/validation - Input sanitization
+@src/utils/crypto - Crypto functions
+
+Key tasks:
+- Authentication
+- Authorization
+- Input validation
+- Session management
+- Rate limiting

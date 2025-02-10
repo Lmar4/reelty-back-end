@@ -65,30 +65,23 @@ model SubscriptionTier {
 
   // Relations
   users          User[]
-  templates      Template[]
+  templates      Template[] @relation("TemplateToSubscriptionTier")
   assets         Asset[]
 
   @@map("subscription_tiers")
 }
 
 model Template {
-  id              String   @id @default(uuid()) @db.Uuid
-  name            String
-  description     String
-  sequence        Json
-  durations       Json
-  musicPath       String?  @map("music_path")
-  musicVolume     Float?   @default(1.0) @map("music_volume")
-  subscriptionTier String  @map("subscription_tier") @db.Uuid
-  isActive        Boolean  @default(true) @map("is_active")
-  createdAt       DateTime @default(now()) @map("created_at")
-  updatedAt       DateTime @updatedAt @map("updated_at")
+  id          String   @id @default(cuid())
+  name        String
+  description String
+  tiers       String[] // ["free", "pro", "enterprise"]
+  order       Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   // Relations
-  tier            SubscriptionTier @relation(fields: [subscriptionTier], references: [id])
-
-  @@index([subscriptionTier])
-  @@map("templates")
+  subscriptionTiers SubscriptionTier[] @relation("TemplateToSubscriptionTier")
 }
 
 model CreditLog {
@@ -178,6 +171,7 @@ model Photo {
   userId      String   @map("user_id")
   listingId   String   @map("listing_id") @db.Uuid
   filePath    String   @map("file_path")
+  processedFilePath String? @map("processed_file_path")
   order       Int      @default(0)
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
@@ -194,6 +188,7 @@ model VideoJob {
   userId      String   @map("user_id")
   listingId   String   @map("listing_id") @db.Uuid
   status      String
+  progress    Float    @default(0) @map("progress")
   template    String?
   inputFiles  Json?    @map("input_files")
   outputFile  String?  @map("output_file")

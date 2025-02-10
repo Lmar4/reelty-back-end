@@ -1,54 +1,68 @@
 import express, { RequestHandler } from "express";
-import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
+import {
+  getTierNameFromId,
+  isValidTierId,
+  SubscriptionTierId,
+  SUBSCRIPTION_TIERS,
+} from "../constants/subscription-tiers";
+import { prisma } from "../lib/prisma";
+import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
-import { getAuth } from "@clerk/express";
+import { logger } from "../utils/logger";
 
 const router = express.Router();
-const prisma = new PrismaClient();
 
 // Validation schemas
 const templateSchema = z.object({
   body: z.object({
     name: z.string().min(1),
     description: z.string().min(1),
-    sequence: z.any(),
-    durations: z.any(),
-    musicPath: z.string().optional(),
-    musicVolume: z.number().optional(),
-    subscriptionTier: z.string().min(1),
-    isActive: z.boolean().optional(),
+    subscriptionTierIds: z
+      .array(z.string())
+      .refine((ids) => ids.every(isValidTierId), {
+        message: "Invalid subscription tier ID provided",
+      }),
+    order: z.number().default(0),
   }),
+});
+
+// Schema for query parameters
+const GetTemplatesQuerySchema = z.object({
+  tierId: z.string().refine((val) => {
+    // Check if it's a valid UUID format tier ID
+    if (isValidTierId(val)) return true;
+    // Check if it's a valid tier name (case insensitive)
+    const upperVal = val.toUpperCase();
+    return Object.keys(SUBSCRIPTION_TIERS).includes(upperVal);
+  }, "Invalid subscription tier ID"),
 });
 
 // Get templates by subscription tier
 const getTemplates: RequestHandler = async (req, res) => {
   try {
-    const auth = getAuth(req);
-    if (!auth.userId) {
-      res.status(401).json({
-        success: false,
-        error: "Unauthorized",
-      });
-      return;
-    }
+    const { tierId } = GetTemplatesQuerySchema.parse(req.query);
 
-    const { tier } = req.query;
-    if (!tier) {
-      res.status(400).json({
-        success: false,
-        error: "Subscription tier is required",
-      });
-      return;
-    }
+    // Convert tier name to ID if necessary
+    const actualTierId = isValidTierId(tierId)
+      ? tierId
+      : SUBSCRIPTION_TIERS[
+          tierId.toUpperCase() as keyof typeof SUBSCRIPTION_TIERS
+        ];
 
     const templates = await prisma.template.findMany({
       where: {
-        subscriptionTier: tier as string,
-        isActive: true,
+        subscriptionTiers: {
+          some: {
+            id: actualTierId,
+          },
+        },
       },
       include: {
-        tier: true,
+        subscriptionTiers: true,
+      },
+      orderBy: {
+        order: "asc",
       },
     });
 
@@ -57,7 +71,7 @@ const getTemplates: RequestHandler = async (req, res) => {
       data: templates,
     });
   } catch (error) {
-    console.error("Get templates error:", error);
+    logger.error("Get templates error:", error);
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Unknown error occurred",
@@ -68,31 +82,46 @@ const getTemplates: RequestHandler = async (req, res) => {
 // Create template
 const createTemplate: RequestHandler = async (req, res) => {
   try {
-    const auth = getAuth(req);
-    if (!auth.userId) {
-      res.status(401).json({
+    const { name, description, order, subscriptionTierIds } = req.body;
+
+    // Validate subscription tier IDs
+    if (!subscriptionTierIds.every(isValidTierId)) {
+      res.status(400).json({
         success: false,
-        error: "Unauthorized",
+        error: "Invalid subscription tier ID provided",
       });
       return;
     }
 
-    const template = await prisma.template.create({
-      data: {
-        ...req.body,
-        isActive: req.body.isActive ?? true,
-      },
-      include: {
-        tier: true,
-      },
+    const validTierIds = subscriptionTierIds as SubscriptionTierId[];
+
+    // Create template and connect subscription tiers in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // Create the template
+      const template = await tx.template.create({
+        data: {
+          name,
+          description,
+          order: order || 0,
+          tiers: validTierIds.map(getTierNameFromId),
+          subscriptionTiers: {
+            connect: validTierIds.map((id) => ({ id })),
+          },
+        },
+        include: {
+          subscriptionTiers: true,
+        },
+      });
+
+      return template;
     });
 
     res.status(201).json({
       success: true,
-      data: template,
+      data: result,
     });
   } catch (error) {
-    console.error("Create template error:", error);
+    logger.error("Create template error:", error);
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Unknown error occurred",
@@ -101,7 +130,12 @@ const createTemplate: RequestHandler = async (req, res) => {
 };
 
 // Route handlers
-router.get("/", getTemplates);
-router.post("/", validateRequest(templateSchema), createTemplate);
+router.get("/", isAuthenticated, getTemplates);
+router.post(
+  "/",
+  isAuthenticated,
+  validateRequest(templateSchema),
+  createTemplate
+);
 
 export default router;

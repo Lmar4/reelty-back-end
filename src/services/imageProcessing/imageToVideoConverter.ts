@@ -5,11 +5,17 @@ import ffmpeg from "fluent-ffmpeg";
 import { RunwayML } from "../runway";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { ReelTemplate, TemplateKey, reelTemplates } from "./templates/types";
+import sharp from "sharp";
 
 // Add ProcessedImage type
 export interface ProcessedImage {
   croppedPath: string;
   // Add other properties if needed
+}
+
+interface VideoClip {
+  path: string;
+  duration: number;
 }
 
 const exists = promisify(fs.exists);
@@ -394,87 +400,101 @@ export class ImageToVideoConverter {
 
   async createTemplate(
     templateKey: TemplateKey,
-    videoFiles: string[],
-    mapVideoPath?: string,
-    subscriptionTier: string = "free",
-    watermarkAsset?: { path: string; opacity?: number }
+    inputVideos: string[],
+    mapVideoPath?: string
   ): Promise<string> {
-    if (!videoFiles.length) {
-      throw new Error("No videos provided for template creation");
+    console.log(
+      "Creating template",
+      templateKey,
+      "with",
+      inputVideos.length,
+      "videos..."
+    );
+
+    const template = reelTemplates[templateKey];
+    if (!template) {
+      throw new Error(`Template ${templateKey} not found`);
+    }
+
+    // Count how many actual image slots we need (excluding map)
+    const imageSlots = template.sequence.filter((s) => s !== "map").length;
+    const availableImages = inputVideos.length;
+
+    console.log("Template analysis:", {
+      totalSlots: template.sequence.length,
+      imageSlots,
+      availableImages,
+      hasMapVideo: !!mapVideoPath,
+    });
+
+    // If we have fewer images than slots, adapt the sequence
+    let adaptedSequence = [...template.sequence];
+    if (availableImages < imageSlots) {
+      // Keep the map and use available images in a round-robin fashion
+      adaptedSequence = template.sequence.filter((item) => {
+        if (item === "map") return true;
+        const index = typeof item === "number" ? item : parseInt(item);
+        return index < availableImages;
+      });
+
+      console.log("Adapted sequence for fewer images:", {
+        originalLength: template.sequence.length,
+        adaptedLength: adaptedSequence.length,
+        sequence: adaptedSequence,
+      });
+    }
+
+    const clips: VideoClip[] = [];
+    for (const sequenceItem of adaptedSequence) {
+      if (sequenceItem === "map") {
+        if (!mapVideoPath) {
+          throw new Error("Map video required but not provided");
+        }
+        const mapDuration =
+          typeof template.durations === "object"
+            ? (template.durations as Record<string, number>).map
+            : (template.durations as number[])[0];
+        clips.push({
+          path: mapVideoPath,
+          duration: mapDuration,
+        });
+      } else {
+        const index =
+          typeof sequenceItem === "number"
+            ? sequenceItem
+            : parseInt(sequenceItem);
+        // Normalize the index to fit within available images
+        const normalizedIndex = index % availableImages;
+        const duration =
+          typeof template.durations === "object"
+            ? (template.durations as Record<string, number>)[String(index)]
+            : (template.durations as number[])[clips.length];
+        clips.push({
+          path: inputVideos[normalizedIndex],
+          duration,
+        });
+      }
     }
 
     await this.ensureDirectoryExists(this.outputDir);
-    const template = reelTemplates[templateKey];
     const uniqueId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const outputPath = path.join(
       this.outputDir,
       `${templateKey}-${uniqueId}.mp4`
     );
 
-    console.log(
-      `Creating template ${templateKey} with ${videoFiles.length} videos...`
+    console.log("Creating video with adapted sequence:", {
+      templateKey,
+      clipCount: clips.length,
+      totalDuration: clips.reduce((sum, clip) => sum + clip.duration, 0),
+    });
+
+    await this.stitchVideos(
+      clips.map((clip) => clip.path),
+      clips.map((clip) => clip.duration),
+      outputPath,
+      template.music
     );
-
-    // Add watermark for free tier if watermarkAsset is provided
-    const watermark = subscriptionTier === "free" ? watermarkAsset : undefined;
-
-    // Handle different template types
-    if (templateKey === "googlezoomintro") {
-      if (!mapVideoPath) {
-        throw new Error(
-          "Map video path is required for googlezoomintro template"
-        );
-      }
-
-      const orderedVideos: string[] = [];
-      const orderedDurations: number[] = [];
-      const durations = template.durations as Record<string | number, number>;
-
-      // Process each item in the sequence
-      for (const key of template.sequence) {
-        if (key === "map") {
-          orderedVideos.push(mapVideoPath);
-          orderedDurations.push(durations["map"]);
-        } else {
-          const index = typeof key === "string" ? parseInt(key) : key;
-          if (index < 0 || index >= videoFiles.length) {
-            throw new Error(
-              `Invalid video index ${index} for template ${templateKey}`
-            );
-          }
-          orderedVideos.push(videoFiles[index]);
-          orderedDurations.push(durations[key]);
-        }
-      }
-
-      await this.stitchVideos(
-        orderedVideos,
-        orderedDurations,
-        outputPath,
-        template.music,
-        watermark
-      );
-    } else {
-      // Regular template processing
-      const durations = template.durations as number[];
-      const orderedVideos = template.sequence.map((index) => {
-        const videoIndex = typeof index === "number" ? index : parseInt(index);
-        if (videoIndex < 0 || videoIndex >= videoFiles.length) {
-          throw new Error(
-            `Invalid video index ${videoIndex} for template ${templateKey}`
-          );
-        }
-        return videoFiles[videoIndex];
-      });
-
-      await this.stitchVideos(
-        orderedVideos,
-        durations,
-        outputPath,
-        template.music,
-        watermark
-      );
-    }
 
     console.log(`${templateKey} video created at: ${outputPath}`);
     return outputPath;
@@ -642,9 +662,32 @@ export class ImageToVideoConverter {
       });
     });
   }
+
+  async convertToWebP(
+    inputPath: string,
+    outputPath: string,
+    options: {
+      quality: number;
+      width: number;
+      height: number;
+      fit: "cover" | "contain" | "fill";
+    }
+  ): Promise<string> {
+    try {
+      await sharp(inputPath)
+        .resize(options.width, options.height, { fit: options.fit })
+        .webp({ quality: options.quality })
+        .toFile(outputPath);
+
+      return outputPath;
+    } catch (error) {
+      console.error("Error converting to WebP:", error);
+      throw error;
+    }
+  }
 }
 
 // Export singleton instance
 export const imageToVideoConverter = new ImageToVideoConverter(
-  process.env.RUNWAYML_API_SECRET || ""
+  process.env.RUNWAYML_API_KEY || ""
 );

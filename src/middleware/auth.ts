@@ -28,16 +28,16 @@ export class AuthError extends Error {
 
 export async function validateRequest(req: Request) {
   try {
-    // Ensure clerkMiddleware has run and auth is attached to the request
     const auth = getAuth(req);
+    const { userId, sessionId } = auth;
 
-    if (!auth.sessionId) {
+    if (!userId || !sessionId) {
       throw new AuthError(401, "Invalid or missing session");
     }
 
     return {
-      userId: auth.userId,
-      sessionId: auth.sessionId,
+      userId,
+      sessionId,
     };
   } catch (error) {
     if (error instanceof AuthError) {
@@ -54,6 +54,17 @@ export async function isAuthenticated(
 ) {
   try {
     const { userId } = await validateRequest(req);
+
+    // Verify the user exists in our database
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
+
+    if (!user) {
+      throw new AuthError(401, "User not found");
+    }
+
     req.user = { id: userId };
     next();
   } catch (error) {

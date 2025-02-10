@@ -1,8 +1,8 @@
-import { getAuth } from "@clerk/express";
-import { PrismaClient } from "@prisma/client";
 import express, { RequestHandler } from "express";
+import { PrismaClient } from "@prisma/client";
 import { z } from "zod";
 import { validateRequest } from "../middleware/validate";
+import { isAuthenticated } from "../middleware/auth";
 import {
   SUBSCRIPTION_TIERS,
   isValidTierId,
@@ -61,16 +61,8 @@ const getTiers: RequestHandler = async (_req, res) => {
 // Update user's subscription tier
 const updateTier: RequestHandler = async (req, res) => {
   try {
-    const auth = getAuth(req);
-    if (!auth.userId) {
-      res.status(401).json({
-        success: false,
-        error: "Unauthorized",
-      });
-      return;
-    }
-
     const { tierId } = req.body;
+    const userId = req.user!.id;
 
     // Additional validation using the constant
     if (!isValidTierId(tierId)) {
@@ -98,7 +90,7 @@ const updateTier: RequestHandler = async (req, res) => {
 
     // Get current user data
     const currentUser = await prisma.user.findUnique({
-      where: { id: auth.userId },
+      where: { id: userId },
       select: {
         id: true,
         currentTierId: true,
@@ -116,7 +108,7 @@ const updateTier: RequestHandler = async (req, res) => {
     // Update user's tier
     const user = await prisma.user.update({
       where: {
-        id: auth.userId,
+        id: userId,
       },
       data: {
         currentTierId: tierId,
@@ -156,20 +148,14 @@ const updateTier: RequestHandler = async (req, res) => {
 // Initiate checkout process
 const initiateCheckout: RequestHandler = async (req, res) => {
   try {
-    const auth = getAuth(req);
-    if (!auth.userId) {
-      res.status(401).json({
-        success: false,
-        error: "Unauthorized",
-      });
-      return;
-    }
+    const userId = req.user!.id;
 
     // TODO: Implement your payment provider integration here
     // This is a placeholder that returns a mock checkout session
     res.json({
       success: true,
       data: {
+        userId,
         checkoutUrl: "https://your-payment-provider.com/checkout/session-id",
         sessionId: "mock-session-id",
       },
@@ -237,7 +223,8 @@ const updateSubscriptionFromStripe: RequestHandler = async (req, res) => {
 // Cancel subscription
 const cancelSubscription: RequestHandler = async (req, res) => {
   try {
-    const { userId, stripeSubscriptionId } = req.body;
+    const userId = req.user!.id;
+    const { stripeSubscriptionId } = req.body;
 
     // Update user's subscription status
     const updatedUser = await prisma.user.update({
@@ -272,14 +259,19 @@ const cancelSubscription: RequestHandler = async (req, res) => {
 };
 
 // Route handlers
-router.get("/tiers", getTiers);
-router.patch("/tier", validateRequest(updateTierSchema), updateTier);
-router.post("/checkout", initiateCheckout);
+router.get("/tiers", getTiers); // Public endpoint
+router.patch(
+  "/tier",
+  isAuthenticated,
+  validateRequest(updateTierSchema),
+  updateTier
+);
+router.post("/checkout", isAuthenticated, initiateCheckout);
 router.post(
   "/update",
   validateRequest(updateSubscriptionSchema),
   updateSubscriptionFromStripe
-);
-router.post("/cancel", cancelSubscription);
+); // Stripe webhook endpoint
+router.post("/cancel", isAuthenticated, cancelSubscription);
 
 export default router;

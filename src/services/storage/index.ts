@@ -1,19 +1,17 @@
+import { PutObjectCommand } from "@aws-sdk/client-s3";
+import { AWS_CONFIG, s3Client } from "../../config/s3";
 import {
-  StoragePathSchema,
-  StoragePathParams,
-  FileType,
-  AllowedMimeTypes,
   AllowedMimeType,
-  MaxFileSizes,
-  STORAGE_BUCKET_NAME,
+  AllowedMimeTypes,
   AssetType,
+  FileType,
+  StoragePathSchema,
 } from "../../config/storage";
 import {
-  generateStoragePath,
-  generatePresignedUploadUrl,
-  generatePresignedDownloadUrl,
   deleteFile,
-  sanitizeFilename,
+  generatePresignedDownloadUrl,
+  generatePresignedUploadUrl,
+  generateStoragePath,
   generateUniqueFilename,
 } from "../../utils/storage";
 
@@ -35,8 +33,19 @@ export class StorageService {
       name: string;
       type: FileType;
       contentType: AllowedMimeType;
+      buffer?: Buffer;
     }
   ): Promise<{ uploadUrl: string; fileKey: string }> {
+    console.log("[STORAGE_SERVICE] Starting upload process:", {
+      propertyId,
+      fileType: file.type,
+      contentType: file.contentType,
+      bucket: AWS_CONFIG.bucket,
+      hasBuffer: !!file.buffer,
+      region: AWS_CONFIG.region,
+      hasCredentials: !!AWS_CONFIG.credentials.accessKeyId,
+    });
+
     // Validate mime type matches the file type
     const validMimeTypes = AllowedMimeTypes[file.type];
     const isValidMimeType = (validMimeTypes as readonly string[]).includes(
@@ -48,31 +57,54 @@ export class StorageService {
 
     // Generate unique filename and path
     const filename = generateUniqueFilename(file.name);
-    let pathTemplate: string;
-
-    switch (file.type) {
-      case "image":
-        pathTemplate = StoragePathSchema.PROPERTY.PHOTOS;
-        break;
-      case "video":
-        pathTemplate = StoragePathSchema.PROPERTY.VIDEOS;
-        break;
-      case "document":
-        pathTemplate = StoragePathSchema.PROPERTY.DOCUMENTS;
-        break;
-      default:
-        throw new Error(`Unsupported file type: ${file.type}`);
-    }
-
-    const fileKey = `${generateStoragePath(pathTemplate, {
+    const fileKey = generateStoragePath(StoragePathSchema.PROPERTY.PHOTOS, {
       propertyId,
-    })}/${filename}`;
-    const uploadUrl = await generatePresignedUploadUrl(
-      fileKey,
-      file.contentType
-    );
+      filename,
+    });
 
-    return { uploadUrl, fileKey };
+    console.log("[STORAGE_SERVICE] Attempting S3 operation:", {
+      fileKey,
+      bucket: AWS_CONFIG.bucket,
+      operation: file.buffer ? "PutObject" : "GeneratePresignedUrl",
+    });
+
+    if (file.buffer) {
+      try {
+        // If we have a buffer, upload directly
+        const command = new PutObjectCommand({
+          Bucket: AWS_CONFIG.bucket,
+          Key: fileKey,
+          Body: file.buffer,
+          ContentType: file.contentType,
+        });
+        console.log("[STORAGE_SERVICE] PutObject command created:", {
+          bucket: command.input.Bucket,
+          key: command.input.Key,
+          hasBody: !!command.input.Body,
+          contentType: command.input.ContentType,
+        });
+
+        await s3Client.send(command);
+        // Get a download URL for the uploaded file
+        const uploadUrl = await generatePresignedDownloadUrl(fileKey);
+        return { uploadUrl, fileKey };
+      } catch (error) {
+        console.error("[STORAGE_SERVICE] S3 upload error:", {
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
+          bucket: AWS_CONFIG.bucket,
+          key: fileKey,
+        });
+        throw error;
+      }
+    } else {
+      // Otherwise, generate a presigned URL for client-side upload
+      const uploadUrl = await generatePresignedUploadUrl(
+        fileKey,
+        file.contentType
+      );
+      return { uploadUrl, fileKey };
+    }
   }
 
   async uploadUserDocument(
