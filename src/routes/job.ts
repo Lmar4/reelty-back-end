@@ -11,48 +11,6 @@ const prisma = new PrismaClient();
 // Initialize ProductionPipeline
 const productionPipeline = new ProductionPipeline();
 
-// Cleanup jobs with incorrect template names
-async function cleanupIncorrectJobs() {
-  try {
-    console.log("[CLEANUP] Looking for jobs with incorrect template names...");
-
-    // Find all jobs with incorrect template names
-    const jobsToDelete = await prisma.videoJob.findMany({
-      where: {
-        OR: [{ template: "default_template" }, { template: "googlezoomintro" }],
-      },
-    });
-
-    if (jobsToDelete.length > 0) {
-      console.log(`[CLEANUP] Found ${jobsToDelete.length} jobs to delete`);
-
-      // Delete all jobs with incorrect template names
-      await prisma.videoJob.deleteMany({
-        where: {
-          OR: [
-            { template: "default_template" },
-            { template: "googlezoomintro" },
-          ],
-        },
-      });
-
-      console.log(
-        "[CLEANUP] Successfully deleted jobs with incorrect templates"
-      );
-    } else {
-      console.log("[CLEANUP] No jobs found with incorrect template names");
-    }
-  } catch (error) {
-    console.error("[CLEANUP] Error:", error);
-  }
-}
-
-// Run cleanup before recovering pending jobs
-cleanupIncorrectJobs().then(() => {
-  // Start job recovery after cleanup
-  recoverPendingJobs();
-});
-
 // Log warning if API key is missing
 if (!process.env.RUNWAYML_API_KEY) {
   console.warn("[WARNING] RUNWAYML_API_KEY environment variable is not set!");
@@ -99,9 +57,12 @@ async function recoverPendingJobs() {
       console.log("[RECOVERY] No pending jobs found");
     }
   } catch (error) {
-    console.error("[RECOVERY] Error recovering pending jobs:", error);
+    console.error("[RECOVERY] Error:", error);
   }
 }
+
+// Start job recovery on initialization
+recoverPendingJobs();
 
 // Validation schemas
 const createJobSchema = z.object({

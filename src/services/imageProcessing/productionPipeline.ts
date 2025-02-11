@@ -11,6 +11,7 @@ import { TemplateKey } from "./templates/types";
 import { VisionProcessor } from "./visionProcessor";
 import { prisma } from "../../lib/prisma";
 import { logger } from "../../utils/logger";
+import { ThumbnailService } from "../thumbnailService";
 
 const prismaClient = new PrismaClient();
 
@@ -41,6 +42,7 @@ interface ProductionPipelineInput {
   inputFiles: string[];
   template: string;
   coordinates?: { lat: number; lng: number };
+  isRegeneration?: boolean;
 }
 
 export class ProductionPipeline {
@@ -48,6 +50,7 @@ export class ProductionPipeline {
   private mapCapture: MapCapture;
   private visionProcessor: VisionProcessor;
   private processingSteps: Map<string, ProcessingStep>;
+  private thumbnailService: ThumbnailService;
 
   constructor() {
     this.imageToVideoConverter = new ImageToVideoConverter(
@@ -57,6 +60,7 @@ export class ProductionPipeline {
     this.mapCapture = new MapCapture(process.env.TEMP_OUTPUT_DIR || "./temp");
     this.visionProcessor = new VisionProcessor();
     this.processingSteps = new Map();
+    this.thumbnailService = new ThumbnailService();
   }
 
   private async updateJobStatus(
@@ -195,11 +199,39 @@ export class ProductionPipeline {
     };
   }
 
-  private async processImage(s3Path: string): Promise<{
+  private async processImage(
+    s3Path: string,
+    isRegeneration: boolean = false
+  ): Promise<{
     localWebpPath: string;
     s3WebpPath: string;
     uploadPromise: Promise<void>;
   }> {
+    // For regeneration, directly use the processed WebP path
+    if (isRegeneration) {
+      const originalKey = this.parseS3Path(s3Path).key;
+      const photo = await prismaClient.photo.findFirst({
+        where: {
+          filePath: originalKey,
+          processedFilePath: { not: null },
+        },
+      });
+
+      if (!photo?.processedFilePath) {
+        throw new Error(`WebP version not found for image: ${originalKey}`);
+      }
+
+      // Construct S3 path for the WebP and download it
+      const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${photo.processedFilePath}`;
+      const localWebpPath = await this.downloadFromS3(s3WebpPath);
+
+      return {
+        localWebpPath,
+        s3WebpPath,
+        uploadPromise: Promise.resolve(), // No need to upload since it already exists
+      };
+    }
+
     // First check if WebP version exists in the database
     const originalKey = this.parseS3Path(s3Path).key;
     const existingPhoto = await prismaClient.photo.findFirst({
@@ -332,7 +364,10 @@ export class ProductionPipeline {
     throw lastError;
   }
 
-  private async processWebP(input: string[]): Promise<ProcessingStep> {
+  private async processWebP(
+    input: string[],
+    isRegeneration: boolean = false
+  ): Promise<ProcessingStep> {
     const step: ProcessingStep = {
       id: `webp-${Date.now()}`,
       type: "webp",
@@ -350,7 +385,7 @@ export class ProductionPipeline {
     try {
       const results = await Promise.all(
         input.map(async (file) => {
-          const result = await this.processImage(file);
+          const result = await this.processImage(file, isRegeneration);
           return result.localWebpPath;
         })
       );
@@ -372,16 +407,31 @@ export class ProductionPipeline {
       type: "runway",
       input,
       output: [],
-      settings: { duration: 3 },
+      settings: {
+        duration: 5,
+        ratio: "768:1280",
+        watermark: false,
+      },
       status: "processing",
     };
 
     try {
       const results = await Promise.all(
         input.map(async (file) => {
-          const result = await this.imageToVideoConverter.convertImagesToVideo(
-            [file],
-            { duration: 3 }
+          const result = await this.retryOperation(
+            async () => {
+              return await this.imageToVideoConverter.convertImagesToVideo(
+                [file],
+                {
+                  duration: 5,
+                  ratio: "768:1280",
+                  watermark: false,
+                }
+              );
+            },
+            3,
+            2000,
+            "Runway API call"
           );
           return result;
         })
@@ -391,7 +441,25 @@ export class ProductionPipeline {
       step.status = "completed";
     } catch (error) {
       step.status = "failed";
-      step.error = error instanceof Error ? error.message : "Unknown error";
+      if (error instanceof Error) {
+        step.error = error.message;
+        // Check for specific error types
+        if (error.message.includes("Rate limit exceeded")) {
+          step.error = "Rate limit exceeded. Please try again later.";
+        } else if (error.message.includes("Invalid input parameters")) {
+          step.error = "Invalid input parameters for video generation.";
+        } else if (error.message.includes("service temporarily unavailable")) {
+          step.error =
+            "Runway service is temporarily unavailable. Please try again later.";
+        }
+      } else {
+        step.error = "Unknown error occurred during video generation";
+      }
+
+      console.error("Runway processing failed:", {
+        error: step.error,
+        input,
+      });
     }
 
     this.processingSteps.set(step.id, step);
@@ -440,19 +508,16 @@ export class ProductionPipeline {
     inputFiles,
     template,
     coordinates,
+    isRegeneration = false,
   }: ProductionPipelineInput): Promise<string> {
     try {
-      // Get job details with user tier
+      // Get job details
       const job = await prisma.videoJob.findUnique({
         where: { id: jobId },
         include: {
           listing: {
             include: {
-              user: {
-                include: {
-                  currentTier: true,
-                },
-              },
+              user: true,
             },
           },
         },
@@ -462,23 +527,13 @@ export class ProductionPipeline {
         throw new Error(`Invalid job data for ${jobId}`);
       }
 
-      // Get all available templates for the user's tier
-      const availableTemplates = await prisma.template.findMany({
-        where: {
-          subscriptionTiers: {
-            some: {
-              id: job.listing.user.currentTier?.id,
-            },
-          },
-        },
+      // Get all templates
+      const allTemplates = await prisma.template.findMany({
+        orderBy: { order: "asc" },
       });
 
-      if (availableTemplates.length === 0) {
-        throw new Error("No templates available for user tier");
-      }
-
-      // Process WebP conversion
-      const webpStep = await this.processWebP(inputFiles);
+      // Process WebP conversion or download existing WebPs if regenerating
+      const webpStep = await this.processWebP(inputFiles, isRegeneration);
       if (webpStep.status === "failed") {
         throw new Error(`WebP processing failed: ${webpStep.error}`);
       }
@@ -500,24 +555,132 @@ export class ProductionPipeline {
         throw new Error(`Runway processing failed: ${runwayStep.error}`);
       }
 
-      // Process all available templates in parallel
+      // Process all templates
       const templateStep = await this.processTemplates(
         runwayStep.output,
-        availableTemplates.map((t) => t.name),
+        allTemplates.map((t) => t.name),
         mapVideoPath
       );
+
       if (templateStep.status === "failed") {
         throw new Error(`Template processing failed: ${templateStep.error}`);
       }
 
-      // Return the video for the requested template
-      const templateIndex = availableTemplates.findIndex(
-        (t) => t.name.toLowerCase() === template.toLowerCase()
+      // Upload final video to S3
+      const outputFile = templateStep.output[0]; // Use the first template output as main output
+      const s3Key = `videos/${path.basename(outputFile)}`;
+      const s3Url = await this.uploadToS3(
+        outputFile,
+        `s3://${process.env.AWS_BUCKET}/${s3Key}`
       );
 
-      return templateStep.output[templateIndex] || templateStep.output[0];
+      // Generate and upload thumbnail
+      const dbTemplate = await prisma.template.findFirst({
+        where: { name: template },
+      });
+
+      if (dbTemplate && !dbTemplate.thumbnailUrl) {
+        try {
+          await this.thumbnailService.generateAndUploadThumbnail(
+            outputFile,
+            dbTemplate.id
+          );
+        } catch (error) {
+          console.error("[THUMBNAIL_ERROR]", error);
+          // Don't fail the whole process if thumbnail generation fails
+        }
+      }
+
+      // Update job with S3 URL
+      await prisma.videoJob.update({
+        where: { id: jobId },
+        data: { outputFile: s3Url, status: "completed" },
+      });
+
+      return s3Url;
     } catch (error) {
-      logger.error("Production pipeline failed:", { jobId, error });
+      console.error("[CREATE_JOB] Production pipeline error:", {
+        jobId,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      await this.updateJobStatus(
+        jobId,
+        "error",
+        error instanceof Error ? error.message : "Unknown error"
+      );
+      throw error;
+    }
+  }
+
+  async regeneratePhotos(jobId: string, photoIds: string[]): Promise<void> {
+    const job = await prisma.videoJob.findUnique({
+      where: { id: jobId },
+      include: {
+        listing: {
+          include: {
+            photos: true,
+          },
+        },
+      },
+    });
+
+    if (!job || !job.listing) {
+      throw new Error("Invalid job or listing not found");
+    }
+
+    try {
+      // Update job status
+      await this.updateJobStatus(jobId, "processing");
+
+      // Regenerate videos for selected photos
+      const regeneratedVideos =
+        await this.imageToVideoConverter.regenerateVideos(photoIds);
+
+      // Get all video segments (both regenerated and existing)
+      const allPhotos = job.listing.photos;
+      const videoSegments = allPhotos
+        .map((photo) => {
+          const regeneratedIndex = photoIds.indexOf(photo.id);
+          if (regeneratedIndex !== -1) {
+            return regeneratedVideos[regeneratedIndex];
+          }
+          // @ts-ignore - property exists after Prisma generate
+          return photo.runwayVideoPath || null;
+        })
+        .filter(Boolean) as string[]; // Type assertion after filtering out nulls
+
+      // Create a new final video with the updated segments
+      const outputPath = await this.imageToVideoConverter.createTemplate(
+        job.template as TemplateKey,
+        videoSegments,
+        undefined // mapVideoPath if needed
+      );
+
+      // Upload the new video to S3
+      const s3Key = `videos/${path.basename(outputPath)}`;
+      const s3Url = await this.uploadToS3(
+        outputPath,
+        `s3://${process.env.AWS_BUCKET}/${s3Key}`
+      );
+
+      // Update job with new video URL
+      await prisma.videoJob.update({
+        where: { id: jobId },
+        data: {
+          outputFile: s3Url,
+          status: "completed",
+          error: null,
+        },
+      });
+    } catch (error) {
+      console.error("Error during photo regeneration:", error);
+      await this.updateJobStatus(
+        jobId,
+        "error",
+        error instanceof Error
+          ? error.message
+          : "Unknown error during regeneration"
+      );
       throw error;
     }
   }

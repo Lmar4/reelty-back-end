@@ -2,6 +2,10 @@ import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { PrismaClient } from "@prisma/client";
 import { ProductionPipeline } from "../../services/imageProcessing/productionPipeline";
 import { z } from "zod";
+import {
+  getTierNameFromId,
+  SUBSCRIPTION_TIERS,
+} from "../../constants/subscription-tiers";
 
 const prisma = new PrismaClient();
 

@@ -1,25 +1,21 @@
-import axios, { AxiosInstance } from "axios";
+import RunwayML from "@runwayml/sdk";
 
-export class RunwayML {
-  private apiKey: string;
-  private client: AxiosInstance;
-  private readonly baseURL = "https://api.runwayml.com/v1";
+export class RunwayClient {
+  private client: RunwayML;
 
   constructor(apiKey: string) {
     console.log("Initializing RunwayML client...");
-    this.apiKey = apiKey;
-    this.client = axios.create({
-      baseURL: this.baseURL,
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
+    this.client = new RunwayML({
+      apiKey: apiKey,
+      maxRetries: 2,
+      timeout: 60000, // 1 minute timeout
     });
   }
 
   async getStatus(): Promise<{ status: string }> {
     console.log("Checking RunwayML API status...");
     try {
+      // Note: Health check endpoint might need to be called differently with the SDK
       const response = await this.client.get("/health");
       console.log("RunwayML API is online");
       return { status: "online" };
@@ -29,115 +25,100 @@ export class RunwayML {
     }
   }
 
-  async generateVideo(params: {
-    model: string;
-    input: {
-      images: string[];
-      prompt?: string;
-      duration?: number;
-    };
+  async imageToVideo(params: {
+    model: "gen3a_turbo";
+    promptImage: string;
+    promptText: string;
+    duration?: 5 | 10;
+    ratio?: "768:1280" | "1280:768";
   }): Promise<{
     id: string;
-    status: "pending" | "processing" | "completed" | "failed";
-    output?: { url: string };
   }> {
-    console.log("Generating video with RunwayML:", {
+    console.log("Creating image-to-video task with RunwayML:", {
       model: params.model,
-      imageCount: params.input.images.length,
-      prompt: params.input.prompt,
-      duration: params.input.duration,
+      promptText: params.promptText,
+      duration: params.duration,
+      ratio: params.ratio,
     });
 
     try {
-      const response = await this.client.post("/inference", {
+      const response = await this.client.imageToVideo.create({
         model: params.model,
-        input: {
-          image_urls: params.input.images,
-          prompt: params.input.prompt || "Create a smooth transition video",
-          duration: params.input.duration || 5,
-        },
+        promptImage: params.promptImage,
+        promptText: params.promptText || "Create a smooth transition video",
+        duration: params.duration || 5,
+        ratio: params.ratio || "768:1280",
       });
 
-      console.log("RunwayML video generation initiated:", {
-        jobId: response.data.id,
-        status: response.data.status,
+      console.log("RunwayML task created:", {
+        taskId: response.id,
       });
 
       return {
-        id: response.data.id,
-        status: response.data.status,
-        output: response.data.output,
+        id: response.id,
       };
     } catch (error) {
-      console.error("RunwayML video generation failed:", {
-        error: error instanceof Error ? error.message : error,
-        params,
-      });
-      throw new Error("Failed to generate video");
+      if (error instanceof RunwayML.APIError) {
+        console.error("RunwayML task creation failed:", {
+          status: error.status,
+          name: error.name,
+          message: error.message,
+        });
+      } else {
+        console.error("RunwayML task creation failed:", error);
+      }
+      throw error;
     }
   }
 
-  async getJobStatus(jobId: string): Promise<{
-    status: "pending" | "processing" | "completed" | "failed";
-    output?: { url: string };
-  }> {
-    console.log("Checking RunwayML job status:", { jobId });
+  tasks = {
+    retrieve: async (
+      taskId: string
+    ): Promise<{
+      status: "PENDING" | "PROCESSING" | "SUCCEEDED" | "FAILED";
+      failure?: string;
+      output?: string[];
+    }> => {
+      console.log("Checking RunwayML task status:", { taskId });
+      try {
+        const task = await this.client.tasks.retrieve(taskId);
+
+        console.log("RunwayML task status retrieved:", {
+          taskId,
+          status: task.status,
+          hasOutput: !!task.output,
+        });
+
+        return {
+          status: task.status as
+            | "PENDING"
+            | "PROCESSING"
+            | "SUCCEEDED"
+            | "FAILED",
+          failure: task.failure,
+          output: task.output,
+        };
+      } catch (error) {
+        console.error("RunwayML task status check failed:", {
+          taskId,
+          error: error instanceof Error ? error.message : error,
+        });
+        throw error;
+      }
+    },
+  };
+
+  async cancelTask(taskId: string): Promise<void> {
+    console.log("Cancelling RunwayML task:", { taskId });
     try {
-      const response = await this.client.get(`/inference/${jobId}`);
-
-      console.log("RunwayML job status retrieved:", {
-        jobId,
-        status: response.data.status,
-        hasOutput: !!response.data.output,
-      });
-
-      return {
-        status: response.data.status,
-        output: response.data.output,
-      };
+      await this.client.tasks.delete(taskId);
+      console.log("RunwayML task cancelled successfully:", { taskId });
     } catch (error) {
-      console.error("RunwayML job status check failed:", {
-        jobId,
+      console.error("RunwayML task cancellation failed:", {
+        taskId,
         error: error instanceof Error ? error.message : error,
       });
-      throw new Error("Failed to check job status");
-    }
-  }
-
-  async cancelJob(jobId: string): Promise<void> {
-    console.log("Cancelling RunwayML job:", { jobId });
-    try {
-      await this.client.delete(`/inference/${jobId}`);
-      console.log("RunwayML job cancelled successfully:", { jobId });
-    } catch (error) {
-      console.error("RunwayML job cancellation failed:", {
-        jobId,
-        error: error instanceof Error ? error.message : error,
-      });
-      throw new Error("Failed to cancel job");
-    }
-  }
-
-  async listModels(): Promise<
-    Array<{
-      id: string;
-      name: string;
-      description: string;
-      type: string;
-    }>
-  > {
-    console.log("Fetching available RunwayML models...");
-    try {
-      const response = await this.client.get("/models");
-      console.log("RunwayML models retrieved:", {
-        modelCount: response.data.models.length,
-      });
-      return response.data.models;
-    } catch (error) {
-      console.error("RunwayML models listing failed:", {
-        error: error instanceof Error ? error.message : error,
-      });
-      throw new Error("Failed to list models");
+      throw error;
     }
   }
 }

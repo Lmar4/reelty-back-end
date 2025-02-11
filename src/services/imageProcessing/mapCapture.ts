@@ -12,6 +12,8 @@ interface MapConfig {
   initialZoom: number;
   finalZoom: number;
   frameCount: number;
+  transitionDuration: number;
+  fps: number;
 }
 
 // Define Google Maps types
@@ -56,7 +58,9 @@ export class MapCapture {
     this.config = {
       initialZoom: 18,
       finalZoom: 12,
-      frameCount: 30,
+      frameCount: 90, // Increased to 90 frames for smoother animation
+      transitionDuration: 3, // 3 seconds total duration
+      fps: 30, // 30 frames per second
     };
     this.mapStyles = []; // Add your map styles here
     this.loader = new Loader({
@@ -158,6 +162,7 @@ export class MapCapture {
 
     try {
       const page = await browser.newPage();
+      await page.setViewport({ width: 1080, height: 1080 });
 
       await page.setContent(`
         <!DOCTYPE html>
@@ -166,7 +171,6 @@ export class MapCapture {
             <style>
               #map { height: 100vh; width: 100vw; }
             </style>
-            <script src="https://maps.googleapis.com/maps/api/js?key=${process.env.GOOGLE_MAPS_API_KEY}&callback=initMap" async defer></script>
           </head>
           <body>
             <div id="map"></div>
@@ -201,30 +205,61 @@ export class MapCapture {
         });
       }, address);
 
-      // Animate map
-      await page.evaluate((coords: { lat: number; lng: number }) => {
-        // @ts-expect-error: window.map is defined in the page context
-        const map: google.maps.Map | undefined = window.map;
-        if (map) {
-          map.setCenter({ lat: coords.lat, lng: coords.lng });
-          map.setZoom(18);
-        }
-      }, location);
-
-      // Capture frames
-      const frames: string[] = [];
+      // Create output directory
       const outputDir = path.join(this.outputDir, Date.now().toString());
       await fs.promises.mkdir(outputDir, { recursive: true });
 
-      // Take screenshot
-      const framePath = path.join(outputDir, `frame_0.jpg`);
-      await page.screenshot({
-        path: framePath,
-        type: "jpeg",
-        quality: 80,
-      });
-      frames.push(framePath);
+      // Calculate zoom steps
+      const zoomSteps =
+        (this.config.initialZoom - this.config.finalZoom) /
+        this.config.frameCount;
+      const frames: string[] = [];
 
+      // Capture frames with smooth zoom transition
+      for (let i = 0; i < this.config.frameCount; i++) {
+        const currentZoom = this.config.initialZoom - zoomSteps * i;
+
+        // Update map zoom and center
+        await page.evaluate(
+          ({
+            coords,
+            zoom,
+          }: {
+            coords: { lat: number; lng: number };
+            zoom: number;
+          }) => {
+            const win = globalThis as unknown as Window;
+            const map = win.map;
+            if (map) {
+              map.setCenter(coords);
+              map.setZoom(zoom);
+            }
+          },
+          { coords: location, zoom: currentZoom }
+        );
+
+        // Add a small delay to allow map rendering
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        // Capture frame
+        const framePath = path.join(
+          outputDir,
+          `frame_${String(i).padStart(2, "0")}.jpg`
+        );
+        await page.screenshot({
+          path: framePath,
+          type: "jpeg",
+          quality: 80,
+        });
+        frames.push(framePath);
+
+        // Log progress
+        if (i % 10 === 0) {
+          console.log(`Captured frame ${i + 1}/${this.config.frameCount}`);
+        }
+      }
+
+      console.log("Map animation capture completed successfully");
       return frames;
     } catch (error) {
       console.error("Error capturing map animation:", error);

@@ -39,8 +39,22 @@ async function seedTemplates() {
   ];
 
   for (const template of templates) {
+    // Get subscription tier IDs for the template's tiers
+    const subscriptionTiers = await prisma.subscriptionTier.findMany({
+      where: {
+        name: {
+          in: template.tiers.map((tier) => tier.toUpperCase()),
+        },
+      },
+    });
+
     await prisma.template.create({
-      data: template,
+      data: {
+        ...template,
+        subscriptionTiers: {
+          connect: subscriptionTiers.map((tier) => ({ id: tier.id })),
+        },
+      },
     });
   }
 
