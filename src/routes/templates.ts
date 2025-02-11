@@ -129,6 +129,36 @@ const createTemplate: RequestHandler = async (req, res) => {
   }
 };
 
+// Get all templates with subscription tiers
+router.get("/", isAuthenticated, async (req, res) => {
+  try {
+    const templates = await prisma.template.findMany({
+      include: {
+        subscriptionTiers: {
+          select: {
+            name: true,
+          },
+        },
+      },
+      orderBy: {
+        order: "asc",
+      },
+    });
+
+    res.json({
+      success: true,
+      data: templates,
+    });
+  } catch (error) {
+    logger.error("[GET_TEMPLATES_ERROR]", error);
+    res.status(500).json({
+      success: false,
+      error:
+        error instanceof Error ? error.message : "Failed to fetch templates",
+    });
+  }
+});
+
 // Route handlers
 router.get("/", isAuthenticated, getTemplates);
 router.post(
