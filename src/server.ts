@@ -8,6 +8,10 @@ import jobsRouter from "./routes/job";
 import listingsRouter from "./routes/listings";
 import templatesRouter from "./routes/templates";
 import usersRouter from "./routes/users";
+import adminRouter from "./routes/admin";
+import agencyRoutes from "./routes/agency";
+import bulkDiscountRoutes from "./routes/bulk-discount";
+import queueRouter from "./routes/queue";
 import { logger } from "./utils/logger";
 
 const app = express();
@@ -39,6 +43,10 @@ app.use("/api/listings", listingsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/jobs", jobsRouter);
 app.use("/api/templates", templatesRouter);
+app.use("/api/admin", adminRouter);
+app.use("/api/agency", agencyRoutes);
+app.use("/api/bulk-discounts", bulkDiscountRoutes);
+app.use("/api/queue", queueRouter);
 
 // Error handling middleware
 app.use((err: Error, _req: Request, res: Response, _next: Function) => {
