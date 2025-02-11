@@ -1,12 +1,9 @@
-import express, { RequestHandler } from "express";
 import { PrismaClient } from "@prisma/client";
+import express, { RequestHandler } from "express";
 import { z } from "zod";
-import { validateRequest } from "../middleware/validate";
+import { isValidTierId } from "../constants/subscription-tiers";
 import { isAuthenticated } from "../middleware/auth";
-import {
-  SUBSCRIPTION_TIERS,
-  isValidTierId,
-} from "../constants/subscription-tiers";
+import { validateRequest } from "../middleware/validate";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -230,7 +227,7 @@ const cancelSubscription: RequestHandler = async (req, res) => {
     const updatedUser = await prisma.user.update({
       where: { id: userId },
       data: {
-        subscriptionStatus: "canceled",
+        subscriptionStatus: "CANCELED",
         updatedAt: new Date(),
       },
     });

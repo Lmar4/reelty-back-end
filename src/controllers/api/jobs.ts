@@ -1,11 +1,7 @@
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
-import { PrismaClient } from "@prisma/client";
-import { ProductionPipeline } from "../../services/imageProcessing/productionPipeline";
 import { z } from "zod";
-import {
-  getTierNameFromId,
-  SUBSCRIPTION_TIERS,
-} from "../../constants/subscription-tiers";
+import { ProductionPipeline } from "../../services/imageProcessing/productionPipeline";
 
 const prisma = new PrismaClient();
 
@@ -42,7 +38,7 @@ export async function submitJob(
         listingId: validatedData.listingId,
         inputFiles: validatedData.images,
         template: validatedData.template,
-        status: "pending",
+        status: "PENDING" as VideoGenerationStatus,
       },
     });
 

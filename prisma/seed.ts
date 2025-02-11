@@ -139,7 +139,7 @@ async function main() {
         where: { id: existingAdmin.id },
         data: {
           currentTierId: SUBSCRIPTION_TIERS.ADMIN,
-          subscriptionStatus: "active",
+          subscriptionStatus: "ACTIVE",
         },
       })
     : await prisma.user.create({
@@ -150,7 +150,7 @@ async function main() {
           firstName: "Admin",
           lastName: "User",
           currentTierId: SUBSCRIPTION_TIERS.ADMIN,
-          subscriptionStatus: "active",
+          subscriptionStatus: "ACTIVE",
         },
       });
 

@@ -1,17 +1,16 @@
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { Readable } from "stream";
+import { prisma } from "../../lib/prisma";
+import { ThumbnailService } from "../thumbnailService";
 import { ImageToVideoConverter } from "./imageToVideoConverter";
 import { MapCapture } from "./mapCapture";
 import { TemplateKey } from "./templates/types";
 import { VisionProcessor } from "./visionProcessor";
-import { prisma } from "../../lib/prisma";
-import { logger } from "../../utils/logger";
-import { ThumbnailService } from "../thumbnailService";
 
 const prismaClient = new PrismaClient();
 
@@ -72,7 +71,7 @@ export class ProductionPipeline {
     await prismaClient.videoJob.update({
       where: { id: jobId },
       data: {
-        status,
+        status: status.toUpperCase() as VideoGenerationStatus,
         ...(error && { error }),
       },
     });
@@ -594,7 +593,7 @@ export class ProductionPipeline {
       // Update job with S3 URL
       await prisma.videoJob.update({
         where: { id: jobId },
-        data: { outputFile: s3Url, status: "completed" },
+        data: { outputFile: s3Url, status: "COMPLETED" },
       });
 
       return s3Url;
@@ -668,7 +667,7 @@ export class ProductionPipeline {
         where: { id: jobId },
         data: {
           outputFile: s3Url,
-          status: "completed",
+          status: "COMPLETED",
           error: null,
         },
       });

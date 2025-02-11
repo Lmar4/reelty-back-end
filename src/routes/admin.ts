@@ -447,10 +447,10 @@ const getRevenueAnalytics: RequestHandler = async (_req, res) => {
       })),
       subscriptionStats: {
         active:
-          subscriptionStats.find((s) => s.subscriptionStatus === "active")
+          subscriptionStats.find((s) => s.subscriptionStatus === "ACTIVE")
             ?._count || 0,
         cancelled:
-          subscriptionStats.find((s) => s.subscriptionStatus === "cancelled")
+          subscriptionStats.find((s) => s.subscriptionStatus === "CANCELED")
             ?._count || 0,
         total: subscriptionStats.reduce((acc, curr) => acc + curr._count, 0),
       },
@@ -650,7 +650,7 @@ const listUsers: RequestHandler = async (req, res, next) => {
             "Unknown",
           subscriptionTier: user.currentTierId,
           credits,
-          status: user.subscriptionStatus || "inactive",
+          status: user.subscriptionStatus || "INACTIVE",
           lastActive:
             user.lastLoginAt?.toISOString() || user.updatedAt.toISOString(),
           createdAt: user.createdAt.toISOString(),

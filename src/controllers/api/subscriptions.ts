@@ -1,5 +1,5 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, SubscriptionStatus } from "@prisma/client";
 import { z } from "zod";
 
 const prisma = new PrismaClient();
@@ -11,11 +11,11 @@ const updateSubscriptionSchema = z.object({
   stripePriceId: z.string(),
   stripeProductId: z.string(),
   status: z.enum([
-    "active",
-    "canceled",
-    "past_due",
-    "incomplete",
-    "incomplete_expired",
+    "ACTIVE",
+    "CANCELED",
+    "PAST_DUE",
+    "INCOMPLETE",
+    "INCOMPLETE_EXPIRED",
   ]),
   currentPeriodEnd: z.number(),
 });
@@ -46,7 +46,8 @@ export async function updateSubscription(
         stripeSubscriptionId: validatedData.stripeSubscriptionId,
         stripePriceId: validatedData.stripePriceId,
         stripeProductId: validatedData.stripeProductId,
-        subscriptionStatus: validatedData.status,
+        subscriptionStatus:
+          validatedData.status.toUpperCase() as SubscriptionStatus,
         subscriptionPeriodEnd: new Date(validatedData.currentPeriodEnd * 1000),
         updatedAt: new Date(),
       },
@@ -60,7 +61,7 @@ export async function updateSubscription(
         stripeSubscriptionId: validatedData.stripeSubscriptionId,
         stripePriceId: validatedData.stripePriceId,
         stripeProductId: validatedData.stripeProductId,
-        status: validatedData.status,
+        status: validatedData.status.toUpperCase(),
         periodEnd: new Date(validatedData.currentPeriodEnd * 1000),
       },
     });
@@ -106,7 +107,7 @@ export async function cancelSubscription(
     const updatedUser = await prisma.user.update({
       where: { id: validatedData.userId },
       data: {
-        subscriptionStatus: "canceled",
+        subscriptionStatus: "CANCELED",
         updatedAt: new Date(),
       },
     });
@@ -117,7 +118,7 @@ export async function cancelSubscription(
         userId: validatedData.userId,
         action: "cancel",
         stripeSubscriptionId: validatedData.stripeSubscriptionId,
-        status: "canceled",
+        status: "CANCELED",
       },
     });
 

@@ -1,11 +1,11 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
+import path from "path";
 import { AllowedMimeTypes } from "../../config/storage";
 import { StorageService } from "../storage";
-import { ProductionPipeline } from "./productionPipeline";
 import { MapCapture } from "./mapCapture";
+import { ProductionPipeline } from "./productionPipeline";
 import { TemplateKey } from "./templates/types";
 import { VisionProcessor } from "./visionProcessor";
-import path from "path";
 
 const prisma = new PrismaClient();
 
@@ -136,7 +136,7 @@ export class ImageProcessingService {
       data: {
         userId,
         listingId: propertyId,
-        status: "pending",
+        status: "PENDING" as VideoGenerationStatus,
         inputFiles: imageKeys,
         template: templateKey,
       },

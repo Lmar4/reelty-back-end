@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import express, { RequestHandler } from "express";
 import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
@@ -165,7 +165,7 @@ const createJob: RequestHandler = async (req, res) => {
       data: {
         userId: req.user!.id,
         listingId,
-        status: "pending",
+        status: "PENDING" as VideoGenerationStatus,
         progress: 0,
         template: templateId || "Google Zoom Intro",
         inputFiles: inputFiles || [],
@@ -190,9 +190,9 @@ const createJob: RequestHandler = async (req, res) => {
           ? job.inputFiles.map(String)
           : [],
         template: job.template || "Google Zoom Intro",
-        coordinates: job.listing?.coordinates as
-          | { lat: number; lng: number }
-          | undefined,
+        coordinates: (
+          await prisma.listing.findUnique({ where: { id: job.listingId } })
+        )?.coordinates as { lat: number; lng: number } | undefined,
       })
       .catch((error) => {
         console.error("[CREATE_JOB] Production pipeline error:", {
@@ -373,7 +373,7 @@ const regenerateJob: RequestHandler = async (req, res) => {
       data: {
         userId: req.user!.id,
         listingId: existingJob.listingId,
-        status: "pending",
+        status: "PENDING" as VideoGenerationStatus,
         template: template.name || "Google Zoom Intro",
         inputFiles: existingJob.inputFiles || [],
       },
@@ -403,9 +403,9 @@ const regenerateJob: RequestHandler = async (req, res) => {
           ? newJob.inputFiles.map(String)
           : [],
         template: newJob.template || "Google Zoom Intro",
-        coordinates: newJob.listing?.coordinates as
-          | { lat: number; lng: number }
-          | undefined,
+        coordinates: (
+          await prisma.listing.findUnique({ where: { id: newJob.listingId } })
+        )?.coordinates as { lat: number; lng: number } | undefined,
       })
       .catch((error) => {
         console.error("[REGENERATE_JOB] Production pipeline error:", {
