@@ -16,24 +16,60 @@ enum AssetType {
   LOTTIE
 }
 
+enum UserRole {
+  USER
+  ADMIN
+  AGENCY
+  AGENCY_USER
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  CANCELED
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  PAST_DUE
+  TRIALING
+  UNPAID
+  INACTIVE
+}
+
+enum VideoGenerationStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
 model User {
   id                    String      @id // Clerk ID
   email                 String      @unique
   firstName            String?
   lastName             String?
   password             String
+  role                UserRole    @default(USER)
   stripeCustomerId     String?     @unique
   stripeSubscriptionId String?
   stripePriceId        String?
   stripeProductId      String?
-  subscriptionStatus   String?     @default("inactive")
+  subscriptionStatus   SubscriptionStatus    @default(INACTIVE)
   subscriptionPeriodEnd DateTime?
   currentTierId        String?     @db.Uuid
   lastLoginAt         DateTime?
   createdAt           DateTime    @default(now())
   updatedAt           DateTime    @updatedAt
-
+  
+  // Agency related fields
+  agencyId           String?     // For agency_users
+  agencyOwnerId      String?     // For agency users
+  agencyName         String?     // For agency accounts
+  agencyMaxUsers     Int?        // For agency accounts
+  agencyCurrentUsers Int?        @default(0) // For agency accounts
+  
   // Relations
+  agency            User?       @relation("AgencyUsers", fields: [agencyId], references: [id])
+  agencyUsers       User[]      @relation("AgencyUsers")
   subscriptionLogs    SubscriptionLog[]
   creditLogs      CreditLog[]    @relation("UserCreditLogs")
   adminCreditLogs CreditLog[]    @relation("AdminCreditLogs")
@@ -43,12 +79,18 @@ model User {
   listings        Listing[]
   photos          Photo[]
   videoJobs       VideoJob[]
+  videoGenerationJobs VideoGenerationJob[] @relation("UserVideoJobs")
+  agencyVideoJobs    VideoGenerationJob[] @relation("AgencyUsers")
   searchHistory   SearchHistory[]
   errorLogs       ErrorLog[]
   tempUploads     TempUpload[]
   currentTier     SubscriptionTier? @relation(fields: [currentTierId], references: [id])
+  bulkDiscount    BulkDiscount?   @relation(fields: [bulkDiscountId], references: [id])
+  bulkDiscountId  String?        @db.Uuid
 
   @@index([currentTierId])
+  @@index([agencyId])
+  @@index([bulkDiscountId])
   @@map("users")
 }
 
@@ -191,12 +233,16 @@ model VideoJob {
   id          String   @id @default(uuid()) @db.Uuid
   userId      String   @map("user_id")
   listingId   String   @map("listing_id") @db.Uuid
-  status      String
+  status      VideoGenerationStatus @default(QUEUED)
   progress    Float    @default(0) @map("progress")
   template    String?
   inputFiles  Json?    @map("input_files")
   outputFile  String?  @map("output_file")
   error       String?
+  position    Int      @default(0)
+  priority    Int      @default(1)
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 
@@ -204,6 +250,7 @@ model VideoJob {
   user        User     @relation(fields: [userId], references: [id])
   listing     Listing  @relation(fields: [listingId], references: [id])
 
+  @@index([status, position])
   @@map("video_jobs")
 }
 
@@ -275,4 +322,43 @@ model ProcessedAsset {
 
   @@index([hash])
   @@index([type])
+}
+
+model BulkDiscount {
+  id              String    @id @default(uuid()) @db.Uuid
+  name            String
+  description     String
+  discountPercent Float
+  maxUsers        Int
+  currentUsers    Int       @default(0)
+  isActive        Boolean   @default(true)
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  // Relations
+  users           User[]
+
+  @@map("bulk_discounts")
+}
+
+model VideoGenerationJob {
+  id          String               @id @default(uuid())
+  userId      String
+  agencyId    String?
+  inputFiles  Json                 // Array of file paths
+  template    String
+  status      VideoGenerationStatus @default(QUEUED)
+  position    Int
+  priority    Int                  @default(1)
+  error       String?
+  result      String?              // URL of the generated video
+  createdAt   DateTime             @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  
+  user        User                 @relation("UserVideoJobs", fields: [userId], references: [id], onDelete: Cascade)
+  agency      User?                @relation("AgencyUsers", fields: [agencyId], references: [id], onDelete: SetNull)
+
+  @@map("video_generation_jobs")
 }
