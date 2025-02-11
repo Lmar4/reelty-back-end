@@ -1,10 +1,10 @@
-import express, { RequestHandler } from "express";
 import { getAuth } from "@clerk/express";
-import { PrismaClient, Prisma } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
+import { format, subDays } from "date-fns";
+import express, { RequestHandler } from "express";
 import { z } from "zod";
-import { validateRequest } from "../middleware/validate";
 import { SUBSCRIPTION_TIERS } from "../constants/subscription-tiers";
-import { subDays, startOfDay, endOfDay, format } from "date-fns";
+import { validateRequest } from "../middleware/validate";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -25,44 +25,104 @@ const assetUpdateSchema = z.object({
   body: assetSchema.shape.body.partial(),
 });
 
+const creditAdjustmentSchema = z.object({
+  body: z.object({
+    amount: z.number(),
+    reason: z.string().min(1),
+  }),
+});
+
+const statusUpdateSchema = z.object({
+  body: z.object({
+    status: z.enum([
+      "active",
+      "canceled",
+      "incomplete",
+      "incomplete_expired",
+      "past_due",
+      "trialing",
+      "unpaid",
+      "inactive",
+    ]),
+  }),
+});
+
 // Middleware to check if user is admin
 const requireAdmin: RequestHandler = async (req, res, next) => {
   try {
+    console.log("[ADMIN_CHECK] Request path:", req.path);
+    console.log("[ADMIN_CHECK] Request headers:", {
+      authorization: req.headers.authorization ? "present" : "missing",
+    });
+
     const auth = getAuth(req);
-    if (!auth.userId) {
+    const { userId, sessionId } = auth;
+
+    console.log("[ADMIN_CHECK] Auth info:", { userId, sessionId });
+
+    if (!userId || !sessionId) {
+      console.log("[ADMIN_CHECK] No userId or sessionId");
       res.status(401).json({
-        error: "Unauthorized",
+        success: false,
+        error: "Unauthorized: Invalid session",
         status: 401,
       });
       return;
     }
 
+    // Get user from database
     const user = await prisma.user.findUnique({
-      where: { id: auth.userId },
+      where: { id: userId },
       select: {
         currentTierId: true,
       },
     });
 
+    console.log("[ADMIN_CHECK] User data:", {
+      found: !!user,
+      currentTierId: user?.currentTierId,
+    });
+
+    if (!user) {
+      console.log("[ADMIN_CHECK] User not found");
+      res.status(401).json({
+        success: false,
+        error: "Unauthorized: User not found",
+        status: 401,
+      });
+      return;
+    }
+
     if (
-      !user?.currentTierId ||
+      !user.currentTierId ||
       user.currentTierId !== SUBSCRIPTION_TIERS.ADMIN
     ) {
+      console.log("[ADMIN_CHECK] Not admin tier:", {
+        currentTierId: user.currentTierId,
+        requiredTierId: SUBSCRIPTION_TIERS.ADMIN,
+      });
       res.status(403).json({
+        success: false,
         error: "Forbidden: Admin access required",
         status: 403,
       });
       return;
     }
 
+    console.log("[ADMIN_CHECK] Admin access granted");
+    // Add user info to request for downstream handlers
+    req.user = { id: userId, role: "ADMIN" };
     next();
   } catch (error) {
-    console.error("Admin check error:", error);
+    console.error("[ADMIN_CHECK_ERROR]", {
+      error: error instanceof Error ? error.message : "Unknown error",
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     res.status(500).json({
+      success: false,
       error: "Internal server error",
       status: 500,
     });
-    return;
   }
 };
 
@@ -275,8 +335,8 @@ const getVideoAnalytics: RequestHandler = async (_req, res) => {
         acc[date] = { total: 0, success: 0, failed: 0 };
       }
       acc[date].total++;
-      if (job.status === "success") acc[date].success++;
-      if (job.status === "failed") acc[date].failed++;
+      if (job.status === "COMPLETED") acc[date].success++;
+      if (job.status === "FAILED") acc[date].failed++;
       return acc;
     }, {});
 
@@ -285,10 +345,10 @@ const getVideoAnalytics: RequestHandler = async (_req, res) => {
       processingStats: {
         total: totalJobs,
         success:
-          processingStats.find((s) => s.status === "success")?._count ?? 0,
-        failed: processingStats.find((s) => s.status === "failed")?._count ?? 0,
+          processingStats.find((s) => s.status === "COMPLETED")?._count ?? 0,
+        failed: processingStats.find((s) => s.status === "FAILED")?._count ?? 0,
         inProgress:
-          processingStats.find((s) => s.status === "processing")?._count ?? 0,
+          processingStats.find((s) => s.status === "PROCESSING")?._count ?? 0,
       },
       dailyJobs: Object.entries(dailyJobStats).map(([date, stats]) => ({
         date,
@@ -504,7 +564,238 @@ const getCreditAnalytics: RequestHandler = async (_req, res) => {
   }
 };
 
+// User handlers
+const listUsers: RequestHandler = async (req, res, next) => {
+  try {
+    const { tier, status, minCredits, maxCredits, search } = req.query;
+
+    // Build where clause
+    const where: any = {};
+
+    if (tier) {
+      where.currentTierId = tier as string;
+    }
+
+    if (status) {
+      // Validate status against allowed values
+      const validStatuses = [
+        "active",
+        "canceled",
+        "incomplete",
+        "incomplete_expired",
+        "past_due",
+        "trialing",
+        "unpaid",
+        "inactive",
+      ] as const;
+
+      if (!validStatuses.includes(status as any)) {
+        res.status(400).json({
+          success: false,
+          error: `Invalid status. Must be one of: ${validStatuses.join(", ")}`,
+        });
+        return next();
+      }
+
+      where.subscriptionStatus = status as string;
+    }
+
+    // Get users with their credit logs
+    const users = await prisma.user.findMany({
+      where,
+      include: {
+        currentTier: true,
+        creditLogs: true,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    // Calculate credits for each user
+    const usersWithCredits = await Promise.all(
+      users.map(async (user) => {
+        // Calculate total credits from credit logs
+        const credits = user.creditLogs.reduce(
+          (total, log) => total + log.amount,
+          0
+        );
+
+        // Apply credits filter if specified
+        if (
+          (minCredits && credits < parseInt(minCredits as string)) ||
+          (maxCredits && credits > parseInt(maxCredits as string))
+        ) {
+          return null;
+        }
+
+        // Apply search filter if specified
+        if (search) {
+          const searchLower = (search as string).toLowerCase();
+          const fullName = `${user.firstName || ""} ${
+            user.lastName || ""
+          }`.toLowerCase();
+          const email = user.email.toLowerCase();
+
+          if (!fullName.includes(searchLower) && !email.includes(searchLower)) {
+            return null;
+          }
+        }
+
+        return {
+          id: user.id,
+          email: user.email,
+          name:
+            `${user.firstName || ""} ${user.lastName || ""}`.trim() ||
+            "Unknown",
+          subscriptionTier: user.currentTierId,
+          credits,
+          status: user.subscriptionStatus || "inactive",
+          lastActive:
+            user.lastLoginAt?.toISOString() || user.updatedAt.toISOString(),
+          createdAt: user.createdAt.toISOString(),
+        };
+      })
+    );
+
+    // Filter out null values (users that didn't match filters)
+    const transformedUsers = usersWithCredits.filter(
+      (user): user is NonNullable<typeof user> => user !== null
+    );
+
+    res.json({
+      success: true,
+      data: transformedUsers,
+    });
+    return next();
+  } catch (error) {
+    console.error("[LIST_USERS_ERROR]", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+    return next();
+  }
+};
+
+// Credit adjustment route
+const adjustUserCredits: RequestHandler = async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    const { amount, reason } = req.body;
+
+    // Verify user exists
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+      return next();
+    }
+
+    // Create credit log
+    const creditLog = await prisma.creditLog.create({
+      data: {
+        userId,
+        amount,
+        reason,
+        adminId: req.user!.id, // Admin who made the adjustment
+      },
+      include: {
+        user: {
+          select: {
+            email: true,
+          },
+        },
+      },
+    });
+
+    // Calculate new total credits
+    const totalCredits = await prisma.creditLog.aggregate({
+      where: {
+        userId,
+      },
+      _sum: {
+        amount: true,
+      },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        creditLog,
+        totalCredits: totalCredits._sum.amount || 0,
+      },
+    });
+    return next();
+  } catch (error) {
+    console.error("[CREDIT_ADJUST]", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+    return next();
+  }
+};
+
+// Update user status
+const updateUserStatus: RequestHandler = async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    const { status } = req.body;
+
+    // Verify user exists
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+      return next();
+    }
+
+    // Update user status
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
+        subscriptionStatus: status,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.json({
+      success: true,
+      data: updatedUser,
+    });
+  } catch (error) {
+    console.error("[UPDATE_USER_STATUS]", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+    return next();
+  }
+};
+
 // Route handlers
+router.get("/users", listUsers);
+router.post(
+  "/users/:userId/credits",
+  validateRequest(creditAdjustmentSchema),
+  adjustUserCredits
+);
+router.post(
+  "/users/:userId/status",
+  validateRequest(statusUpdateSchema),
+  updateUserStatus
+);
 router.get("/assets", getAssets);
 router.post("/assets", validateRequest(assetSchema), createAsset);
 router.patch(

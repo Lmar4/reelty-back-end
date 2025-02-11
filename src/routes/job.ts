@@ -22,7 +22,7 @@ async function recoverPendingJobs() {
     console.log("[RECOVERY] Looking for pending jobs...");
     const pendingJobs = await prisma.videoJob.findMany({
       where: {
-        status: "pending",
+        status: "QUEUED",
       },
       include: {
         listing: true,
