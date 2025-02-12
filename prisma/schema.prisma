@@ -96,21 +96,27 @@ model User {
 }
 
 model SubscriptionTier {
-  id              String   @id @default(uuid()) @db.Uuid
-  name            String
-  description     String
-  stripePriceId   String   @unique
-  stripeProductId String   @unique
-  features        String[]
-  monthlyPrice    Float
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id                   String   @id @default(uuid()) @db.Uuid
+  name                 String
+  description          String
+  stripePriceId        String   @unique
+  stripeProductId      String   @unique
+  features             String[]
+  monthlyPrice         Float
+  creditExpirationDays Int      @default(30)     @map("credit_expiration_days")
+  creditRolloverMonths Int      @default(0)      @map("credit_rollover_months")
+  hasWatermark         Boolean  @default(true)   @map("has_watermark")
+  maxPhotosPerListing  Int      @default(10)     @map("max_photos_per_listing")
+  maxReelDownloads     Int?                      @map("max_reel_downloads")  // null means unlimited
+  maxActiveListings    Int      @default(5)      @map("max_active_listings")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 
   // Relations
-  users          User[]
-  templates      Template[] @relation("TemplateToSubscriptionTier")
-  assets         Asset[]
-  subscriptionHistory SubscriptionHistory[]
+  users                User[]
+  templates            Template[] @relation("TemplateToSubscriptionTier")
+  assets               Asset[]
+  subscriptionHistory  SubscriptionHistory[]
 
   @@map("subscription_tiers")
 }

@@ -6,6 +6,7 @@ import statsRoutes from "./stats";
 import bulkDiscountRoutes from "./bulk-discount";
 import agencyRoutes from "./agency";
 import subscriptionTiersRoutes from "./subscription-tiers";
+import templatesRoutes from "./templates";
 
 const router = express.Router();
 
@@ -16,5 +17,6 @@ router.use("/stats", statsRoutes);
 router.use("/bulk-discounts", bulkDiscountRoutes);
 router.use("/agencies", agencyRoutes);
 router.use("/subscription-tiers", subscriptionTiersRoutes);
+router.use("/templates", templatesRoutes);
 
 export default router;

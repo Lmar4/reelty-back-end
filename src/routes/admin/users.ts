@@ -40,9 +40,22 @@ const listUsers: RequestHandler = async (req, res) => {
       },
     });
 
+    // Get credit counts for all users
+    const userCredits = await Promise.all(
+      users.map(async (user) => {
+        const availableCredits = await prisma.listingCredit.count({
+          where: {
+            userId: user.id,
+            creditsRemaining: { gt: 0 }
+          }
+        });
+        return { ...user, credits: availableCredits };
+      })
+    );
+
     res.json({
       success: true,
-      data: users,
+      data: userCredits,
     });
   } catch (error) {
     console.error("List users error:", error);
@@ -58,6 +71,49 @@ const adjustUserCredits: RequestHandler = async (req, res) => {
     const { userId } = req.params;
     const { amount, reason } = req.body;
 
+    if (amount > 0) {
+      // Add new listing credits
+      const expiryDate = new Date();
+      expiryDate.setDate(expiryDate.getDate() + 30); // Credits expire in 30 days
+
+      // Create multiple listing credits
+      await prisma.$transaction(
+        Array.from({ length: amount }, () => 
+          prisma.listingCredit.create({
+            data: {
+              userId,
+              expiryDate,
+              creditsRemaining: amount
+            }
+          })
+        )
+      );
+    } else if (amount < 0) {
+      // Remove unused credits
+      const creditsToRemove = -amount; // Convert negative to positive
+      const unusedCredits = await prisma.listingCredit.findMany({
+        where: {
+          userId,
+          creditsRemaining: { gt: 0 },
+          expiryDate: { gt: new Date() }
+        },
+        orderBy: {
+          expiryDate: 'asc'
+        },
+        take: creditsToRemove
+      });
+
+      if (unusedCredits.length < creditsToRemove) {
+        throw new Error('Not enough unused credits to remove');
+      }
+
+      await prisma.listingCredit.deleteMany({
+        where: {
+          id: { in: unusedCredits.map(c => c.id) }
+        }
+      });
+    }
+
     // Create credit adjustment log
     await prisma.creditLog.create({
       data: {
@@ -68,9 +124,18 @@ const adjustUserCredits: RequestHandler = async (req, res) => {
       },
     });
 
+    // Get updated credit count
+    const availableCredits = await prisma.listingCredit.count({
+      where: {
+        userId,
+        creditsRemaining: { gt: 0 },
+        expiryDate: { gt: new Date() }
+      }
+    });
+
     res.json({
       success: true,
-      data: null,
+      data: { credits: availableCredits }
     });
   } catch (error) {
     console.error("Adjust credits error:", error);
