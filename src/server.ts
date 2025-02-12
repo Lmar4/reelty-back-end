@@ -4,14 +4,14 @@ import cors from "cors";
 import express, { Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
+import adminRouter from "./routes/admin";
+import creditsRouter from "./routes/credits";
 import jobsRouter from "./routes/job";
 import listingsRouter from "./routes/listings";
+import queueRouter from "./routes/queue";
+import subscriptionRouter from "./routes/subscription";
 import templatesRouter from "./routes/templates";
 import usersRouter from "./routes/users";
-import adminRouter from "./routes/admin";
-import agencyRoutes from "./routes/agency";
-import bulkDiscountRoutes from "./routes/bulk-discount";
-import queueRouter from "./routes/queue";
 import { logger } from "./utils/logger";
 
 const app = express();
@@ -43,10 +43,11 @@ app.use("/api/listings", listingsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/jobs", jobsRouter);
 app.use("/api/templates", templatesRouter);
+// Mount all admin routes under /api/admin
 app.use("/api/admin", adminRouter);
-app.use("/api/agency", agencyRoutes);
-app.use("/api/bulk-discounts", bulkDiscountRoutes);
 app.use("/api/queue", queueRouter);
+app.use("/api/subscription", subscriptionRouter);
+app.use("/api/credits", creditsRouter);
 
 // Error handling middleware
 app.use((err: Error, _req: Request, res: Response, _next: Function) => {

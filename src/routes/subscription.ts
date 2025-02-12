@@ -1,7 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import express, { RequestHandler } from "express";
 import { z } from "zod";
-import { isValidTierId } from "../constants/subscription-tiers";
+import { isValidTierId, getTierNameFromId, SubscriptionTierId } from "../constants/subscription-tiers";
 import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
 
@@ -42,9 +42,14 @@ const getTiers: RequestHandler = async (_req, res) => {
       ],
     });
 
+    const tiersWithNames = tiers.map(tier => ({
+      ...tier,
+      name: getTierNameFromId(tier.id as SubscriptionTierId),
+    }));
+
     res.json({
       success: true,
-      data: tiers,
+      data: tiersWithNames,
     });
   } catch (error) {
     console.error("Get tiers error:", error);
@@ -255,6 +260,51 @@ const cancelSubscription: RequestHandler = async (req, res) => {
   }
 };
 
+// Get current user's subscription
+const getCurrentSubscription: RequestHandler = async (req, res) => {
+  try {
+    const userId = req.user!.id;
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        currentTier: true,
+        stripeSubscriptionId: true,
+        subscriptionStatus: true,
+        subscriptionPeriodEnd: true,
+        stripePriceId: true,
+      },
+    });
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: user.stripeSubscriptionId || user.id,
+        plan: user.currentTier?.name || "free",
+        status: user.subscriptionStatus?.toLowerCase() || "free",
+        currentPeriodEnd:
+          user.subscriptionPeriodEnd?.toISOString() || new Date().toISOString(),
+        cancelAtPeriodEnd: user.subscriptionStatus === "CANCELED",
+      },
+    });
+  } catch (error) {
+    console.error("Get current subscription error:", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+  }
+};
+
 // Route handlers
 router.get("/tiers", getTiers); // Public endpoint
 router.patch(
@@ -270,5 +320,6 @@ router.post(
   updateSubscriptionFromStripe
 ); // Stripe webhook endpoint
 router.post("/cancel", isAuthenticated, cancelSubscription);
+router.get("/current", isAuthenticated, getCurrentSubscription);
 
 export default router;

@@ -64,9 +64,9 @@ router.post(
   validateRequest(addUserSchema),
   async (req, res) => {
     try {
-      const agencyUser = await agencyService.addAgencyUser(
+      const agencyUser = await agencyService.addUserToAgency(
         req.user!.id,
-        req.body
+        req.body.userId
       );
       res.json({
         success: true,
@@ -91,7 +91,7 @@ router.delete(
   validateRequest(removeUserSchema),
   async (req, res) => {
     try {
-      await agencyService.removeAgencyUser(req.user!.id, req.body.userId);
+      await agencyService.removeUserFromAgency(req.body.userId);
       res.json({
         success: true,
       });
@@ -109,7 +109,11 @@ router.delete(
 // Get agency stats
 router.get("/stats", isAuthenticated, isAgencyOwner, async (req, res) => {
   try {
-    const stats = await agencyService.getAgencyStats(req.user!.id);
+    const agency = await agencyService.getAgencies();
+    const stats = {
+      totalUsers: agency[0]?.agencyCurrentUsers || 0,
+      maxUsers: agency[0]?.agencyMaxUsers || 0
+    };
     res.json({
       success: true,
       data: stats,

@@ -4,6 +4,7 @@ import {
   deductCredits,
   getCreditHistory,
   purchaseCredits,
+  getBalance,
 } from "../controllers/api/credits";
 import { isAuthenticated } from "../middleware/auth";
 import { z } from "zod";
@@ -27,6 +28,7 @@ const purchaseCreditsSchema = z.object({
 });
 
 // Credit management routes
+router.get("/balance", isAuthenticated, getBalance);
 router.post("/check", isAuthenticated, checkCredits);
 router.post(
   "/deduct",
@@ -34,7 +36,7 @@ router.post(
   validateRequest(deductCreditsSchema),
   deductCredits
 );
-router.get("/history", isAuthenticated, getCreditHistory);
+router.get("/history/:userId", isAuthenticated, getCreditHistory);
 router.post(
   "/purchase",
   isAuthenticated,

@@ -1,9 +1,8 @@
 import express from "express";
 import { z } from "zod";
-import { BulkDiscountService } from "../services/bulk-discount.service";
-import { validateRequest } from "../middleware/validate";
-import { isAuthenticated } from "../middleware/auth";
-import { isAdmin } from "../middleware/roles";
+import { BulkDiscountService } from "../../services/bulk-discount.service";
+import { validateRequest } from "../../middleware/validate";
+import { isAdmin } from "../../middleware/auth";
 
 const router = express.Router();
 const bulkDiscountService = new BulkDiscountService();
@@ -26,32 +25,11 @@ const applyDiscountSchema = z.object({
   }),
 });
 
-// Create new bulk discount
-router.post(
-  "/create",
-  isAuthenticated,
-  isAdmin,
-  validateRequest(createDiscountSchema),
-  async (req, res) => {
-    try {
-      const discount = await bulkDiscountService.createBulkDiscount(req.body);
-      res.json({
-        success: true,
-        data: discount,
-      });
-    } catch (error) {
-      console.error("Create bulk discount error:", error);
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error ? error.message : "Unknown error occurred",
-      });
-    }
-  }
-);
+// Apply admin middleware to all routes
+router.use(isAdmin);
 
-// Get all active bulk discounts
-router.get("/", isAuthenticated, isAdmin, async (_req, res) => {
+// Get all bulk discounts
+router.get("/", async (_req, res) => {
   try {
     const discounts = await bulkDiscountService.getBulkDiscounts();
     res.json({
@@ -67,11 +45,30 @@ router.get("/", isAuthenticated, isAdmin, async (_req, res) => {
   }
 });
 
+// Create new bulk discount
+router.post(
+  "/",
+  validateRequest(createDiscountSchema),
+  async (req, res) => {
+    try {
+      const discount = await bulkDiscountService.createBulkDiscount(req.body);
+      res.json({
+        success: true,
+        data: discount,
+      });
+    } catch (error) {
+      console.error("Create bulk discount error:", error);
+      res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error occurred",
+      });
+    }
+  }
+);
+
 // Apply bulk discount to user
 router.post(
   "/apply",
-  isAuthenticated,
-  isAdmin,
   validateRequest(applyDiscountSchema),
   async (req, res) => {
     try {
@@ -88,41 +85,23 @@ router.post(
       console.error("Apply bulk discount error:", error);
       res.status(500).json({
         success: false,
-        error:
-          error instanceof Error ? error.message : "Unknown error occurred",
+        error: error instanceof Error ? error.message : "Unknown error occurred",
       });
     }
   }
 );
 
 // Deactivate bulk discount
-router.post("/deactivate/:id", isAuthenticated, isAdmin, async (req, res) => {
+router.post("/bulk-discounts/:id/deactivate", async (req, res) => {
   try {
     const { id } = req.params;
-    await bulkDiscountService.deactivateDiscount(id);
+    const discount = await bulkDiscountService.deactivateDiscount(id);
     res.json({
       success: true,
+      data: discount,
     });
   } catch (error) {
     console.error("Deactivate bulk discount error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
-  }
-});
-
-// Get bulk discount stats
-router.get("/stats/:id", isAuthenticated, isAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const stats = await bulkDiscountService.getDiscountStats(id);
-    res.json({
-      success: true,
-      data: stats,
-    });
-  } catch (error) {
-    console.error("Get bulk discount stats error:", error);
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Unknown error occurred",

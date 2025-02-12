@@ -1,60 +1,45 @@
-import { PrismaClient, UserRole } from "@prisma/client";
-import {
-  CreateAgencyInput,
-  AddAgencyUserInput,
-  AgencyStats,
-} from "../types/agency";
-import {
-  SUBSCRIPTION_TIERS,
-  SubscriptionTierId,
-  isAgencyTier,
-} from "../constants/subscription-tiers";
-import crypto from "crypto";
-
-const prisma = new PrismaClient();
+import { PrismaClient, User, UserRole } from "@prisma/client";
+import { AgencyInput } from "../types/agency";
 
 export class AgencyService {
-  async createAgency(input: CreateAgencyInput) {
-    const { name, ownerEmail, maxUsers, initialCredits } = input;
+  private prisma: PrismaClient;
 
-    return await prisma.$transaction(async (tx) => {
-      // Create agency owner
-      const agencyOwner = await tx.user.create({
-        data: {
-          id: crypto.randomUUID(),
-          email: ownerEmail,
-          password: crypto.randomUUID(), // Temporary password that should be changed on first login
-          role: UserRole.AGENCY,
-          agencyName: name,
-          agencyMaxUsers: maxUsers,
-          agencyCurrentUsers: 1, // Owner counts as first user
-          currentTierId: SUBSCRIPTION_TIERS.AGENCY,
-        },
-      });
+  constructor() {
+    this.prisma = new PrismaClient();
+  }
 
-      // Create initial credit allocation
-      if (initialCredits > 0) {
-        await tx.creditLog.create({
-          data: {
-            userId: agencyOwner.id,
-            amount: initialCredits,
-            reason: "Initial agency credits allocation",
-          },
-        });
-      }
-
-      return agencyOwner;
+  async getAgencies(): Promise<User[]> {
+    return this.prisma.user.findMany({
+      where: {
+        role: UserRole.AGENCY,
+      },
+      include: {
+        agencyUsers: true,
+      },
     });
   }
 
-  async addAgencyUser(agencyId: string, input: AddAgencyUserInput) {
-    const agency = await prisma.user.findUnique({
+  async createAgency(data: AgencyInput): Promise<User> {
+    // Create agency account
+    const agency = await this.prisma.user.update({
+      where: { id: data.ownerId },
+      data: {
+        role: UserRole.AGENCY,
+        agencyName: data.name,
+        agencyMaxUsers: data.maxUsers,
+        agencyCurrentUsers: 0,
+      },
+    });
+
+    return agency;
+  }
+
+  async addUserToAgency(agencyId: string, userId: string): Promise<User> {
+    // Get agency first
+    const agency = await this.prisma.user.findUnique({
       where: { id: agencyId },
-      select: {
-        id: true,
-        agencyCurrentUsers: true,
-        agencyMaxUsers: true,
-        currentTierId: true,
+      include: {
+        agencyUsers: true,
       },
     });
 
@@ -62,123 +47,67 @@ export class AgencyService {
       throw new Error("Agency not found");
     }
 
-    if (!isAgencyTier(agency.currentTierId as SubscriptionTierId)) {
-      throw new Error("Invalid agency subscription");
+    if (agency.role !== UserRole.AGENCY) {
+      throw new Error("Specified user is not an agency");
     }
 
-    if (agency.agencyCurrentUsers! >= agency.agencyMaxUsers!) {
-      throw new Error("Agency user limit reached");
+    if ((agency.agencyCurrentUsers || 0) >= (agency.agencyMaxUsers || 0)) {
+      throw new Error("Agency has reached maximum number of users");
     }
 
-    return await prisma.$transaction(async (tx) => {
-      // Create agency user
-      const agencyUser = await tx.user.create({
-        data: {
-          id: crypto.randomUUID(),
-          email: input.email,
-          password: crypto.randomUUID(), // Temporary password that should be changed on first login
-          firstName: input.firstName,
-          lastName: input.lastName,
-          role: UserRole.AGENCY_USER,
-          agencyId: agency.id,
-          currentTierId: agency.currentTierId,
-        },
-      });
-
-      // Update agency user count
-      await tx.user.update({
-        where: { id: agency.id },
-        data: {
-          agencyCurrentUsers: {
-            increment: 1,
-          },
-        },
-      });
-
-      // Allocate credits if specified
-      if (input.credits && input.credits > 0) {
-        await tx.creditLog.create({
-          data: {
-            userId: agencyUser.id,
-            amount: input.credits,
-            reason: "Agency user initial credits allocation",
-          },
-        });
-      }
-
-      return agencyUser;
-    });
-  }
-
-  async removeAgencyUser(agencyId: string, userId: string) {
-    const agencyUser = await prisma.user.findFirst({
-      where: {
-        id: userId,
-        agencyId: agencyId,
+    // Update user to be part of agency
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data: {
         role: UserRole.AGENCY_USER,
+        agencyId: agencyId,
       },
     });
 
-    if (!agencyUser) {
-      throw new Error("Agency user not found");
-    }
-
-    return await prisma.$transaction(async (tx) => {
-      // Update user
-      await tx.user.update({
-        where: { id: userId },
-        data: {
-          role: UserRole.USER,
-          agencyId: null,
-          currentTierId: SUBSCRIPTION_TIERS.BASIC,
+    // Increment agency user count
+    await this.prisma.user.update({
+      where: { id: agencyId },
+      data: {
+        agencyCurrentUsers: {
+          increment: 1,
         },
-      });
-
-      // Update agency user count
-      await tx.user.update({
-        where: { id: agencyId },
-        data: {
-          agencyCurrentUsers: {
-            decrement: 1,
-          },
-        },
-      });
+      },
     });
+
+    return updatedUser;
   }
 
-  async getAgencyStats(agencyId: string): Promise<AgencyStats> {
-    const [users, credits, videos] = await Promise.all([
-      // Get user stats
-      prisma.user.aggregate({
-        where: {
-          OR: [{ id: agencyId }, { agencyId: agencyId }],
-        },
-        _count: true,
-      }),
-      // Get credit stats
-      prisma.creditLog.aggregate({
-        where: {
-          OR: [{ userId: agencyId }, { user: { agencyId: agencyId } }],
-        },
-        _sum: {
-          amount: true,
-        },
-      }),
-      // Get video generation stats
-      prisma.videoJob.aggregate({
-        where: {
-          OR: [{ userId: agencyId }, { user: { agencyId: agencyId } }],
-        },
-        _count: true,
-      }),
-    ]);
+  async removeUserFromAgency(userId: string): Promise<User> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        agency: true,
+      },
+    });
 
-    return {
-      totalUsers: users._count,
-      activeUsers: users._count, // TODO: Implement active user logic
-      totalCredits: credits._sum.amount || 0,
-      usedCredits: 0, // TODO: Implement used credits calculation
-      videoGenerations: videos._count,
-    };
+    if (!user || !user.agencyId) {
+      throw new Error("User not found or not part of an agency");
+    }
+
+    // Update user to remove from agency
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        role: UserRole.USER,
+        agencyId: null,
+      },
+    });
+
+    // Decrement agency user count
+    await this.prisma.user.update({
+      where: { id: user.agencyId },
+      data: {
+        agencyCurrentUsers: {
+          decrement: 1,
+        },
+      },
+    });
+
+    return updatedUser;
   }
 }

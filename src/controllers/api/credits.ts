@@ -14,12 +14,16 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
   apiVersion: "2025-01-27.acacia",
 });
 
-export const checkCredits = async (
+export const getBalance = async (
   req: Request,
   res: Response
 ): Promise<void> => {
   try {
-    const { userId } = req.body;
+    const userId = req.user?.id;
+    if (!userId) {
+      res.status(401).json({ error: "User not authenticated" });
+      return;
+    }
 
     const listingCredits = await prisma.listingCredit.findMany({
       where: {
@@ -34,10 +38,63 @@ export const checkCredits = async (
       0
     );
 
-    res.json({ credits: totalCredits });
+    // Get used credits from credit log
+    const usedCredits = await prisma.creditLog.aggregate({
+      where: {
+        userId,
+        amount: { lt: 0 }, // Only count negative amounts (used credits)
+      },
+      _sum: {
+        amount: true,
+      },
+    });
+
+    const total = totalCredits;
+    const used = Math.abs(usedCredits._sum.amount || 0);
+    const available = total - used;
+
+    res.json({
+      success: true,
+      data: {
+        total,
+        available,
+        used,
+      }
+    });
+  } catch (error) {
+    console.error("[GET_BALANCE_ERROR]", error);
+    res.status(500).json({ error: "Failed to get credit balance" });
+  }
+};
+
+export const checkCredits = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      res.status(401).json({ error: "User not authenticated" });
+      return;
+    }
+
+    const listingCredits = await prisma.listingCredit.findMany({
+      where: {
+        userId,
+        creditsRemaining: { gt: 0 },
+        expiryDate: { gt: new Date() },
+      },
+    });
+
+    const totalCredits = listingCredits.reduce(
+      (sum: number, credit: ListingCredit) => sum + credit.creditsRemaining,
+      0
+    );
+
+    res.json({ success: true, data: { credits: totalCredits } });
   } catch (error) {
     console.error("[CHECK_CREDITS_ERROR]", error);
-    res.status(500).json({ error: "Failed to check credits" });
+    res.status(500).json({ success: false, error: "Failed to check credits" });
   }
 };
 
@@ -46,7 +103,13 @@ export const deductCredits = async (
   res: Response
 ): Promise<void> => {
   try {
-    const { userId, amount, reason } = req.body;
+    const userId = req.user?.id;
+    if (!userId) {
+      res.status(401).json({ error: "User not authenticated" });
+      return;
+    }
+
+    const { amount, reason } = req.body;
 
     // Start transaction
     const result = await prisma.$transaction(async (prisma) => {
@@ -115,7 +178,19 @@ export const getCreditHistory = async (
   res: Response
 ): Promise<void> => {
   try {
+    const authUserId = req.user?.id;
+    if (!authUserId) {
+      res.status(401).json({ error: "User not authenticated" });
+      return;
+    }
+
     const { userId } = req.params;
+    
+    // Only allow users to view their own credit history
+    if (userId !== authUserId) {
+      res.status(403).json({ error: "Not authorized to view this credit history" });
+      return;
+    }
 
     const creditLogs = await prisma.creditLog.findMany({
       where: { userId },
@@ -123,7 +198,10 @@ export const getCreditHistory = async (
       take: 50, // Limit to last 50 transactions
     });
 
-    res.json({ history: creditLogs });
+    res.json({ 
+      success: true,
+      data: creditLogs
+    });
   } catch (error) {
     console.error("[CREDIT_HISTORY_ERROR]", error);
     res.status(500).json({ error: "Failed to fetch credit history" });

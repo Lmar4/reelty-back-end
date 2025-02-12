@@ -71,6 +71,7 @@ model User {
   agency            User?       @relation("AgencyUsers", fields: [agencyId], references: [id])
   agencyUsers       User[]      @relation("AgencyUsers")
   subscriptionLogs    SubscriptionLog[]
+  subscriptionHistory SubscriptionHistory[]
   creditLogs      CreditLog[]    @relation("UserCreditLogs")
   adminCreditLogs CreditLog[]    @relation("AdminCreditLogs")
   tierChanges     TierChange[]   @relation("UserTierChanges")
@@ -109,6 +110,7 @@ model SubscriptionTier {
   users          User[]
   templates      Template[] @relation("TemplateToSubscriptionTier")
   assets         Asset[]
+  subscriptionHistory SubscriptionHistory[]
 
   @@map("subscription_tiers")
 }
@@ -311,6 +313,42 @@ model SubscriptionLog {
   @@map("subscription_logs")
 }
 
+model BulkDiscount {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String
+  description     String
+  discountPercent Float
+  maxUsers        Int
+  isActive        Boolean  @default(true)
+  expiresAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Relations
+  users           User[]
+
+  @@map("bulk_discounts")
+}
+
+
+
+model SubscriptionHistory {
+  id            String   @id @default(uuid()) @db.Uuid
+  userId        String
+  status        SubscriptionStatus
+  tierId        String   @db.Uuid
+  startDate     DateTime
+  endDate       DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Relations
+  user          User     @relation(fields: [userId], references: [id])
+  tier          SubscriptionTier @relation(fields: [tierId], references: [id])
+
+  @@map("subscription_history")
+}
+
 model ProcessedAsset {
   id        String   @id @default(cuid())
   type      String   // 'webp' | 'video' | 'map'
@@ -324,23 +362,6 @@ model ProcessedAsset {
   @@index([type])
 }
 
-model BulkDiscount {
-  id              String    @id @default(uuid()) @db.Uuid
-  name            String
-  description     String
-  discountPercent Float
-  maxUsers        Int
-  currentUsers    Int       @default(0)
-  isActive        Boolean   @default(true)
-  expiresAt       DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  
-  // Relations
-  users           User[]
-
-  @@map("bulk_discounts")
-}
 
 model VideoGenerationJob {
   id          String               @id @default(uuid())

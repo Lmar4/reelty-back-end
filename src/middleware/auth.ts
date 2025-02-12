@@ -1,7 +1,6 @@
 import { getAuth } from "@clerk/express";
-import type { Request, Response, NextFunction } from "express";
+import type { NextFunction, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
-import { SUBSCRIPTION_TIERS } from "../constants/subscription-tiers";
 
 // Extend Request type to include user property
 declare global {
@@ -82,19 +81,17 @@ export async function isAdmin(req: Request, res: Response, next: NextFunction) {
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: { currentTierId: true },
+      select: { role: true },
     });
 
-    if (
-      !user?.currentTierId ||
-      user.currentTierId !== SUBSCRIPTION_TIERS.ADMIN
-    ) {
+    if (!user?.role || user.role !== "ADMIN") {
       throw new AuthError(403, "Unauthorized: Admin access required");
     }
 
-    req.user = { id: userId, role: "ADMIN" };
+    req.user = { id: userId, role: user.role };
     next();
   } catch (error) {
+    console.error("[isAdmin] Error:", error);
     if (error instanceof AuthError) {
       res.status(error.statusCode).json({ error: error.message });
     } else {

@@ -7,6 +7,7 @@ import storageRouter from "./storage";
 import jobRouter from "./job";
 import creditsRouter from "./credits";
 import paymentRouter from "./payment";
+import adminRouter from "./admin";
 import { logger } from "../utils/logger";
 
 const router = express.Router();
