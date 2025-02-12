@@ -319,6 +319,7 @@ model BulkDiscount {
   description     String
   discountPercent Float
   maxUsers        Int
+  currentUsers    Int      @default(0)
   isActive        Boolean  @default(true)
   expiresAt       DateTime?
   createdAt       DateTime @default(now())
