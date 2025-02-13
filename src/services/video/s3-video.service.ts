@@ -2,6 +2,7 @@ import {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
+  HeadObjectCommand,
 } from "@aws-sdk/client-s3";
 import * as fs from "fs";
 
@@ -94,6 +95,23 @@ export class S3VideoService {
         s3Path,
         localPath,
       });
+      throw error;
+    }
+  }
+
+  public async checkFileExists(bucket: string, key: string): Promise<boolean> {
+    try {
+      const command = new HeadObjectCommand({
+        Bucket: bucket,
+        Key: key,
+      });
+
+      await this.s3Client.send(command);
+      return true;
+    } catch (error) {
+      if ((error as any)?.name === "NotFound") {
+        return false;
+      }
       throw error;
     }
   }

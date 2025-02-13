@@ -153,6 +153,87 @@ export class VideoProcessingService {
       command.run();
     });
   }
+
+  public async batchProcessVideos(
+    inputVideos: string[],
+    outputPath: string,
+    options: {
+      template?: string;
+      music?: MusicConfig;
+      reverse?: boolean;
+    } = {}
+  ): Promise<void> {
+    console.log("Starting batch video processing with:", {
+      videoCount: inputVideos.length,
+      outputPath,
+      hasTemplate: !!options.template,
+      hasMusicTrack: !!options.music,
+      reverse: options.reverse,
+    });
+
+    // Create a temporary directory for intermediate files
+    const tempDir = path.join(
+      process.env.TEMP_OUTPUT_DIR || "./temp",
+      "batch_" + Date.now()
+    );
+    await fs.promises.mkdir(tempDir, { recursive: true });
+
+    try {
+      // Process videos in parallel batches
+      const batchSize = 3; // Process 3 videos at a time
+      const batches = [];
+
+      for (let i = 0; i < inputVideos.length; i += batchSize) {
+        const batch = inputVideos.slice(i, i + batchSize);
+        batches.push(batch);
+      }
+
+      // Process each batch
+      for (const [index, batch] of batches.entries()) {
+        console.log(`Processing batch ${index + 1}/${batches.length}`);
+        await Promise.all(
+          batch.map(async (video, idx) => {
+            const outputFile = path.join(tempDir, `processed_${idx}.mp4`);
+            await this.stitchVideos(
+              [video],
+              [5], // Default duration
+              outputFile,
+              options.music,
+              options.reverse
+            );
+            return outputFile;
+          })
+        );
+      }
+
+      // Get all processed videos
+      const processedFiles = await fs.promises.readdir(tempDir);
+      const processedPaths = processedFiles
+        .filter((file) => file.startsWith("processed_"))
+        .map((file) => path.join(tempDir, file))
+        .sort((a, b) => {
+          const aNum = parseInt(a.match(/processed_(\d+)\.mp4/)?.[1] || "0");
+          const bNum = parseInt(b.match(/processed_(\d+)\.mp4/)?.[1] || "0");
+          return aNum - bNum;
+        });
+
+      // Final concatenation of all processed videos
+      await this.stitchVideos(
+        processedPaths,
+        processedPaths.map(() => 5), // Default duration for each segment
+        outputPath,
+        options.music,
+        options.reverse
+      );
+    } finally {
+      // Cleanup temporary files
+      try {
+        await fs.promises.rm(tempDir, { recursive: true, force: true });
+      } catch (error) {
+        console.error("Error cleaning up temporary files:", error);
+      }
+    }
+  }
 }
 
 // Export singleton instance

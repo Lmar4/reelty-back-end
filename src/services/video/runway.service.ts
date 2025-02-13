@@ -1,5 +1,7 @@
 import RunwayML from "@runwayml/sdk";
 import { tempFileManager } from "../storage/temp-file.service";
+import { s3Service } from "../storage/s3.service";
+import { imageProcessor } from "../imageProcessing/image.service";
 
 export class RunwayService {
   private static instance: RunwayService;
@@ -23,9 +25,13 @@ export class RunwayService {
     try {
       console.log("Starting video generation:", { imageUrl, index });
 
+      // Download the image from S3 and convert to data URL
+      const imageBuffer = await s3Service.downloadFile(imageUrl);
+      const dataUrl = await imageProcessor.bufferToDataUrl(imageBuffer);
+
       const imageToVideo = await this.client.imageToVideo.create({
         model: "gen3a_turbo",
-        promptImage: imageUrl,
+        promptImage: dataUrl,
         promptText: "Move forward slowly",
         duration: 5,
         ratio: "768:1280",
@@ -36,13 +42,24 @@ export class RunwayService {
       console.log("Task created:", { taskId: imageToVideo.id });
 
       let task;
+      let attempts = 0;
+      const maxAttempts = 30; // 5 minutes maximum (10 second intervals * 30)
+
       do {
         await new Promise((resolve) => setTimeout(resolve, 10000));
         task = await this.client.tasks.retrieve(imageToVideo.id);
+        attempts++;
+
         console.log("Status:", {
           taskId: imageToVideo.id,
           status: task.status,
+          attempt: attempts,
+          maxAttempts,
         });
+
+        if (attempts >= maxAttempts) {
+          throw new Error("Video generation timed out after 5 minutes");
+        }
 
         if (task.status === "FAILED") {
           throw new Error(task.failure || "Video generation failed");
