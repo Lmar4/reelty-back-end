@@ -97,7 +97,6 @@ export class VisionProcessor {
   async analyzeImageForCrop(imagePath: string): Promise<CropCoordinates> {
     try {
       await this.validateImage(imagePath);
-
       const image = sharp(imagePath);
       const metadata = await image.metadata();
 
@@ -120,21 +119,38 @@ export class VisionProcessor {
         cropHeight = Math.round(metadata.width / targetRatio);
       }
 
-      // Analyze multiple regions to find optimal crop
+      // Modified region generation to consider both horizontal and vertical positions
       const regions: CropCoordinates[] = [];
-      const steps = 5;
-      const stepSize = Math.max(
+      const horizontalSteps = 5;
+      const verticalSteps = 3; // Add vertical steps
+
+      const horizontalStepSize = Math.max(
         1,
-        Math.floor((metadata.width - cropWidth) / steps)
+        Math.floor((metadata.width - cropWidth) / horizontalSteps)
+      );
+      const verticalStepSize = Math.max(
+        1,
+        Math.floor((metadata.height - cropHeight) / verticalSteps)
       );
 
-      for (let x = 0; x <= metadata.width - cropWidth; x += stepSize) {
-        regions.push({
-          x,
-          y: Math.floor((metadata.height - cropHeight) / 2),
-          width: cropWidth,
-          height: cropHeight,
-        });
+      // Generate regions by scanning both horizontally and vertically
+      for (
+        let y = 0;
+        y <= metadata.height - cropHeight;
+        y += verticalStepSize
+      ) {
+        for (
+          let x = 0;
+          x <= metadata.width - cropWidth;
+          x += horizontalStepSize
+        ) {
+          regions.push({
+            x,
+            y,
+            width: cropWidth,
+            height: cropHeight,
+          });
+        }
       }
 
       // Analyze each region

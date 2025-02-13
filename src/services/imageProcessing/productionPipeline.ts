@@ -1,18 +1,14 @@
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { Upload } from "@aws-sdk/lib-storage";
 import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
-import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
-import { Readable } from "stream";
 import { prisma } from "../../lib/prisma";
-import { ThumbnailService } from "../thumbnailService";
-import { ImageToVideoConverter } from "./imageToVideoConverter";
+import { imageProcessor } from "./image.service";
 import { MapCapture } from "./mapCapture";
 import { TemplateKey } from "./templates/types";
 import { VisionProcessor } from "./visionProcessor";
-
-const prismaClient = new PrismaClient();
+import { runwayService } from "../video/runway.service";
+import { videoProcessingService } from "../video/video-processing.service";
+import { s3VideoService } from "../video/s3-video.service";
+import { videoTemplateService } from "../video/video-template.service";
 
 interface ProcessingStep {
   id: string;
@@ -45,302 +41,86 @@ interface ProductionPipelineInput {
 }
 
 export class ProductionPipeline {
-  private s3Client: S3Client;
-  private imageToVideoConverter: ImageToVideoConverter;
   private visionProcessor: VisionProcessor;
   private mapCapture: MapCapture;
-  private thumbnailService: ThumbnailService;
   private processingSteps: Map<string, ProcessingStep>;
+  private prisma: PrismaClient;
 
   constructor() {
-    this.s3Client = new S3Client({
-      region: process.env.AWS_REGION || "us-east-1",
-    });
-    this.imageToVideoConverter = new ImageToVideoConverter(
-      process.env.RUNWAYML_API_KEY || "",
-      process.env.TEMP_OUTPUT_DIR || "./temp"
-    );
+    this.prisma = new PrismaClient();
     this.visionProcessor = new VisionProcessor();
     this.mapCapture = new MapCapture(process.env.TEMP_OUTPUT_DIR || "./temp");
-    this.thumbnailService = new ThumbnailService();
     this.processingSteps = new Map();
   }
 
   private async updateJobStatus(
     jobId: string,
     status: VideoGenerationStatus,
-    error?: string
+    error?: string,
+    metadata?: {
+      stage?: "webp" | "runway" | "template" | "final";
+      currentFile?: number;
+      totalFiles?: number;
+      progress?: number;
+    }
   ): Promise<void> {
-    console.log("Updating job status:", { jobId, status, error });
-    await prismaClient.videoJob.update({
+    console.log("Updating job status:", { jobId, status, error, metadata });
+
+    // Convert technical stage to user-friendly message
+    let userMessage = "";
+    if (metadata?.stage === "webp") {
+      userMessage = "Processing your photos...";
+    } else if (metadata?.stage === "runway") {
+      userMessage = "Creating your reel...";
+    } else if (metadata?.stage === "template") {
+      userMessage = "Almost ready...";
+    }
+
+    await prisma.videoJob.update({
       where: { id: jobId },
       data: {
         status,
         error,
+        metadata: metadata
+          ? {
+              ...metadata,
+              error,
+              userMessage,
+              // Keep internal tracking for debugging
+              internalStage: metadata.stage,
+              internalProgress: metadata.progress,
+            }
+          : undefined,
+        // For progress bar, simplify to 3 stages (33% each)
+        progress:
+          metadata?.stage === "webp"
+            ? 33
+            : metadata?.stage === "runway"
+            ? 66
+            : metadata?.stage === "template"
+            ? 99
+            : metadata?.progress || 0,
       },
     });
   }
 
-  private parseS3Path(s3Path: string): { bucket: string; key: string } {
-    return this.imageToVideoConverter.parseS3Path(s3Path);
-  }
-
-  private async downloadFromS3(
-    s3Path: string,
-    outputPath?: string
-  ): Promise<string> {
-    try {
-      // Use ImageToVideoConverter's comprehensive processing
-      const { localWebpPath, uploadPromise } =
-        await this.imageToVideoConverter.processImage(s3Path);
-
-      // Wait for the upload to complete to ensure consistency
-      await uploadPromise;
-
-      return localWebpPath;
-    } catch (error) {
-      console.error("S3 download and processing failed:", {
-        error: error instanceof Error ? error.message : "Unknown error",
-        s3Path,
-        outputPath,
-      });
-      throw error;
-    }
-  }
-
-  private async uploadToS3(
-    localPath: string,
-    destinationPath: string
-  ): Promise<string> {
-    try {
-      await this.imageToVideoConverter.uploadToS3(localPath, destinationPath);
-      return `s3://${this.parseS3Path(destinationPath).bucket}/${
-        this.parseS3Path(destinationPath).key
-      }`;
-    } catch (error) {
-      console.error("S3 upload failed:", {
-        error: error instanceof Error ? error.message : "Unknown error",
-        localPath,
-        destinationPath,
-      });
-      throw error;
-    }
-  }
-
-  private async cleanupFile(filePath: string): Promise<void> {
-    try {
-      await fs.promises.unlink(filePath);
-    } catch (error) {
-      console.warn(`Failed to cleanup file ${filePath}:`, error);
-    }
-  }
-
-  private async checkWebPExists(s3Path: string): Promise<boolean> {
-    try {
-      const webpS3Path = s3Path.replace(/\.[^.]+$/, ".webp");
-      const { bucket, key } = this.parseS3Path(webpS3Path);
-
-      const command = new GetObjectCommand({
-        Bucket: bucket,
-        Key: key,
-      });
-
-      await this.s3Client.send(command);
-      return true;
-    } catch (error) {
-      return false;
-    }
-  }
-
-  private async getExistingWebP(s3Path: string): Promise<{
-    localWebpPath: string;
-    s3WebpPath: string;
-    uploadPromise: Promise<void>;
-  }> {
-    const webpS3Path = s3Path.replace(/\.[^.]+$/, ".webp");
-    const localWebpPath = await this.downloadFromS3(webpS3Path);
-
-    // Since the WebP already exists in S3, we create a resolved promise
-    const uploadPromise = Promise.resolve();
-
-    return {
-      localWebpPath,
-      s3WebpPath: webpS3Path,
-      uploadPromise,
-    };
-  }
-
-  private async processImage(s3Path: string): Promise<{
-    localWebpPath: string;
-    s3WebpPath: string;
-    uploadPromise: Promise<any>;
-  }> {
-    // Create a unique process directory
-    const processDir = path.join(
-      os.tmpdir(),
-      `process-${Date.now()}-${Math.random().toString(36).substring(7)}`
-    );
-    await fs.promises.mkdir(processDir, { recursive: true });
-
-    // Check if WebP version already exists
-    const originalKey = this.parseS3Path(s3Path).key;
-    const existingPhoto = await prismaClient.photo.findFirst({
-      where: { filePath: originalKey, processedFilePath: { not: null } },
-    });
-
-    if (existingPhoto?.processedFilePath) {
-      const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${existingPhoto.processedFilePath}`;
-      const localWebpPath = path.join(
-        processDir,
-        path.basename(existingPhoto.processedFilePath)
-      );
-      await this.downloadFromS3(s3WebpPath, localWebpPath);
-
-      return {
-        localWebpPath,
-        s3WebpPath,
-        uploadPromise: Promise.resolve(),
-      };
-    }
-
-    // If no WebP exists, proceed with the original conversion process
-    let originalPath: string | null = null;
-    let webpPath: string | null = null;
-    let uploadPromise: Promise<any> = Promise.resolve();
-
-    try {
-      // Download original to the process directory
-      originalPath = path.join(processDir, path.basename(s3Path));
-      await this.downloadFromS3(s3Path, originalPath);
-
-      // Validate the downloaded image
-      const validation = await this.imageToVideoConverter.validateImage(
-        originalPath
-      );
-      if (!validation.isValid) {
-        throw new Error(`Invalid image: ${validation.error}`);
-      }
-
-      // Convert to WebP in the same process directory
-      webpPath = path.join(
-        processDir,
-        `${path.basename(s3Path, path.extname(s3Path))}.webp`
-      );
-
-      await this.imageToVideoConverter.convertToWebP(originalPath, webpPath, {
-        quality: 80,
-        width: 1080,
-        height: 1920,
-        fit: "cover",
-      });
-
-      // Create upload promise that includes S3 upload and database update
-      const webpS3Path = s3Path.replace(/\.[^.]+$/, ".webp");
-      uploadPromise = this.uploadToS3(webpPath, webpS3Path)
-        .then(async () => {
-          // Update the photo record in the database with the WebP path
-          const webpKey = this.parseS3Path(webpS3Path).key;
-          await prismaClient.photo.updateMany({
-            where: { filePath: originalKey },
-            data: { processedFilePath: webpKey },
-          });
-
-          console.log("Updated photo record with WebP path:", {
-            original: originalKey,
-            webp: webpKey,
-          });
-        })
-        .catch((error) => {
-          console.error("WebP upload failed:", {
-            error: error instanceof Error ? error.message : "Unknown error",
-            s3Path: webpS3Path,
-          });
-          throw error;
-        })
-        .finally(async () => {
-          try {
-            // Clean up the process directory after upload is complete
-            await fs.promises.rm(processDir, { recursive: true, force: true });
-          } catch (error) {
-            console.error("Failed to cleanup process directory:", {
-              dir: processDir,
-              error: error instanceof Error ? error.message : "Unknown error",
-            });
-          }
-        });
-
-      return {
-        localWebpPath: webpPath,
-        s3WebpPath: webpS3Path,
-        uploadPromise,
-      };
-    } catch (error) {
-      // Clean up on error
-      try {
-        await fs.promises.rm(processDir, { recursive: true, force: true });
-      } catch (cleanupError) {
-        console.error("Failed to cleanup on error:", {
-          dir: processDir,
-          error:
-            cleanupError instanceof Error
-              ? cleanupError.message
-              : "Unknown error",
-        });
-      }
-
-      console.error("Error processing image:", {
-        s3Path,
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
-      throw error;
-    }
-  }
-
-  private async retryOperation<T>(
-    operation: () => Promise<T>,
-    maxRetries: number = 3,
-    initialDelay: number = 2000,
-    operationName: string = "operation"
-  ): Promise<T> {
-    let lastError: Error | undefined;
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      try {
-        console.log(
-          `Attempting ${operationName} (attempt ${
-            attempt + 1
-          }/${maxRetries})...`
-        );
-        const result = await operation();
-        if (attempt > 0) {
-          console.log(
-            `${operationName} succeeded after ${attempt + 1} attempts`
-          );
-        }
-        return result;
-      } catch (error) {
-        lastError = error as Error;
-        console.error(`${operationName} failed:`, {
-          attempt: attempt + 1,
-          maxRetries,
-          error: lastError.message,
-        });
-
-        if (attempt < maxRetries - 1) {
-          const delay = initialDelay * Math.pow(2, attempt); // Exponential backoff
-          console.log(`Retrying ${operationName} in ${delay}ms...`);
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        } else {
-          console.error(`All retry attempts for ${operationName} failed`);
-        }
-      }
-    }
-    throw lastError;
-  }
-
   private async processWebP(
+    jobId: string,
     input: string[],
     isRegeneration: boolean = false
   ): Promise<ProcessingStep> {
+    await this.updateJobStatus(
+      jobId,
+      VideoGenerationStatus.PROCESSING,
+      undefined,
+      {
+        stage: "webp",
+        currentFile: 0,
+        totalFiles: input.length,
+        progress: 0,
+      }
+    );
+
     const step: ProcessingStep = {
       id: `webp-${Date.now()}`,
       type: "webp",
@@ -357,24 +137,56 @@ export class ProductionPipeline {
 
     try {
       const results = await Promise.all(
-        input.map(async (file) => {
-          const result = await this.processImage(file);
-          return result.localWebpPath;
+        input.map(async (file, index) => {
+          const result = await imageProcessor.processImage(file);
+          await this.updateJobStatus(
+            jobId,
+            VideoGenerationStatus.PROCESSING,
+            undefined,
+            {
+              stage: "webp",
+              currentFile: index + 1,
+              totalFiles: input.length,
+              progress: Math.round(((index + 1) / input.length) * 25),
+            }
+          );
+          return result;
         })
       );
 
-      step.output = results;
+      step.output = results.map(
+        (result: { s3WebpPath: string }) => result.s3WebpPath
+      );
       step.status = "completed";
     } catch (error) {
       step.status = "failed";
       step.error = error instanceof Error ? error.message : "Unknown error";
+      console.error("WebP processing failed:", {
+        error: step.error,
+        input,
+      });
     }
 
     this.processingSteps.set(step.id, step);
     return step;
   }
 
-  private async processRunway(input: string[]): Promise<ProcessingStep> {
+  private async processRunway(
+    jobId: string,
+    input: string[]
+  ): Promise<ProcessingStep> {
+    await this.updateJobStatus(
+      jobId,
+      VideoGenerationStatus.PROCESSING,
+      undefined,
+      {
+        stage: "runway",
+        currentFile: 0,
+        totalFiles: input.length,
+        progress: 25,
+      }
+    );
+
     const step: ProcessingStep = {
       id: `runway-${Date.now()}`,
       type: "runway",
@@ -389,46 +201,45 @@ export class ProductionPipeline {
     };
 
     try {
-      const results = await Promise.all(
-        input.map(async (file) => {
-          const result = await this.retryOperation(
-            async () => {
-              return await this.imageToVideoConverter.convertImagesToVideo(
-                [file],
-                {
-                  duration: 5,
-                  ratio: "768:1280",
-                  watermark: false,
-                }
-              );
-            },
-            3,
-            2000,
-            "Runway API call"
+      const results = [];
+      for (let i = 0; i < input.length; i++) {
+        try {
+          if (i > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+          }
+
+          const { bucket, key } = s3VideoService.parseS3Path(input[i]);
+          const publicUrl = s3VideoService.getPublicUrl(bucket, key);
+          const result = await runwayService.generateVideo(publicUrl, i);
+          results.push(result);
+
+          await this.updateJobStatus(
+            jobId,
+            VideoGenerationStatus.PROCESSING,
+            undefined,
+            {
+              stage: "runway",
+              currentFile: i + 1,
+              totalFiles: input.length,
+              progress: Math.round(25 + ((i + 1) / input.length) * 50),
+            }
           );
-          return result;
-        })
-      );
+
+          console.log(`Successfully processed video ${i + 1}/${input.length}`);
+        } catch (error) {
+          console.error(
+            `Failed to process video ${i + 1}/${input.length}:`,
+            error
+          );
+          throw error;
+        }
+      }
 
       step.output = results;
       step.status = "completed";
     } catch (error) {
       step.status = "failed";
-      if (error instanceof Error) {
-        step.error = error.message;
-        // Check for specific error types
-        if (error.message.includes("Rate limit exceeded")) {
-          step.error = "Rate limit exceeded. Please try again later.";
-        } else if (error.message.includes("Invalid input parameters")) {
-          step.error = "Invalid input parameters for video generation.";
-        } else if (error.message.includes("service temporarily unavailable")) {
-          step.error =
-            "Runway service is temporarily unavailable. Please try again later.";
-        }
-      } else {
-        step.error = "Unknown error occurred during video generation";
-      }
-
+      step.error = error instanceof Error ? error.message : "Unknown error";
       console.error("Runway processing failed:", {
         error: step.error,
         input,
@@ -440,10 +251,23 @@ export class ProductionPipeline {
   }
 
   private async processTemplates(
+    jobId: string,
     input: string[],
     templates: string[],
     mapVideoPath?: string
   ): Promise<ProcessingStep> {
+    await this.updateJobStatus(
+      jobId,
+      VideoGenerationStatus.PROCESSING,
+      undefined,
+      {
+        stage: "template",
+        currentFile: 0,
+        totalFiles: templates.length,
+        progress: 75,
+      }
+    );
+
     const step: ProcessingStep = {
       id: `templates-${Date.now()}`,
       type: "ffmpeg",
@@ -455,13 +279,39 @@ export class ProductionPipeline {
 
     try {
       const results = await Promise.all(
-        templates.map(async (template) => {
-          const result = await this.imageToVideoConverter.createTemplate(
+        templates.map(async (template, index) => {
+          const clips = await videoTemplateService.createTemplate(
             template.toLowerCase().replace(/\s+/g, "_") as TemplateKey,
             input,
             mapVideoPath
           );
-          return result;
+
+          const outputPath = path.join(
+            process.env.TEMP_OUTPUT_DIR || "./temp",
+            `${template}-${Date.now()}-${Math.random()
+              .toString(36)
+              .slice(2, 7)}.mp4`
+          );
+
+          await videoProcessingService.stitchVideos(
+            clips.map((clip) => clip.path),
+            clips.map((clip) => clip.duration),
+            outputPath
+          );
+
+          await this.updateJobStatus(
+            jobId,
+            VideoGenerationStatus.PROCESSING,
+            undefined,
+            {
+              stage: "template",
+              currentFile: index + 1,
+              totalFiles: templates.length,
+              progress: Math.round(75 + ((index + 1) / templates.length) * 25),
+            }
+          );
+
+          return outputPath;
         })
       );
 
@@ -506,7 +356,11 @@ export class ProductionPipeline {
       });
 
       // Process WebP conversion or download existing WebPs if regenerating
-      const webpStep = await this.processWebP(inputFiles, isRegeneration);
+      const webpStep = await this.processWebP(
+        jobId,
+        inputFiles,
+        isRegeneration
+      );
       if (webpStep.status === "failed") {
         throw new Error(`WebP processing failed: ${webpStep.error}`);
       }
@@ -546,13 +400,14 @@ export class ProductionPipeline {
       }
 
       // Process Runway videos
-      const runwayStep = await this.processRunway(webpStep.output);
+      const runwayStep = await this.processRunway(jobId, webpStep.output);
       if (runwayStep.status === "failed") {
         throw new Error(`Runway processing failed: ${runwayStep.error}`);
       }
 
       // Process all templates
       const templateStep = await this.processTemplates(
+        jobId,
         runwayStep.output,
         allTemplates.map((t) => t.name),
         mapVideoPath
@@ -565,27 +420,10 @@ export class ProductionPipeline {
       // Upload final video to S3
       const outputFile = templateStep.output[0]; // Use the first template output as main output
       const s3Key = `videos/${path.basename(outputFile)}`;
-      const s3Url = await this.uploadToS3(
+      const s3Url = await s3VideoService.uploadVideo(
         outputFile,
         `s3://${process.env.AWS_BUCKET}/${s3Key}`
       );
-
-      // Generate and upload thumbnail
-      const dbTemplate = await prisma.template.findFirst({
-        where: { name: template },
-      });
-
-      if (dbTemplate && !dbTemplate.thumbnailUrl) {
-        try {
-          await this.thumbnailService.generateAndUploadThumbnail(
-            outputFile,
-            dbTemplate.id
-          );
-        } catch (error) {
-          console.error("[THUMBNAIL_ERROR]", error);
-          // Don't fail the whole process if thumbnail generation fails
-        }
-      }
 
       // Update job with S3 URL
       await prisma.videoJob.update({
@@ -628,9 +466,21 @@ export class ProductionPipeline {
       // Update job status
       await this.updateJobStatus(jobId, VideoGenerationStatus.PROCESSING);
 
-      // Regenerate videos for selected photos
-      const regeneratedVideos =
-        await this.imageToVideoConverter.regenerateVideos(photoIds);
+      // Process each photo
+      const regeneratedVideos = await Promise.all(
+        photoIds.map(async (photoId, index) => {
+          const photo = job.listing?.photos.find((p) => p.id === photoId);
+          if (!photo || !photo.processedFilePath) {
+            throw new Error(`Invalid photo data for ${photoId}`);
+          }
+
+          const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${photo.processedFilePath}`;
+          const { bucket, key } = s3VideoService.parseS3Path(s3WebpPath);
+          const publicUrl = s3VideoService.getPublicUrl(bucket, key);
+
+          return await runwayService.generateVideo(publicUrl, index);
+        })
+      );
 
       // Get all video segments (both regenerated and existing)
       const allPhotos = job.listing.photos;
@@ -648,15 +498,29 @@ export class ProductionPipeline {
         throw new Error("Job template is required");
       }
 
-      // Create a new final video with the updated segments
-      const outputPath = await this.imageToVideoConverter.createTemplate(
+      // Create clips configuration
+      const clips = await videoTemplateService.createTemplate(
         job.template as TemplateKey,
         videoSegments
       );
 
+      // Create a new final video with the updated segments
+      const outputPath = path.join(
+        process.env.TEMP_OUTPUT_DIR || "./temp",
+        `${job.template}-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 7)}.mp4`
+      );
+
+      await videoProcessingService.stitchVideos(
+        clips.map((clip) => clip.path),
+        clips.map((clip) => clip.duration),
+        outputPath
+      );
+
       // Upload the new video to S3
       const s3Key = `videos/${path.basename(outputPath)}`;
-      const s3Url = await this.uploadToS3(
+      const s3Url = await s3VideoService.uploadVideo(
         outputPath,
         `s3://${process.env.AWS_BUCKET}/${s3Key}`
       );
