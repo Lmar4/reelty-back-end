@@ -9,6 +9,8 @@ import { runwayService } from "../video/runway.service";
 import { videoProcessingService } from "../video/video-processing.service";
 import { s3VideoService } from "../video/s3-video.service";
 import { videoTemplateService } from "../video/video-template.service";
+import * as fs from "fs/promises";
+import { AssetCacheService } from "../cache/assetCache";
 
 interface ProcessingStep {
   id: string;
@@ -40,17 +42,62 @@ interface ProductionPipelineInput {
   isRegeneration?: boolean;
 }
 
+interface S3VideoService {
+  parseS3Path(path: string): { bucket: string; key: string };
+  getPublicUrl(bucket: string, key: string): string;
+  uploadVideo(localPath: string, s3Path: string): Promise<string>;
+  checkFileExists(bucket: string, key: string): Promise<boolean>;
+}
+
 export class ProductionPipeline {
   private visionProcessor: VisionProcessor;
   private mapCapture: MapCapture;
   private processingSteps: Map<string, ProcessingStep>;
   private prisma: PrismaClient;
+  private assetCache: AssetCacheService;
+  private readonly batchSize = 3;
+  private readonly processingLocks = new Map<string, Promise<any>>();
 
   constructor() {
     this.prisma = new PrismaClient();
     this.visionProcessor = new VisionProcessor();
     this.mapCapture = new MapCapture(process.env.TEMP_OUTPUT_DIR || "./temp");
     this.processingSteps = new Map();
+    this.assetCache = AssetCacheService.getInstance();
+  }
+
+  private async withProcessingLock<T>(
+    key: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    // Wait for any existing operation with the same key
+    const existingLock = this.processingLocks.get(key);
+    if (existingLock) {
+      await existingLock;
+    }
+
+    // Create new lock
+    const operationPromise = operation();
+    this.processingLocks.set(key, operationPromise);
+
+    try {
+      const result = await operationPromise;
+      return result;
+    } finally {
+      // Clean up lock after operation completes or fails
+      this.processingLocks.delete(key);
+    }
+  }
+
+  private generateCacheKey(
+    type: string,
+    input: string | string[],
+    metadata?: any
+  ): string {
+    const inputHash = Array.isArray(input) ? input.join("|") : input;
+    return `${type}:${inputHash}${
+      metadata ? ":" + JSON.stringify(metadata) : ""
+    }`;
   }
 
   private async updateJobStatus(
@@ -137,26 +184,78 @@ export class ProductionPipeline {
 
     try {
       const results = await Promise.all(
-        input.map(async (file, index) => {
-          const result = await imageProcessor.processImage(file);
-          await this.updateJobStatus(
-            jobId,
-            VideoGenerationStatus.PROCESSING,
-            undefined,
-            {
-              stage: "webp",
-              currentFile: index + 1,
-              totalFiles: input.length,
-              progress: Math.round(((index + 1) / input.length) * 25),
+        input.map(async (url, index) => {
+          const cacheKey = this.generateCacheKey("webp", url, step.settings);
+
+          return await this.withProcessingLock(cacheKey, async () => {
+            try {
+              // Check cache first
+              const cachedAsset = await this.assetCache.getCachedAsset(
+                cacheKey
+              );
+              if (cachedAsset) {
+                console.log("Cache hit for WebP:", { url, cachedAsset });
+                await this.updateJobStatus(
+                  jobId,
+                  VideoGenerationStatus.PROCESSING,
+                  undefined,
+                  {
+                    stage: "webp",
+                    currentFile: index + 1,
+                    totalFiles: input.length,
+                    progress: Math.round(((index + 1) / input.length) * 25),
+                  }
+                );
+                return cachedAsset.path;
+              }
+
+              let inputUrl = url;
+              if (url.includes("s3.") || url.startsWith("s3://")) {
+                const { bucket, key } = s3VideoService.parseS3Path(url);
+                const exists = await s3VideoService.checkFileExists(
+                  bucket,
+                  key
+                );
+                if (!exists) {
+                  throw new Error(`S3 file not found: ${bucket}/${key}`);
+                }
+                inputUrl = s3VideoService.getPublicUrl(bucket, key);
+              } else {
+                await fs.access(url);
+              }
+
+              const result = await imageProcessor.processImage(inputUrl);
+
+              // Cache the result
+              await this.assetCache.cacheAsset({
+                type: "webp",
+                path: result.s3WebpPath,
+                cacheKey,
+                metadata: step.settings,
+              });
+
+              await this.updateJobStatus(
+                jobId,
+                VideoGenerationStatus.PROCESSING,
+                undefined,
+                {
+                  stage: "webp",
+                  currentFile: index + 1,
+                  totalFiles: input.length,
+                  progress: Math.round(((index + 1) / input.length) * 25),
+                }
+              );
+
+              return result.s3WebpPath;
+            } catch (error) {
+              console.error(`Failed to process image ${index + 1}:`, error);
+              throw error;
             }
-          );
-          return result;
+          });
         })
       );
 
-      step.output = results.map(
-        (result: { s3WebpPath: string }) => result.s3WebpPath
-      );
+      step.output = results;
       step.status = "completed";
     } catch (error) {
       step.status = "failed";
@@ -164,11 +263,85 @@ export class ProductionPipeline {
       console.error("WebP processing failed:", {
         error: step.error,
         input,
+        jobId,
+        isRegeneration,
       });
+
+      await this.updateJobStatus(
+        jobId,
+        VideoGenerationStatus.FAILED,
+        `WebP processing failed: ${step.error}`
+      );
     }
 
     this.processingSteps.set(step.id, step);
     return step;
+  }
+
+  private async getCachedRunwayVideo(
+    imageUrl: string,
+    index: number
+  ): Promise<string | null> {
+    const cacheKey = this.generateCacheKey("runway", imageUrl, { index });
+    const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
+    return cachedAsset?.path || null;
+  }
+
+  private async cacheRunwayVideo(
+    imageUrl: string,
+    videoPath: string,
+    index: number
+  ): Promise<void> {
+    const cacheKey = this.generateCacheKey("runway", imageUrl, { index });
+    await this.assetCache.cacheAsset({
+      type: "runway",
+      path: videoPath,
+      cacheKey,
+      metadata: {
+        timestamp: new Date(),
+        settings: { index },
+        hash: this.generateCacheKey("runway", imageUrl, { index }),
+      },
+    });
+  }
+
+  private async getCachedTemplate(
+    template: string,
+    inputVideos: string[],
+    mapVideoPath?: string
+  ): Promise<string | null> {
+    const settings = {
+      template,
+      inputs: inputVideos,
+      mapVideo: mapVideoPath,
+    };
+    const cacheKey = this.generateCacheKey("ffmpeg", template, settings);
+    const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
+    return cachedAsset?.path || null;
+  }
+
+  private async cacheTemplate(
+    template: string,
+    outputPath: string,
+    inputVideos: string[],
+    mapVideoPath?: string
+  ): Promise<void> {
+    const settings = {
+      template,
+      inputs: inputVideos,
+      mapVideo: mapVideoPath,
+    };
+    const cacheKey = this.generateCacheKey("ffmpeg", template, settings);
+    await this.assetCache.cacheAsset({
+      type: "ffmpeg",
+      path: outputPath,
+      cacheKey,
+      metadata: {
+        timestamp: new Date(),
+        settings,
+        hash: this.generateCacheKey("ffmpeg", template, settings),
+      },
+    });
   }
 
   private async processRunway(
@@ -192,58 +365,97 @@ export class ProductionPipeline {
       type: "runway",
       input,
       output: [],
-      settings: {
-        duration: 5,
-        ratio: "768:1280",
-        watermark: false,
-      },
+      settings: {},
       status: "processing",
     };
 
     try {
-      const results = [];
-      for (let i = 0; i < input.length; i++) {
-        try {
-          if (i > 0) {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-          }
+      const batches = [];
+      for (let i = 0; i < input.length; i += this.batchSize) {
+        const batch = input.slice(i, i + this.batchSize);
+        batches.push(batch);
+      }
 
-          const { bucket, key } = s3VideoService.parseS3Path(input[i]);
-          const publicUrl = s3VideoService.getPublicUrl(bucket, key);
-          const result = await runwayService.generateVideo(publicUrl, i);
-          results.push(result);
+      const results: string[] = [];
 
-          await this.updateJobStatus(
-            jobId,
-            VideoGenerationStatus.PROCESSING,
-            undefined,
-            {
-              stage: "runway",
-              currentFile: i + 1,
-              totalFiles: input.length,
-              progress: Math.round(25 + ((i + 1) / input.length) * 50),
+      for (const [batchIndex, batch] of batches.entries()) {
+        const batchPromises = batch.map(async (imageUrl, index) => {
+          const absoluteIndex = batchIndex * this.batchSize + index;
+          const cacheKey = this.generateCacheKey("runway", imageUrl, {
+            index: absoluteIndex,
+          });
+
+          return await this.withProcessingLock(cacheKey, async () => {
+            try {
+              // Check cache first
+              const cachedAsset = await this.assetCache.getCachedAsset(
+                cacheKey
+              );
+              if (cachedAsset) {
+                console.log("Cache hit for runway video:", {
+                  imageUrl,
+                  cachedAsset,
+                });
+                return cachedAsset.path;
+              }
+
+              const videoPath = await runwayService.generateVideo(
+                imageUrl,
+                absoluteIndex
+              );
+
+              // Cache the result
+              await this.assetCache.cacheAsset({
+                type: "runway",
+                path: videoPath,
+                cacheKey,
+                metadata: {
+                  timestamp: new Date(),
+                  settings: { index: absoluteIndex },
+                  hash: this.generateCacheKey("runway", imageUrl, {
+                    index: absoluteIndex,
+                  }),
+                },
+              });
+
+              await this.updateJobStatus(
+                jobId,
+                VideoGenerationStatus.PROCESSING,
+                undefined,
+                {
+                  stage: "runway",
+                  currentFile: absoluteIndex + 1,
+                  totalFiles: input.length,
+                  progress: Math.min(
+                    25 + Math.floor(((absoluteIndex + 1) / input.length) * 40),
+                    65
+                  ),
+                }
+              );
+
+              return videoPath;
+            } catch (error) {
+              console.error("Video generation failed:", {
+                imageUrl,
+                index: absoluteIndex,
+                error: error instanceof Error ? error.message : "Unknown error",
+              });
+              throw error;
             }
-          );
+          });
+        });
 
-          console.log(`Successfully processed video ${i + 1}/${input.length}`);
-        } catch (error) {
-          console.error(
-            `Failed to process video ${i + 1}/${input.length}:`,
-            error
-          );
-          throw error;
-        }
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults);
       }
 
       step.output = results;
       step.status = "completed";
     } catch (error) {
+      console.error("Runway processing failed:", error);
       step.status = "failed";
       step.error = error instanceof Error ? error.message : "Unknown error";
-      console.error("Runway processing failed:", {
-        error: step.error,
-        input,
-      });
+      throw error;
     }
 
     this.processingSteps.set(step.id, step);
@@ -280,6 +492,20 @@ export class ProductionPipeline {
     try {
       const results = await Promise.all(
         templates.map(async (template, index) => {
+          // Check cache first
+          const cachedTemplate = await this.getCachedTemplate(
+            template,
+            input,
+            mapVideoPath
+          );
+          if (cachedTemplate) {
+            console.log("Cache hit for template:", {
+              template,
+              cachedTemplate,
+            });
+            return cachedTemplate;
+          }
+
           const clips = await videoTemplateService.createTemplate(
             template.toLowerCase().replace(/\s+/g, "_") as TemplateKey,
             input,
@@ -298,6 +524,9 @@ export class ProductionPipeline {
             clips.map((clip) => clip.duration),
             outputPath
           );
+
+          // Cache the result
+          await this.cacheTemplate(template, outputPath, input, mapVideoPath);
 
           await this.updateJobStatus(
             jobId,

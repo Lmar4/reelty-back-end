@@ -1,21 +1,15 @@
-import {
-  GetObjectCommand,
-  PutObjectCommand,
-  S3Client,
-} from "@aws-sdk/client-s3";
+import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { PrismaClient } from "@prisma/client";
-import axios from "axios";
-import ffmpeg from "fluent-ffmpeg";
 import * as fs from "fs";
 import * as path from "path";
 import { RunwayClient } from "../runway";
-import { tempFileManager } from "../storage/temp-file.service";
-import { imageProcessor } from "./image.service";
-import { TemplateKey, reelTemplates } from "./templates/types";
 import { runwayService } from "../video/runway.service";
-import { videoProcessingService } from "../video/video-processing.service";
 import { s3VideoService } from "../video/s3-video.service";
+import { videoProcessingService } from "../video/video-processing.service";
 import { videoTemplateService } from "../video/video-template.service";
+import { imageProcessor } from "./image.service";
+import { TemplateKey } from "./templates/types";
+import { AssetCacheService } from "../cache/assetCache";
 
 const prisma = new PrismaClient();
 
@@ -48,6 +42,7 @@ export class ImageToVideoConverter {
   private videoFiles: string[] | null = null;
   private mapFrames: string[] | null = null;
   private apiKey: string;
+  private assetCache: AssetCacheService;
 
   private constructor(apiKey: string, outputDir: string = "./output") {
     if (!apiKey) {
@@ -56,6 +51,7 @@ export class ImageToVideoConverter {
     this.runwayClient = new RunwayClient(apiKey);
     this.outputDir = outputDir;
     this.apiKey = apiKey;
+    this.assetCache = AssetCacheService.getInstance();
   }
 
   public static getInstance(
@@ -144,6 +140,33 @@ export class ImageToVideoConverter {
     }
   }
 
+  private async getCachedVideo(
+    imageUrl: string,
+    index: number
+  ): Promise<string | null> {
+    const cachedAsset = await this.assetCache.getCachedAsset(
+      this.assetCache.generateCacheKey("video", { index })
+    );
+    return cachedAsset?.path || null;
+  }
+
+  private async cacheVideo(
+    imageUrl: string,
+    videoPath: string,
+    index: number
+  ): Promise<void> {
+    await this.assetCache.cacheAsset({
+      type: "video",
+      path: videoPath,
+      cacheKey: this.assetCache.generateCacheKey("video", { index }),
+      metadata: {
+        timestamp: new Date(),
+        settings: { index },
+        hash: "",
+      },
+    });
+  }
+
   async regenerateVideos(photoIds: string[]): Promise<string[]> {
     const photos = await prisma.photo.findMany({
       where: {
@@ -169,6 +192,20 @@ export class ImageToVideoConverter {
         // Get the S3 path for the processed WebP image
         const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${photo.processedFilePath}`;
 
+        // Check cache first
+        const cachedVideo = await this.getCachedVideo(
+          s3WebpPath,
+          parseInt(photo.id)
+        );
+        if (cachedVideo) {
+          console.log("Cache hit for video:", {
+            photoId: photo.id,
+            cachedVideo,
+          });
+          regeneratedVideos.push(cachedVideo);
+          continue;
+        }
+
         // Process the image using imageProcessor service
         const processedImage = await imageProcessor.processImage(s3WebpPath);
 
@@ -188,6 +225,9 @@ export class ImageToVideoConverter {
           publicUrl,
           parseInt(photo.id)
         );
+
+        // Cache the video
+        await this.cacheVideo(s3WebpPath, videoPath, parseInt(photo.id));
 
         // Store the individual video path
         await prisma.photo.update({
@@ -234,6 +274,16 @@ export class ImageToVideoConverter {
         `${Date.now()}-${path.basename(inputFiles[0])}.mp4`
       );
 
+      // Check cache first
+      const cachedVideo = await this.getCachedVideo(inputFiles[0], 0);
+      if (cachedVideo) {
+        console.log("Cache hit for video:", {
+          input: inputFiles[0],
+          cachedVideo,
+        });
+        return cachedVideo;
+      }
+
       // Process the first image using imageProcessor service
       const processedImage = await imageProcessor.processImage(inputFiles[0]);
 
@@ -250,6 +300,9 @@ export class ImageToVideoConverter {
 
       // Generate video using the public URL
       const videoPath = await this.generateRunwayVideo(publicUrl, 0);
+
+      // Cache the video
+      await this.cacheVideo(inputFiles[0], videoPath, 0);
 
       console.log("Video created successfully:", videoPath);
       return videoPath;
@@ -298,135 +351,6 @@ export class ImageToVideoConverter {
 
     console.log(`${templateKey} video created at: ${outputPath}`);
     return outputPath;
-  }
-
-  private async stitchVideos(
-    videoFiles: string[],
-    durations: number[],
-    outputPath: string,
-    music?: { path: string; volume?: number; startTime?: number },
-    reverse: boolean = false
-  ): Promise<void> {
-    console.log("Starting video stitching with:", {
-      videoCount: videoFiles.length,
-      durations,
-      outputPath,
-      hasMusicTrack: !!music,
-      reverse,
-    });
-
-    return new Promise((resolve, reject) => {
-      let command = ffmpeg();
-
-      // Add input files
-      videoFiles.forEach((file) => {
-        command = command.input(file);
-      });
-
-      // Add music if provided
-      if (music) {
-        const musicPath = path.resolve(__dirname, music.path);
-        if (fs.existsSync(musicPath)) {
-          command = command.input(musicPath);
-        } else {
-          console.warn(`Music file not found: ${musicPath}`);
-        }
-      }
-
-      // Build complex filter
-      const filterComplex: string[] = [];
-
-      // Add trim and scale filters for each video
-      videoFiles.forEach((_, i) => {
-        filterComplex.push(
-          `[${i}:v]setpts=PTS-STARTPTS,scale=768:1280:force_original_aspect_ratio=decrease,` +
-            `pad=768:1280:(ow-iw)/2:(oh-ih)/2,trim=duration=${durations[i]},` +
-            `${reverse ? "reverse," : ""}setpts=PTS-STARTPTS[v${i}]`
-        );
-      });
-
-      // Create concat inputs string
-      const concatInputs = Array.from(
-        { length: videoFiles.length },
-        (_, i) => `[v${i}]`
-      ).join("");
-
-      // Add concat filter
-      filterComplex.push(
-        `${concatInputs}concat=n=${videoFiles.length}:v=1:a=0[concat]`
-      );
-
-      // Add watermark if provided
-      if (music) {
-        const opacity = 0.5;
-        const totalDuration = durations.reduce((a, b) => a + b, 0);
-        filterComplex.push(
-          `[concat][${videoFiles.length}:v]overlay=W-w-10:H-h-10:enable='between(t,0,${totalDuration})':alpha=${opacity}[outv]`
-        );
-      } else {
-        filterComplex.push(`[concat]copy[outv]`);
-      }
-
-      // Add audio filters if music is provided
-      if (music) {
-        const volume = music.volume || 0.5;
-        const startTime = music.startTime || 0;
-        const totalDuration = durations.reduce((a, b) => a + b, 0);
-        const fadeStart = Math.max(0, totalDuration - 1);
-        filterComplex.push(
-          `[${videoFiles.length}:a]asetpts=PTS-STARTPTS,` +
-            `atrim=start=${startTime}:duration=${totalDuration},` +
-            `volume=${volume}:eval=frame,` +
-            `afade=t=out:st=${fadeStart}:d=1[outa]`
-        );
-      }
-
-      // Apply complex filter
-      command = command.complexFilter(filterComplex);
-
-      // Map outputs
-      command = command.outputOptions(["-map", "[outv]"]);
-      if (music) {
-        command = command.outputOptions(["-map", "[outa]"]);
-      }
-
-      // Set output options
-      command = command
-        .outputOptions([
-          "-c:v",
-          "libx264",
-          "-preset",
-          "slow",
-          "-crf",
-          "18",
-          "-r",
-          "24",
-          "-c:a",
-          "aac",
-          "-shortest",
-        ])
-        .output(outputPath);
-
-      // Handle events
-      command
-        .on("start", (commandLine) => {
-          console.log("FFmpeg started:", commandLine);
-        })
-        .on("progress", (progress) => {
-          console.log("FFmpeg progress:", progress);
-        })
-        .on("end", () => {
-          console.log("FFmpeg processing finished");
-          resolve();
-        })
-        .on("error", (err) => {
-          console.error("FFmpeg error:", err);
-          reject(new Error(`FFmpeg error: ${err.message}`));
-        });
-
-      // Run the command
-      command.run();
-    });
   }
 }
 

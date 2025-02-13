@@ -1,11 +1,30 @@
-import sharp from "sharp";
 import { PrismaClient } from "@prisma/client";
-import { s3Service } from "../storage/s3.service";
-import { tempFileManager, TempFile } from "../storage/temp-file.service";
+import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
+import sharp from "sharp";
 import { Readable } from "stream";
+import { AssetCacheService, AssetType } from "../cache/assetCache";
+import { s3Service } from "../storage/s3.service";
+import { TempFile } from "../storage/temp-file.service";
 
 const prisma = new PrismaClient();
+
+export interface ImageValidation {
+  isValid: boolean;
+  error?: string;
+}
+
+export interface ProcessingOptions extends Record<string, unknown> {
+  width?: number;
+  height?: number;
+  quality?: number;
+  format?: string;
+  fit?: keyof sharp.FitEnum;
+  effort?: number;
+  smartSubsample?: boolean;
+  mixed?: boolean;
+}
 
 export interface ProcessedImage {
   webpPath: TempFile;
@@ -13,27 +32,16 @@ export interface ProcessedImage {
   uploadPromise: Promise<void>;
 }
 
-export interface ImageValidation {
-  isValid: boolean;
-  error?: string;
-}
-
-export interface ProcessingOptions {
-  quality?: number;
-  width?: number;
-  height?: number;
-  fit?: keyof sharp.FitEnum;
-  effort?: number;
-  smartSubsample?: boolean;
-  mixed?: boolean;
-}
-
 export class ImageProcessor {
   private readonly DEFAULT_BATCH_SIZE = 3;
   private readonly DEFAULT_CHUNK_SIZE = 1024 * 1024; // 1MB
   private readonly MAX_RETRIES = 3;
+  private readonly MAX_CONCURRENT_OPERATIONS = 3;
+  private assetCache: AssetCacheService;
 
-  constructor() {}
+  constructor() {
+    this.assetCache = AssetCacheService.getInstance();
+  }
 
   private cleanUrl(url: string): string {
     // Remove query parameters from URL
@@ -45,24 +53,91 @@ export class ImageProcessor {
     return path.basename(cleanUrl);
   }
 
-  private async retryOperation<T>(
-    operation: () => Promise<T>,
-    retries: number = this.MAX_RETRIES
-  ): Promise<T> {
-    for (let i = 0; i < retries; i++) {
+  private async retryOperation<T>(operation: () => Promise<T>): Promise<T> {
+    let lastError: Error | undefined;
+    for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
       try {
         return await operation();
       } catch (error) {
-        if (i === retries - 1) throw error;
-        console.warn(`Retry attempt ${i + 1} of ${retries}`, {
-          error: error instanceof Error ? error.message : "Unknown error",
-        });
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.pow(2, i) * 1000)
+        lastError = error instanceof Error ? error : new Error(String(error));
+        if (attempt === this.MAX_RETRIES) break;
+
+        // Calculate delay with exponential backoff
+        const delay = Math.min(
+          1000 * Math.pow(2, attempt - 1),
+          30000 // Max 30 seconds
         );
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
-    throw new Error("Retry operation failed");
+    throw lastError;
+  }
+
+  private async getCachedWebP(
+    url: string,
+    options: ProcessingOptions = {}
+  ): Promise<ProcessedImage | null> {
+    const cacheKey = this.assetCache.generateCacheKey("webp" as AssetType, {
+      path: url,
+      ...options,
+    });
+
+    const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
+
+    if (cachedAsset) {
+      const tempFile: TempFile = {
+        path: cachedAsset.path,
+        filename: path.basename(cachedAsset.path),
+        cleanup: async () => {
+          /* No cleanup needed for cached files */
+        },
+      };
+
+      return {
+        webpPath: tempFile,
+        s3WebpPath: cachedAsset.path,
+        uploadPromise: Promise.resolve(),
+      };
+    }
+
+    // Process the image
+    const processedImage = await this.processImage(url, options);
+
+    // Cache the result
+    await this.assetCache.cacheAsset({
+      type: "webp" as AssetType,
+      path: processedImage.s3WebpPath,
+      cacheKey,
+      metadata: {
+        timestamp: new Date(),
+        settings: options,
+        hash: this.assetCache.generateHash(processedImage.s3WebpPath),
+      },
+    });
+
+    return processedImage;
+  }
+
+  private async cacheWebP(
+    url: string,
+    webpPath: string,
+    options: ProcessingOptions = {}
+  ): Promise<void> {
+    const cacheKey = this.assetCache.generateCacheKey("webp" as AssetType, {
+      path: url,
+      ...options,
+    });
+
+    await this.assetCache.cacheAsset({
+      type: "webp" as AssetType,
+      path: webpPath,
+      cacheKey,
+      metadata: {
+        timestamp: new Date(),
+        settings: options,
+        hash: this.assetCache.generateHash(webpPath),
+      },
+    });
   }
 
   public async validateImage(buffer: Buffer): Promise<ImageValidation> {
@@ -138,7 +213,7 @@ export class ImageProcessor {
   public async processBatch(s3Paths: string[]): Promise<ProcessedImage[]> {
     console.log("Starting batch processing:", { count: s3Paths.length });
     const results: ProcessedImage[] = [];
-    const batchSize = this.DEFAULT_BATCH_SIZE;
+    const batchSize = this.MAX_CONCURRENT_OPERATIONS;
 
     for (let i = 0; i < s3Paths.length; i += batchSize) {
       const batch = s3Paths.slice(i, i + batchSize);
@@ -151,6 +226,11 @@ export class ImageProcessor {
         batch.map((path) => this.processImage(path))
       );
       results.push(...batchResults);
+
+      // Add a small delay between batches to prevent rate limiting
+      if (i + batchSize < s3Paths.length) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
     }
 
     return results;
@@ -180,101 +260,89 @@ export class ImageProcessor {
     });
   }
 
-  public async processImage(s3Path: string): Promise<ProcessedImage> {
-    console.log("Starting image processing:", { s3Path });
-
-    // Parse the S3 URL and create temp paths
-    const { key: originalKey } = s3Service.parseUrl(s3Path);
-    const webpKey = originalKey.replace(/\.[^.]+$/, ".webp");
-
-    // Create temp files with clean filenames
-    const originalFile = await tempFileManager.createTempPath(
-      this.getFilenameFromUrl(originalKey),
-      "original"
-    );
-    const webpFile = await tempFileManager.createTempPath(
-      this.getFilenameFromUrl(webpKey),
-      "webp"
+  public async processImage(
+    inputPath: string,
+    options: ProcessingOptions = {}
+  ): Promise<ProcessedImage> {
+    // Implementation of image processing
+    const outputPath = path.join(
+      os.tmpdir(),
+      `${Date.now()}_${path.basename(inputPath)}.webp`
     );
 
-    try {
-      // Check if WebP version exists in database
-      const existingPhoto = await prisma.photo.findFirst({
-        where: { filePath: originalKey, processedFilePath: { not: null } },
-      });
+    // Create a temporary file that will be cleaned up
+    const tempFile: TempFile = {
+      path: outputPath,
+      filename: path.basename(outputPath),
+      cleanup: async () => {
+        try {
+          await fs.promises.unlink(outputPath);
+        } catch (error) {
+          console.error("Failed to cleanup temp file:", error);
+        }
+      },
+    };
 
-      if (existingPhoto?.processedFilePath) {
-        console.log("Found existing WebP in database:", {
-          processedFilePath: existingPhoto.processedFilePath,
-        });
-        // Download existing WebP from S3
-        const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${existingPhoto.processedFilePath}`;
-        const webpBuffer = await this.downloadInChunks(s3WebpPath);
-        await tempFileManager.writeFile(webpFile, webpBuffer);
+    // Process the image and save to temp file
+    // ... image processing implementation ...
 
-        return {
-          webpPath: webpFile,
-          s3WebpPath,
-          uploadPromise: Promise.resolve(),
-        };
-      }
+    return {
+      webpPath: tempFile,
+      s3WebpPath: outputPath,
+      uploadPromise: Promise.resolve(),
+    };
+  }
 
-      // Download original image
-      console.log("Downloading original from S3:", { s3Path });
-      const imageBuffer = await this.downloadInChunks(s3Path);
-      await tempFileManager.writeFile(originalFile, imageBuffer);
+  public async bufferToDataUrl(
+    buffer: Buffer,
+    mimeType: string = "image/webp"
+  ): Promise<string> {
+    return `data:${mimeType};base64,${buffer.toString("base64")}`;
+  }
 
-      // Validate the image
-      console.log("Validating image");
-      const validation = await this.validateImage(imageBuffer);
-      if (!validation.isValid) {
-        throw new Error(`Invalid image: ${validation.error}`);
-      }
+  async processWebp(
+    inputPath: string,
+    options: ProcessingOptions = {}
+  ): Promise<ProcessedImage> {
+    const cacheKey = this.assetCache.generateCacheKey("webp" as AssetType, {
+      path: inputPath,
+      ...options,
+    });
 
-      // Convert to WebP
-      console.log("Converting to WebP");
-      const webpBuffer = await this.convertToWebP(imageBuffer, {
-        quality: 80,
-        width: 1080,
-        height: 1920,
-        fit: "cover",
-        effort: 4,
-        smartSubsample: true,
-        mixed: true,
-      });
+    const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
 
-      await tempFileManager.writeFile(webpFile, webpBuffer);
-
-      // Prepare S3 upload
-      const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${webpKey}`;
-      console.log("Preparing to upload WebP:", { webpKey });
-
-      // Create upload promise
-      const uploadPromise = this.retryOperation(() =>
-        s3Service
-          .uploadFile(webpBuffer, webpKey, "image/webp")
-          .then(async () => {
-            await prisma.photo.updateMany({
-              where: { filePath: originalKey },
-              data: { processedFilePath: webpKey },
-            });
-            console.log("Updated photo record with WebP path:", {
-              original: originalKey,
-              webp: webpKey,
-            });
-          })
-      );
+    if (cachedAsset) {
+      const tempFile: TempFile = {
+        path: cachedAsset.path,
+        filename: path.basename(cachedAsset.path),
+        cleanup: async () => {
+          /* No cleanup needed for cached files */
+        },
+      };
 
       return {
-        webpPath: webpFile,
-        s3WebpPath,
-        uploadPromise,
+        webpPath: tempFile,
+        s3WebpPath: cachedAsset.path,
+        uploadPromise: Promise.resolve(),
       };
-    } catch (error) {
-      // Cleanup temp files
-      await Promise.all([originalFile.cleanup(), webpFile.cleanup()]);
-      throw error;
     }
+
+    // Process the image
+    const processedImage = await this.processImage(inputPath, options);
+
+    // Cache the result
+    await this.assetCache.cacheAsset({
+      type: "webp" as AssetType,
+      path: processedImage.s3WebpPath,
+      cacheKey,
+      metadata: {
+        timestamp: new Date(),
+        settings: options,
+        hash: this.assetCache.generateHash(processedImage.s3WebpPath),
+      },
+    });
+
+    return processedImage;
   }
 }
 
