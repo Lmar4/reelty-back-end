@@ -1,13 +1,18 @@
-import * as fs from "fs";
-import * as path from "path";
-import { promisify } from "util";
-import ffmpeg from "fluent-ffmpeg";
-import { RunwayClient } from "../runway";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { ReelTemplate, TemplateKey, reelTemplates } from "./templates/types";
-import sharp from "sharp";
+import {
+  GetObjectCommand,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
 import { PrismaClient } from "@prisma/client";
 import axios from "axios";
+import ffmpeg from "fluent-ffmpeg";
+import * as fs from "fs";
+import * as path from "path";
+import sharp from "sharp";
+import { promisify } from "util";
+import { RunwayClient } from "../runway";
+import { TemplateKey, reelTemplates } from "./templates/types";
+import * as os from "os";
 
 const prisma = new PrismaClient();
 
@@ -59,156 +64,290 @@ export class ImageToVideoConverter {
     }
   }
 
-  private async validateImagePaths(images: string[]): Promise<void> {
-    for (const image of images) {
-      if (!(await exists(image))) {
-        throw new Error(`Image not found: ${image}`);
+  private async downloadFromS3(url: string): Promise<Buffer> {
+    try {
+      // Check if the path is a local file
+      if (url.startsWith("/")) {
+        return await fs.promises.readFile(url);
       }
+
+      // Handle S3 URL
+      const s3Client = new S3Client({
+        region: process.env.AWS_REGION || "us-east-2",
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+        },
+      });
+
+      let bucket: string;
+      let key: string;
+
+      if (url.startsWith("s3://")) {
+        // Handle s3:// protocol
+        const [, , bucketPart, ...keyParts] = url.split("/");
+        bucket = bucketPart;
+        key = keyParts.join("/");
+      } else {
+        // Handle https:// protocol
+        const urlObj = new URL(url);
+        bucket = urlObj.hostname.split(".")[0];
+        // Remove leading slash and decode
+        key = decodeURIComponent(urlObj.pathname.substring(1));
+      }
+
+      // Remove any query parameters from the key
+      key = key.split("?")[0];
+
+      // Validate bucket and key
+      if (!bucket || !key) {
+        throw new Error(`Invalid S3 URL format: bucket=${bucket}, key=${key}`);
+      }
+
+      console.log("Downloading from S3:", { bucket, key });
+
+      // Get object directly from S3
+      const command = new GetObjectCommand({
+        Bucket: bucket,
+        Key: key,
+      });
+
+      const response = await s3Client.send(command);
+
+      if (!response.Body) {
+        throw new Error("No response body from S3");
+      }
+
+      const chunks: Uint8Array[] = [];
+
+      // @ts-ignore - response.Body is a Readable stream
+      for await (const chunk of response.Body) {
+        chunks.push(chunk);
+      }
+
+      const buffer = Buffer.concat(chunks);
+
+      if (buffer.length === 0) {
+        throw new Error("Downloaded buffer is empty");
+      }
+
+      return buffer;
+    } catch (error) {
+      console.error("Image download error:", {
+        url,
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw new Error(
+        `Failed to download image: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
     }
   }
 
-  private async generateVideoSegment(
-    filename: string,
-    index: number
-  ): Promise<string> {
-    const maxRetries = 3;
-    let retryCount = 0;
-
-    // Validate environment variables
-    if (!process.env.AWS_REGION) {
-      throw new Error("AWS_REGION environment variable is not set");
+  public parseS3Path(s3Path: string): { bucket: string; key: string } {
+    // Handle s3:// protocol
+    if (s3Path.startsWith("s3://")) {
+      const [, , bucket, ...keyParts] = s3Path.split("/");
+      return { bucket, key: keyParts.join("/") };
     }
 
-    while (retryCount < maxRetries) {
-      try {
-        // Find the WebP version directly from the database
-        const photo = await prisma.photo.findFirst({
-          where: {
-            filePath: {
-              contains: filename,
-            },
-            processedFilePath: { not: null },
-          },
-          include: {
-            listing: true,
-          },
-        });
+    // Handle https:// protocol
+    const url = new URL(s3Path);
+    const bucket = url.hostname.split(".")[0];
+    const key = decodeURIComponent(url.pathname.substring(1)); // Remove leading slash
+    return { bucket, key: key.split("?")[0] }; // Remove query parameters
+  }
 
-        if (!photo?.processedFilePath || !photo.listing) {
-          throw new Error(
-            `WebP version not found for image: ${filename}. Please ensure images are processed before regeneration.`
-          );
-        }
+  public async uploadToS3(localPath: string, s3Path: string): Promise<void> {
+    const { bucket, key } = this.parseS3Path(s3Path);
+    const fileContent = await fs.promises.readFile(localPath);
 
-        // Use existing WebP file URL directly
-        const imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${photo.processedFilePath}`;
-        console.log("Using existing WebP URL:", imageUrl);
+    const s3Client = new S3Client({
+      region: process.env.AWS_REGION || "us-east-2",
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+      },
+    });
 
-        // Create the video generation task
-        const response = await this.runwayClient.imageToVideo({
+    const command = new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: fileContent,
+      ContentType: "image/webp",
+    });
+
+    await s3Client.send(command);
+  }
+
+  private async generateRunwayVideo(
+    imageUrl: string,
+    index: number
+  ): Promise<string> {
+    try {
+      // Download the image using our S3 download method
+      const imageBuffer = await this.downloadFromS3(imageUrl);
+
+      // Check file size (max 16MB unencoded, ~5MB encoded)
+      const fileSizeInMB = imageBuffer.length / (1024 * 1024);
+      if (fileSizeInMB > 3.3) {
+        throw new Error(
+          `Image file size (${fileSizeInMB.toFixed(
+            2
+          )}MB) exceeds Runway's limit of 3.3MB`
+        );
+      }
+
+      // Validate and process image using sharp
+      const imageInfo = await sharp(imageBuffer).metadata();
+
+      // Check image dimensions
+      if ((imageInfo.width || 0) > 8000 || (imageInfo.height || 0) > 8000) {
+        throw new Error(
+          `Image dimensions (${imageInfo.width}x${imageInfo.height}) exceed Runway's limit of 8000px`
+        );
+      }
+
+      // Convert to WebP format for consistency
+      const processedBuffer = await sharp(imageBuffer)
+        .resize(1080, 1920, {
+          fit: "cover",
+          position: "center",
+        })
+        .webp({ quality: 90 })
+        .toBuffer();
+
+      // Create base64 with proper content type
+      const base64Image = `data:image/webp;base64,${processedBuffer.toString(
+        "base64"
+      )}`;
+
+      // Create video generation task with proper headers
+      const headers = {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+      };
+
+      const taskResponse = await axios.post(
+        "https://api.runwayml.com/v1/image_to_video",
+        {
           model: "gen3a_turbo",
-          promptImage: imageUrl,
+          promptImage: base64Image,
           promptText: "Move forward slowly",
           duration: 5,
           ratio: "768:1280",
-        });
+        },
+        { headers }
+      );
 
-        // Poll for task completion
-        let task = await this.runwayClient.tasks.retrieve(response.id);
-        while (task.status === "PENDING" || task.status === "PROCESSING") {
-          await new Promise((resolve) => setTimeout(resolve, 10000));
-          task = await this.runwayClient.tasks.retrieve(response.id);
+      if (!taskResponse.data?.id) {
+        throw new Error("Failed to create video task: No task ID received");
+      }
 
-          if (task.status === "FAILED") {
-            throw new Error(task.failure || "Video generation failed");
-          }
+      // Poll for task completion
+      let task = await this.runwayClient.tasks.retrieve(taskResponse.data.id);
+      while (task.status === "PENDING" || task.status === "PROCESSING") {
+        await new Promise((resolve) => setTimeout(resolve, 10000));
+        task = await this.runwayClient.tasks.retrieve(taskResponse.data.id);
 
-          if (
-            task.status === "SUCCEEDED" &&
-            task.output &&
-            task.output.length > 0
-          ) {
-            // Download and save the video
-            const videoResponse = await fetch(task.output[0]);
-            if (!videoResponse.ok) {
-              throw new Error(
-                `Failed to download video: ${videoResponse.statusText}`
-              );
-            }
-
-            const segmentPath = path.join(
-              this.outputDir,
-              `segment_${index}.mp4`
-            );
-            const videoBuffer = await videoResponse.arrayBuffer();
-            await fs.promises.writeFile(segmentPath, Buffer.from(videoBuffer));
-            console.log("Successfully downloaded and saved video");
-            return segmentPath;
-          }
+        if (task.status === "FAILED") {
+          throw new Error(task.failure || "Video generation failed");
         }
 
-        throw new Error("Video generation timed out");
-      } catch (error) {
-        retryCount++;
-        console.error("Failed to generate video segment:", {
-          error: error instanceof Error ? error.message : "Unknown error",
-          filename,
-          index,
-          attempt: retryCount,
-          maxRetries,
+        if (
+          task.status === "SUCCEEDED" &&
+          task.output &&
+          task.output.length > 0
+        ) {
+          // Download and save the video
+          const videoResponse = await fetch(task.output[0]);
+          if (!videoResponse.ok) {
+            throw new Error(
+              `Failed to download video: ${videoResponse.statusText}`
+            );
+          }
+
+          const segmentPath = path.join(this.outputDir, `segment_${index}.mp4`);
+          const videoBuffer = await videoResponse.arrayBuffer();
+          await fs.promises.writeFile(segmentPath, Buffer.from(videoBuffer));
+          console.log("Successfully downloaded and saved video");
+          return segmentPath;
+        }
+      }
+
+      throw new Error("Video generation timed out");
+    } catch (error) {
+      throw new Error(
+        `Failed to generate video: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
+
+  async regenerateVideos(photoIds: string[]): Promise<string[]> {
+    const photos = await prisma.photo.findMany({
+      where: {
+        id: { in: photoIds },
+        processedFilePath: { not: null },
+      },
+    });
+
+    if (photos.length === 0) {
+      throw new Error("No valid photos found for regeneration");
+    }
+
+    const regeneratedVideos: string[] = [];
+
+    for (const photo of photos) {
+      try {
+        // Update photo status
+        await prisma.photo.update({
+          where: { id: photo.id },
+          data: { status: "processing", error: null },
         });
 
-        if (retryCount === maxRetries) {
-          throw new Error(
-            `Failed to generate video segment for image ${index} after ${maxRetries} attempts: ${
+        // Use existing WebP file for regeneration
+        const imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${photo.processedFilePath}`;
+
+        // Generate new video
+        const videoPath = await this.generateRunwayVideo(
+          imageUrl,
+          parseInt(photo.id)
+        );
+
+        // Store the individual video path
+        await prisma.photo.update({
+          where: { id: photo.id },
+          data: {
+            runwayVideoPath: videoPath,
+            status: "completed",
+          },
+        });
+
+        regeneratedVideos.push(videoPath);
+      } catch (error) {
+        // Update photo with error status
+        await prisma.photo.update({
+          where: { id: photo.id },
+          data: {
+            status: "error",
+            error:
               error instanceof Error
                 ? error.message
-                : "Failed to generate video"
-            }`
-          );
-        }
-
-        // Wait before retrying (exponential backoff)
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.pow(2, retryCount) * 1000)
+                : "Unknown error during regeneration",
+          },
+        });
+        console.error(
+          `Failed to regenerate video for photo ${photo.id}:`,
+          error
         );
       }
     }
 
-    throw new Error("Video generation failed after all retries");
-  }
-
-  private stitchVideoSegments(
-    segments: string[],
-    template: VideoTemplate
-  ): Promise<string> {
-    const outputPath = path.join(this.outputDir, `final_${Date.now()}.mp4`);
-
-    return new Promise((resolve, reject) => {
-      let command = ffmpeg();
-
-      segments.forEach((segment) => {
-        command = command.input(segment);
-      });
-
-      command
-        .on("end", () => resolve(outputPath))
-        .on("error", (err: Error) =>
-          reject(new Error(`FFmpeg error: ${err.message}`))
-        )
-        .complexFilter([
-          {
-            filter: "concat",
-            options: {
-              n: segments.length,
-              v: 1,
-              a: 0,
-            },
-          },
-        ])
-        .output(outputPath)
-        .run();
-    });
+    return regeneratedVideos;
   }
 
   async convertImagesToVideo(
@@ -386,454 +525,12 @@ export class ImageToVideoConverter {
     }
   }
 
-  private async generateVideoFromExistingWebP(
-    filename: string,
-    index: number
-  ): Promise<string> {
-    const maxRetries = 3;
-    let retryCount = 0;
-
-    if (!process.env.AWS_REGION) {
-      throw new Error("AWS_REGION environment variable is not set");
-    }
-
-    while (retryCount < maxRetries) {
-      try {
-        // Find the WebP version directly from the database
-        const photo = await prisma.photo.findFirst({
-          where: {
-            filePath: {
-              contains: filename,
-            },
-            processedFilePath: { not: null },
-          },
-          include: {
-            listing: true,
-          },
-        });
-
-        if (!photo?.processedFilePath || !photo.listing) {
-          throw new Error(
-            `WebP version not found for image: ${filename}. Please ensure images are processed before regeneration.`
-          );
-        }
-
-        // Use existing WebP file URL directly
-        const imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${photo.processedFilePath}`;
-        console.log("Using existing WebP URL:", imageUrl);
-
-        return this.generateRunwayVideo(imageUrl, index);
-      } catch (error) {
-        retryCount++;
-        console.error("Failed to generate video segment:", {
-          error: error instanceof Error ? error.message : "Unknown error",
-          filename,
-          index,
-          attempt: retryCount,
-          maxRetries,
-        });
-
-        if (retryCount === maxRetries) {
-          throw new Error(
-            `Failed to generate video segment for image ${index} after ${maxRetries} attempts: ${
-              error instanceof Error
-                ? error.message
-                : "Failed to generate video"
-            }`
-          );
-        }
-
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.pow(2, retryCount) * 1000)
-        );
-      }
-    }
-
-    throw new Error("Video generation failed after all retries");
-  }
-
-  private async generateVideoFirstTime(
-    imagePath: string,
-    index: number
-  ): Promise<string> {
-    try {
-      // Read and resize the image for Runway's requirements
-      const inputBuffer = await readFile(imagePath);
-      const webpBuffer = await sharp(inputBuffer)
-        .resize(1080, 1920, {
-          fit: "cover",
-          position: "center",
-        })
-        .toBuffer();
-
-      // Upload to S3 to get HTTPS URL
-      const s3Client = new S3Client({ region: process.env.AWS_REGION });
-      const tempKey = `temp/runway-inputs/${Date.now()}-${path.basename(
-        imagePath
-      )}`;
-
-      await s3Client.send(
-        new PutObjectCommand({
-          Bucket: process.env.AWS_BUCKET,
-          Key: tempKey,
-          Body: webpBuffer,
-          ContentType: "image/webp",
-        })
-      );
-
-      // Construct the S3 URL
-      const imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${tempKey}`;
-      console.log("Creating video from new image URL:", imageUrl);
-
-      return this.generateRunwayVideo(imageUrl, index);
-    } catch (error) {
-      throw new Error(
-        `Failed to process image for first-time video generation: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`
-      );
-    }
-  }
-
-  private async generateRunwayVideo(
-    imageUrl: string,
-    index: number
-  ): Promise<string> {
-    // Download the image from URL
-    const imageResponse = await axios.get(imageUrl, {
-      responseType: "arraybuffer",
-    });
-    const imageBuffer = Buffer.from(imageResponse.data);
-
-    // Check file size (max 16MB unencoded, ~5MB encoded)
-    const fileSizeInMB = imageBuffer.length / (1024 * 1024);
-    if (fileSizeInMB > 3.3) {
-      throw new Error(
-        `Image file size (${fileSizeInMB.toFixed(
-          2
-        )}MB) exceeds Runway's limit of 3.3MB`
-      );
-    }
-
-    // Validate and process image using sharp
-    const imageInfo = await sharp(imageBuffer).metadata();
-
-    // Check image dimensions
-    if ((imageInfo.width || 0) > 8000 || (imageInfo.height || 0) > 8000) {
-      throw new Error(
-        `Image dimensions (${imageInfo.width}x${imageInfo.height}) exceed Runway's limit of 8000px`
-      );
-    }
-
-    // Convert to WebP format for consistency
-    const processedBuffer = await sharp(imageBuffer)
-      .resize(1080, 1920, {
-        fit: "cover",
-        position: "center",
-      })
-      .webp({ quality: 90 })
-      .toBuffer();
-
-    // Create base64 with proper content type
-    const base64Image = `data:image/webp;base64,${processedBuffer.toString(
-      "base64"
-    )}`;
-
-    // Create video generation task with proper headers
-    const headers = {
-      Authorization: `Bearer ${this.apiKey}`,
-      "Content-Type": "application/json",
-    };
-
-    const taskResponse = await axios.post(
-      "https://api.runwayml.com/v1/image_to_video",
-      {
-        model: "gen3a_turbo",
-        promptImage: base64Image,
-        promptText: "Move forward slowly",
-        duration: 5,
-        ratio: "768:1280",
-      },
-      { headers }
-    );
-
-    if (!taskResponse.data?.id) {
-      throw new Error("Failed to create video task: No task ID received");
-    }
-
-    // Poll for task completion
-    let task = await this.runwayClient.tasks.retrieve(taskResponse.data.id);
-    while (task.status === "PENDING" || task.status === "PROCESSING") {
-      await new Promise((resolve) => setTimeout(resolve, 10000));
-      task = await this.runwayClient.tasks.retrieve(taskResponse.data.id);
-
-      if (task.status === "FAILED") {
-        throw new Error(task.failure || "Video generation failed");
-      }
-
-      if (
-        task.status === "SUCCEEDED" &&
-        task.output &&
-        task.output.length > 0
-      ) {
-        // Download and save the video
-        const videoResponse = await fetch(task.output[0]);
-        if (!videoResponse.ok) {
-          throw new Error(
-            `Failed to download video: ${videoResponse.statusText}`
-          );
-        }
-
-        const segmentPath = path.join(this.outputDir, `segment_${index}.mp4`);
-        const videoBuffer = await videoResponse.arrayBuffer();
-        await fs.promises.writeFile(segmentPath, Buffer.from(videoBuffer));
-        console.log("Successfully downloaded and saved video");
-        return segmentPath;
-      }
-    }
-
-    throw new Error("Video generation timed out");
-  }
-
-  private async uploadVideoToS3(videoPath: string): Promise<void> {
-    const s3Client = new S3Client({ region: process.env.AWS_REGION });
-    const bucketName = process.env.VIDEOS_BUCKET_NAME;
-    const key = `videos/${path.basename(videoPath)}`;
-
-    const command = new PutObjectCommand({
-      Bucket: bucketName,
-      Key: key,
-      Body: await fs.promises.readFile(videoPath),
-      ContentType: "video/mp4",
-    });
-
-    try {
-      await s3Client.send(command);
-      console.log(`Video uploaded to S3: ${key}`);
-    } catch (error) {
-      throw new Error(
-        `Failed to upload video to S3: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`
-      );
-    }
-  }
-
-  private async generateVideo(
-    image: ProcessedImage,
-    outputPath: string
-  ): Promise<void> {
-    try {
-      // Read and resize the image for Runway's requirements
-      const inputBuffer = await readFile(image.croppedPath);
-      const webpBuffer = await sharp(inputBuffer)
-        .resize(1080, 1920, {
-          fit: "cover",
-          position: "center",
-        })
-        .toBuffer();
-
-      // Upload to S3 to get HTTPS URL
-      const s3Client = new S3Client({ region: process.env.AWS_REGION });
-      const tempKey = `temp/runway-inputs/${Date.now()}-${path.basename(
-        image.croppedPath
-      )}`;
-
-      await s3Client.send(
-        new PutObjectCommand({
-          Bucket: process.env.AWS_BUCKET,
-          Key: tempKey,
-          Body: webpBuffer,
-          ContentType: "image/webp",
-        })
-      );
-
-      // Construct the S3 URL
-      const imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${tempKey}`;
-      console.log("Creating video from image URL:", imageUrl);
-
-      // Create video generation task
-      const response = await this.runwayClient.imageToVideo({
-        model: "gen3a_turbo",
-        promptImage: imageUrl,
-        promptText: "Move forward slowly",
-        duration: 5,
-        ratio: "768:1280",
-      });
-
-      // Poll for task completion
-      let task = await this.runwayClient.tasks.retrieve(response.id);
-      while (task.status === "PENDING" || task.status === "PROCESSING") {
-        await new Promise((resolve) => setTimeout(resolve, 10000));
-        task = await this.runwayClient.tasks.retrieve(response.id);
-
-        if (task.status === "FAILED") {
-          throw new Error(task.failure || "Video generation failed");
-        }
-
-        if (
-          task.status === "SUCCEEDED" &&
-          task.output &&
-          task.output.length > 0
-        ) {
-          // Download and save the video
-          const videoResponse = await fetch(task.output[0]);
-          if (!videoResponse.ok) {
-            throw new Error(
-              `Failed to download video: ${videoResponse.statusText}`
-            );
-          }
-
-          const videoBuffer = await videoResponse.arrayBuffer();
-          await writeFile(outputPath, Buffer.from(videoBuffer));
-          console.log("Successfully downloaded and saved video");
-          return;
-        }
-      }
-    } catch (error) {
-      console.error("Error generating video:", error);
-
-      // Create a fallback video by copying the original image
-      console.log("Creating fallback video by copying the original image");
-      await copyFile(image.croppedPath, outputPath);
-      console.log(`Created fallback video at: ${outputPath}`);
-    }
-  }
-
   async setMapFrames(mapFramesDir: string): Promise<void> {
     const files = await fs.promises.readdir(mapFramesDir);
     this.mapFrames = files
       .filter((f) => f.startsWith("frame_") && f.endsWith(".jpg"))
       .sort()
       .map((f) => path.join(mapFramesDir, f));
-  }
-
-  private async stitchVideosWithMapFrames(
-    videoFiles: string[],
-    durations: number[],
-    outputPath: string,
-    music?: { path: string; volume?: number }
-  ): Promise<void> {
-    if (!this.mapFrames) {
-      throw new Error("No map frames set. Call setMapFrames first.");
-    }
-
-    // Determine segment durations:
-    // If durations length equals the number of video files, use them.
-    // Else if a single duration is provided, use it for all.
-    // Otherwise, throw an error.
-    let segmentDurations: number[] = [];
-    if (durations.length === videoFiles.length) {
-      segmentDurations = durations;
-    } else if (durations.length === 1) {
-      segmentDurations = Array(videoFiles.length).fill(durations[0]);
-    } else {
-      throw new Error(
-        "Durations array length must be either 1 or equal to number of video files."
-      );
-    }
-
-    // Ensure we have enough map frames to match the video files.
-    if (this.mapFrames.length < videoFiles.length) {
-      throw new Error(
-        "Not enough map frames set to match video files count. Please check setMapFrames."
-      );
-    }
-
-    // Create temporary map frame video segments from map frame images.
-    const tempMapVideos: string[] = [];
-    for (let i = 0; i < videoFiles.length; i++) {
-      const mapFrameImage = this.mapFrames[i];
-      const duration = segmentDurations[i];
-      const tempMapVideoPath = path.join(this.outputDir, `temp_map_${i}.mp4`);
-      await new Promise<void>((resolve, reject) => {
-        ffmpeg()
-          .input(mapFrameImage)
-          .inputOptions(["-loop", "1"])
-          .duration(duration)
-          .videoCodec("libx264")
-          .outputOptions(["-pix_fmt", "yuv420p"])
-          .on("end", () => resolve())
-          .on("error", (err: Error) =>
-            reject(
-              new Error(
-                `Failed to generate map frame video for ${mapFrameImage}: ${err.message}`
-              )
-            )
-          )
-          .save(tempMapVideoPath);
-      });
-      tempMapVideos.push(tempMapVideoPath);
-    }
-
-    // Interleave map frame videos and main video segments.
-    const filesToConcat: string[] = [];
-    for (let i = 0; i < videoFiles.length; i++) {
-      filesToConcat.push(tempMapVideos[i]); // Map frame segment.
-      filesToConcat.push(videoFiles[i]); // Main video segment.
-    }
-
-    // Concatenate all videos into one temporary file.
-    const tempConcatPath = path.join(
-      this.outputDir,
-      `concat_${Date.now()}.mp4`
-    );
-    await new Promise<void>((resolve, reject) => {
-      let command = ffmpeg();
-      filesToConcat.forEach((file) => {
-        command = command.input(file);
-      });
-      command
-        .on("end", () => resolve())
-        .on("error", (err: Error) =>
-          reject(new Error(`FFmpeg concatenation error: ${err.message}`))
-        )
-        .complexFilter([
-          {
-            filter: "concat",
-            options: {
-              n: filesToConcat.length,
-              v: 1,
-              a: 0,
-            },
-          },
-        ])
-        .output(tempConcatPath)
-        .run();
-    });
-
-    // If music is provided, overlay it on the concatenated video.
-    if (music && music.path) {
-      await new Promise<void>((resolve, reject) => {
-        const musicVolume = music.volume !== undefined ? music.volume : 1;
-        ffmpeg()
-          .input(tempConcatPath)
-          .input(music.path)
-          .outputOptions(["-c:v copy", "-c:a aac", "-shortest"])
-          .audioFilters(`volume=${musicVolume}`)
-          .on("end", () => resolve())
-          .on("error", (err: Error) =>
-            reject(new Error(`FFmpeg music overlay error: ${err.message}`))
-          )
-          .save(outputPath);
-      });
-      // Remove temporary concatenated video after overlay.
-      await fs.promises.unlink(tempConcatPath);
-    } else {
-      // No music provided; move the concatenated file to final output.
-      await fs.promises.rename(tempConcatPath, outputPath);
-    }
-
-    // Cleanup temporary map frame video files.
-    await Promise.all(
-      tempMapVideos.map(async (tempPath) => {
-        try {
-          await fs.promises.unlink(tempPath);
-        } catch (err) {
-          console.warn(`Failed to remove temp file ${tempPath}: ${err}`);
-        }
-      })
-    );
   }
 
   async createTemplate(
@@ -943,179 +640,215 @@ export class ImageToVideoConverter {
     durations: number[],
     outputPath: string,
     music?: { path: string; volume?: number; startTime?: number },
-    watermark?: { path: string; opacity?: number },
-    regeneratedSegments?: { [key: string]: string }
+    reverse: boolean = false
   ): Promise<void> {
     console.log("Starting video stitching with:", {
       videoCount: videoFiles.length,
       durations,
       outputPath,
       hasMusicTrack: !!music,
-      hasWatermark: !!watermark,
+      reverse,
     });
 
-    // Create filter complex for trimming and scaling videos
-    const filterComplex: string[] = [];
-    const inputs: string[] = [];
-
-    // Add input files
-    for (let i = 0; i < videoFiles.length; i++) {
-      inputs.push("-i", videoFiles[i]);
-    }
-
-    // Add music input if provided
-    if (music) {
-      const musicPath = path.resolve(__dirname, music.path);
-      if (await exists(musicPath)) {
-        inputs.push("-i", musicPath);
-      } else {
-        console.warn(`Music file not found: ${musicPath}`);
-      }
-    }
-
-    // Add watermark input if provided
-    let watermarkInputIndex = videoFiles.length;
-    if (watermark) {
-      const watermarkPath = watermark.path;
-      if (await exists(watermarkPath)) {
-        inputs.push("-i", watermarkPath);
-        watermarkInputIndex = inputs.length / 2 - 1; // Calculate the input index for watermark
-      } else {
-        console.warn(`Watermark file not found: ${watermarkPath}`);
-      }
-    }
-
-    // Add trim and scale filters for each video
-    for (let i = 0; i < videoFiles.length; i++) {
-      filterComplex.push(
-        `[${i}:v]setpts=PTS-STARTPTS,scale=768:1280:force_original_aspect_ratio=decrease,` +
-          `pad=768:1280:(ow-iw)/2:(oh-ih)/2,trim=duration=${durations[i]},` +
-          `setpts=PTS-STARTPTS[v${i}]`
-      );
-    }
-
-    // Create concat inputs string
-    const concatInputs = Array.from(
-      { length: videoFiles.length },
-      (_, i) => `[v${i}]`
-    ).join("");
-
-    // Add concat filter
-    filterComplex.push(
-      `${concatInputs}concat=n=${videoFiles.length}:v=1:a=0[concat]`
-    );
-
-    // Add watermark if provided
-    if (watermark) {
-      const opacity = watermark.opacity || 0.5;
-      filterComplex.push(
-        `[concat][${watermarkInputIndex}:v]overlay=W-w-10:H-h-10:enable='between(t,0,${durations.reduce(
-          (a, b) => a + b,
-          0
-        )})':alpha=${opacity}[outv]`
-      );
-    } else {
-      filterComplex.push(`[concat]copy[outv]`);
-    }
-
-    // Calculate total duration
-    const totalDuration = durations.reduce((sum, d) => sum + d, 0);
-
-    // Add audio filters if music is provided
-    if (music) {
-      const volume = music.volume || 0.5;
-      const startTime = music.startTime || 0;
-      const fadeStart = Math.max(0, totalDuration - 1);
-      filterComplex.push(
-        `[${videoFiles.length}:a]asetpts=PTS-STARTPTS,` +
-          `atrim=start=${startTime}:duration=${totalDuration},` +
-          `volume=${volume}:eval=frame,` +
-          `afade=t=out:st=${fadeStart}:d=1[outa]`
-      );
-    }
-
-    // Build ffmpeg command
-    const command = [
-      "ffmpeg",
-      "-y",
-      ...inputs,
-      "-filter_complex",
-      filterComplex.join(";"),
-      "-map",
-      "[outv]",
-    ];
-
-    // Add audio mapping if music is provided
-    if (music) {
-      command.push("-map", "[outa]");
-    }
-
-    // Add output options
-    command.push(
-      "-c:v",
-      "libx264",
-      "-preset",
-      "slow",
-      "-crf",
-      "18",
-      "-r",
-      "24",
-      "-c:a",
-      "aac",
-      "-shortest",
-      "-t",
-      totalDuration.toString(),
-      outputPath
-    );
-
-    // Execute ffmpeg
-    const { spawn } = require("child_process");
-    const ffmpeg = spawn(command[0], command.slice(1));
-
     return new Promise((resolve, reject) => {
-      let errorOutput = "";
-      ffmpeg.stderr.on("data", (data: Buffer) => {
-        const message = data.toString();
-        errorOutput += message;
-        console.log(`ffmpeg: ${message}`);
+      let command = ffmpeg();
+
+      // Add input files
+      videoFiles.forEach((file) => {
+        command = command.input(file);
       });
 
-      ffmpeg.on("close", (code: number) => {
-        if (code === 0) {
-          resolve();
+      // Add music if provided
+      if (music) {
+        const musicPath = path.resolve(__dirname, music.path);
+        if (fs.existsSync(musicPath)) {
+          command = command.input(musicPath);
         } else {
-          reject(
-            new Error(
-              `ffmpeg exited with code ${code}\nError output: ${errorOutput}`
-            )
-          );
+          console.warn(`Music file not found: ${musicPath}`);
         }
-      });
+      }
 
-      ffmpeg.on("error", (err: Error) => {
-        reject(
-          new Error(
-            `ffmpeg process error: ${err.message}\nError output: ${errorOutput}`
-          )
+      // Build complex filter
+      const filterComplex: string[] = [];
+
+      // Add trim and scale filters for each video
+      videoFiles.forEach((_, i) => {
+        filterComplex.push(
+          `[${i}:v]setpts=PTS-STARTPTS,scale=768:1280:force_original_aspect_ratio=decrease,` +
+            `pad=768:1280:(ow-iw)/2:(oh-ih)/2,trim=duration=${durations[i]},` +
+            `${reverse ? "reverse," : ""}setpts=PTS-STARTPTS[v${i}]`
         );
       });
+
+      // Create concat inputs string
+      const concatInputs = Array.from(
+        { length: videoFiles.length },
+        (_, i) => `[v${i}]`
+      ).join("");
+
+      // Add concat filter
+      filterComplex.push(
+        `${concatInputs}concat=n=${videoFiles.length}:v=1:a=0[concat]`
+      );
+
+      // Add watermark if provided
+      if (music) {
+        const opacity = 0.5;
+        const totalDuration = durations.reduce((a, b) => a + b, 0);
+        filterComplex.push(
+          `[concat][${videoFiles.length}:v]overlay=W-w-10:H-h-10:enable='between(t,0,${totalDuration})':alpha=${opacity}[outv]`
+        );
+      } else {
+        filterComplex.push(`[concat]copy[outv]`);
+      }
+
+      // Add audio filters if music is provided
+      if (music) {
+        const volume = music.volume || 0.5;
+        const startTime = music.startTime || 0;
+        const totalDuration = durations.reduce((a, b) => a + b, 0);
+        const fadeStart = Math.max(0, totalDuration - 1);
+        filterComplex.push(
+          `[${videoFiles.length}:a]asetpts=PTS-STARTPTS,` +
+            `atrim=start=${startTime}:duration=${totalDuration},` +
+            `volume=${volume}:eval=frame,` +
+            `afade=t=out:st=${fadeStart}:d=1[outa]`
+        );
+      }
+
+      // Apply complex filter
+      command = command.complexFilter(filterComplex);
+
+      // Map outputs
+      command = command.outputOptions(["-map", "[outv]"]);
+      if (music) {
+        command = command.outputOptions(["-map", "[outa]"]);
+      }
+
+      // Set output options
+      command = command
+        .outputOptions([
+          "-c:v",
+          "libx264",
+          "-preset",
+          "slow",
+          "-crf",
+          "18",
+          "-r",
+          "24",
+          "-c:a",
+          "aac",
+          "-shortest",
+        ])
+        .output(outputPath);
+
+      // Handle events
+      command
+        .on("start", (commandLine) => {
+          console.log("FFmpeg started:", commandLine);
+        })
+        .on("progress", (progress) => {
+          console.log("FFmpeg progress:", progress);
+        })
+        .on("end", () => {
+          console.log("FFmpeg processing finished");
+          resolve();
+        })
+        .on("error", (err) => {
+          console.error("FFmpeg error:", err);
+          reject(new Error(`FFmpeg error: ${err.message}`));
+        });
+
+      // Run the command
+      command.run();
     });
   }
 
-  async convertToWebP(
+  public async validateImage(
+    inputPath: string
+  ): Promise<{ isValid: boolean; error?: string }> {
+    try {
+      // If input is a URL, get just the base path without query parameters
+      const cleanPath = inputPath.includes("http")
+        ? inputPath.split("?")[0]
+        : inputPath;
+
+      // Try to load the image with sharp
+      const image = sharp(cleanPath);
+      const metadata = await image.metadata();
+
+      // Check if it's a valid image format
+      if (
+        !metadata.format ||
+        !["jpeg", "jpg", "png", "webp"].includes(metadata.format)
+      ) {
+        return {
+          isValid: false,
+          error: `Unsupported image format: ${metadata.format}`,
+        };
+      }
+
+      // Check if image dimensions are valid
+      if (!metadata.width || !metadata.height) {
+        return {
+          isValid: false,
+          error: "Invalid image dimensions",
+        };
+      }
+
+      // Check if image is corrupted by trying to get its buffer
+      await image.toBuffer();
+
+      return { isValid: true };
+    } catch (error) {
+      return {
+        isValid: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unknown error validating image",
+      };
+    }
+  }
+
+  public async convertToWebP(
     inputPath: string,
     outputPath: string,
     options: {
-      quality: number;
-      width: number;
-      height: number;
-      fit: "cover" | "contain" | "fill";
-    }
+      quality?: number;
+      width?: number;
+      height?: number;
+      fit?: keyof sharp.FitEnum;
+    } = {}
   ): Promise<string> {
     try {
-      await sharp(inputPath)
-        .resize(options.width, options.height, { fit: options.fit })
-        .webp({ quality: options.quality })
+      // If input is a URL, get just the base path without query parameters
+      const cleanPath = inputPath.includes("http")
+        ? inputPath.split("?")[0]
+        : inputPath;
+
+      // Validate the image first
+      const validation = await this.validateImage(cleanPath);
+      if (!validation.isValid) {
+        throw new Error(`Invalid image: ${validation.error}`);
+      }
+
+      const image = sharp(cleanPath);
+
+      // Apply resizing if dimensions are provided
+      if (options.width || options.height) {
+        image.resize(options.width, options.height, {
+          fit: options.fit || "contain",
+          withoutEnlargement: true,
+        });
+      }
+
+      // Convert to WebP with specified quality
+      await image
+        .webp({
+          quality: options.quality || 80,
+          effort: 4, // Medium compression effort
+        })
         .toFile(outputPath);
 
       return outputPath;
@@ -1125,85 +858,171 @@ export class ImageToVideoConverter {
     }
   }
 
-  private async uploadToS3ForRunway(
-    filePath: string,
-    key: string
-  ): Promise<string> {
-    const s3Client = new S3Client({ region: process.env.AWS_REGION });
-    const command = new PutObjectCommand({
-      Bucket: process.env.AWS_BUCKET,
-      Key: key,
-      Body: await fs.promises.readFile(filePath),
-      ContentType: "application/octet-stream",
+  async processImage(s3Path: string): Promise<{
+    localWebpPath: string;
+    s3WebpPath: string;
+    uploadPromise: Promise<any>;
+  }> {
+    console.log("Starting image processing:", { s3Path });
+
+    // Parse the original key and create paths
+    const { key: originalKey } = this.parseS3Path(s3Path);
+    const webpKey = originalKey.replace(/\.[^.]+$/, ".webp");
+    const tempDir = process.env.TEMP_OUTPUT_DIR || os.tmpdir();
+
+    // Create consistent file names based on the original key without query params
+    const cleanOriginalKey = originalKey.split("?")[0];
+    const tempOriginalPath = path.join(
+      tempDir,
+      path.basename(cleanOriginalKey)
+    );
+    const tempWebpPath = path.join(tempDir, path.basename(webpKey));
+
+    console.log("Checking paths:", {
+      originalKey,
+      webpKey,
+      tempOriginalPath,
+      tempWebpPath,
     });
 
-    await s3Client.send(command);
-    const url = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
-    console.log("Uploaded file to S3:", url);
-    return url;
-  }
-
-  async regenerateVideos(photoIds: string[]): Promise<string[]> {
-    const photos = await prisma.photo.findMany({
-      where: {
-        id: { in: photoIds },
-        processedFilePath: { not: null },
-      },
-    });
-
-    if (photos.length === 0) {
-      throw new Error("No valid photos found for regeneration");
-    }
-
-    const regeneratedVideos: string[] = [];
-
-    for (const photo of photos) {
-      try {
-        // Update photo status
-        await prisma.photo.update({
-          where: { id: photo.id },
-          data: { status: "processing", error: null },
-        });
-
-        // Use existing WebP file for regeneration
-        const imageUrl = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${photo.processedFilePath}`;
-
-        // Generate new video
-        const videoPath = await this.generateRunwayVideo(
-          imageUrl,
-          parseInt(photo.id)
-        );
-
-        // Store the individual video path
-        await prisma.photo.update({
-          where: { id: photo.id },
-          data: {
-            runwayVideoPath: videoPath,
-            status: "completed",
-          },
-        });
-
-        regeneratedVideos.push(videoPath);
-      } catch (error) {
-        // Update photo with error status
-        await prisma.photo.update({
-          where: { id: photo.id },
-          data: {
-            status: "error",
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unknown error during regeneration",
-          },
-        });
-        console.error(
-          `Failed to regenerate video for photo ${photo.id}:`,
-          error
-        );
+    try {
+      // First check if WebP already exists in temp directory
+      if (
+        await fs.promises
+          .access(tempWebpPath)
+          .then(() => true)
+          .catch(() => false)
+      ) {
+        console.log("Found existing WebP in temp directory:", { tempWebpPath });
+        return {
+          localWebpPath: tempWebpPath,
+          s3WebpPath: `s3://${process.env.AWS_BUCKET}/${webpKey}`,
+          uploadPromise: Promise.resolve(),
+        };
       }
-    }
 
-    return regeneratedVideos;
+      // Check if original exists in temp directory
+      if (
+        await fs.promises
+          .access(tempOriginalPath)
+          .then(() => true)
+          .catch(() => false)
+      ) {
+        console.log("Found original in temp directory:", { tempOriginalPath });
+      } else {
+        // Check database for existing WebP version
+        const existingPhoto = await prisma.photo.findFirst({
+          where: { filePath: originalKey, processedFilePath: { not: null } },
+        });
+
+        if (existingPhoto?.processedFilePath) {
+          console.log("Found existing WebP in database:", {
+            processedFilePath: existingPhoto.processedFilePath,
+          });
+          // Download WebP from S3
+          const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${existingPhoto.processedFilePath}`;
+          const buffer = await this.downloadFromS3(s3WebpPath);
+          await fs.promises.writeFile(tempWebpPath, buffer);
+
+          return {
+            localWebpPath: tempWebpPath,
+            s3WebpPath,
+            uploadPromise: Promise.resolve(),
+          };
+        }
+
+        // If no WebP exists, download original from S3
+        console.log("Downloading original from S3:", { s3Path });
+        const imageBuffer = await this.downloadFromS3(s3Path);
+        if (!imageBuffer || imageBuffer.length === 0) {
+          throw new Error("Downloaded image buffer is empty");
+        }
+        await fs.promises.writeFile(tempOriginalPath, imageBuffer);
+      }
+
+      // At this point we have the original file in temp directory
+      // Validate the image
+      console.log("Validating image:", { tempOriginalPath });
+      const validation = await this.validateImage(tempOriginalPath);
+      if (!validation.isValid) {
+        throw new Error(`Invalid image: ${validation.error}`);
+      }
+
+      // Convert to WebP
+      console.log("Converting to WebP:", { tempOriginalPath, tempWebpPath });
+      await this.convertToWebP(tempOriginalPath, tempWebpPath, {
+        quality: 80,
+        width: 1080,
+        height: 1920,
+        fit: "cover",
+      });
+
+      // Create upload promise for S3 and database update
+      const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${webpKey}`;
+      console.log("Preparing to upload WebP:", { tempWebpPath, s3WebpPath });
+
+      const uploadPromise = this.uploadToS3(tempWebpPath, s3WebpPath)
+        .then(async () => {
+          await prisma.photo.updateMany({
+            where: { filePath: originalKey },
+            data: { processedFilePath: webpKey },
+          });
+          console.log("Updated photo record with WebP path:", {
+            original: originalKey,
+            webp: webpKey,
+          });
+        })
+        .catch((error) => {
+          console.error("WebP upload failed:", {
+            error: error instanceof Error ? error.message : "Unknown error",
+            stack: error instanceof Error ? error.stack : undefined,
+            s3Path: s3WebpPath,
+          });
+          throw error;
+        });
+
+      return {
+        localWebpPath: tempWebpPath,
+        s3WebpPath,
+        uploadPromise,
+      };
+    } catch (error) {
+      // Clean up on error - only delete if files exist
+      try {
+        if (
+          await fs.promises
+            .access(tempOriginalPath)
+            .then(() => true)
+            .catch(() => false)
+        ) {
+          await fs.promises.unlink(tempOriginalPath);
+        }
+        if (
+          await fs.promises
+            .access(tempWebpPath)
+            .then(() => true)
+            .catch(() => false)
+        ) {
+          await fs.promises.unlink(tempWebpPath);
+        }
+        console.log("Cleaned up temp files after error");
+      } catch (cleanupError) {
+        console.error("Failed to cleanup temp files:", {
+          error:
+            cleanupError instanceof Error
+              ? cleanupError.message
+              : "Unknown error",
+          stack: cleanupError instanceof Error ? cleanupError.stack : undefined,
+        });
+      }
+
+      console.error("Error processing image:", {
+        s3Path,
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error;
+    }
   }
 }
 

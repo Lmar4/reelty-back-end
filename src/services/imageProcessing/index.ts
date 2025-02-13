@@ -6,6 +6,7 @@ import { MapCapture } from "./mapCapture";
 import { ProductionPipeline } from "./productionPipeline";
 import { TemplateKey } from "./templates/types";
 import { VisionProcessor } from "./visionProcessor";
+import { logger } from "../../utils/logger";
 
 const prisma = new PrismaClient();
 
@@ -110,6 +111,7 @@ export class ImageProcessingService {
             where: { id: photo.id },
             data: {
               processedFilePath: webpKey,
+              status: "completed",
             },
           });
         }
@@ -121,6 +123,40 @@ export class ImageProcessingService {
         };
       })
     );
+
+    // After all photos are processed, get the listing to check if we should generate video
+    const listing = await prisma.listing.findUnique({
+      where: { id: propertyId },
+      include: {
+        photos: true,
+        user: true,
+      },
+    });
+
+    if (listing && listing.photos.length > 0 && listing.user) {
+      // Get all processed photo keys
+      const processedPhotoKeys = listing.photos
+        .filter(
+          (photo) => photo.processedFilePath && photo.status === "completed"
+        )
+        .map((photo) => photo.processedFilePath as string);
+
+      if (processedPhotoKeys.length > 0) {
+        try {
+          // Generate video with default template
+          await this.generatePropertyVideo(
+            propertyId,
+            processedPhotoKeys,
+            listing.user.id
+          );
+        } catch (error) {
+          logger.error("Failed to generate video after photo upload", {
+            propertyId,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+        }
+      }
+    }
 
     return results;
   }

@@ -1,11 +1,12 @@
 import express, { Request, Response } from "express";
-import { PrismaClient, Prisma } from "@prisma/client";
+import { PrismaClient, Prisma, VideoGenerationStatus } from "@prisma/client";
 import { z } from "zod";
 import { validateRequest } from "../middleware/validate";
 import { logger } from "../utils/logger";
 import { StorageService } from "../services/storage";
 import multer from "multer";
 import { isAuthenticated } from "../middleware/auth";
+import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -254,6 +255,9 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
         id: listingId,
         userId, // Ensure listing belongs to authenticated user
       },
+      include: {
+        photos: true,
+      },
     });
 
     if (!listing) {
@@ -302,12 +306,151 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
       url: uploadResult.uploadUrl,
     });
 
+    // Check if this is the last photo and trigger video generation
+    const updatedListing = await prisma.listing.findUnique({
+      where: { id: listingId },
+      include: { photos: true },
+    });
+
+    if (updatedListing && updatedListing.photos.length > 0) {
+      // Create a new video generation job
+      const job = await prisma.videoJob.create({
+        data: {
+          listingId,
+          userId,
+          status: "PROCESSING",
+        },
+      });
+
+      logger.info("[Listings] Created video generation job", {
+        jobId: job.id,
+        listingId,
+        photoCount: updatedListing.photos.length,
+      });
+
+      // Start the production pipeline
+      const productionPipeline = new ProductionPipeline();
+      const photoUrls = updatedListing.photos.map((p) => p.filePath);
+
+      // Parse coordinates if they exist
+      const coordinates =
+        updatedListing.coordinates &&
+        typeof updatedListing.coordinates === "object"
+          ? {
+              lat: Number((updatedListing.coordinates as any).lat),
+              lng: Number((updatedListing.coordinates as any).lng),
+            }
+          : undefined;
+
+      logger.info("[Listings] Starting production pipeline", {
+        jobId: job.id,
+        listingId,
+        hasCoordinates: !!coordinates,
+        photoCount: photoUrls.length,
+      });
+
+      // Start the pipeline in the background
+      productionPipeline
+        .execute({
+          jobId: job.id,
+          inputFiles: photoUrls,
+          template: "default",
+          coordinates,
+        })
+        .catch((error: unknown) => {
+          logger.error("[Listings] Error starting production pipeline", {
+            error: error instanceof Error ? error.message : "Unknown error",
+            jobId: job.id,
+            listingId,
+          });
+        });
+    }
+
     res.status(201).json({
       success: true,
       data: photo,
     });
   } catch (error) {
     logger.error("[Listings] Error uploading photo", {
+      error: error instanceof Error ? error.message : "Unknown error",
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+  }
+};
+
+// Delete listing by ID
+const deleteListing = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { listingId } = req.params;
+    const userId = req.user!.id;
+
+    // Check if listing exists and belongs to user
+    const listing = await prisma.listing.findUnique({
+      where: { id: listingId },
+      include: {
+        photos: true,
+        videoJobs: true,
+      },
+    });
+
+    if (!listing) {
+      res.status(404).json({
+        success: false,
+        error: "Listing not found",
+      });
+      return;
+    }
+
+    if (listing.userId !== userId) {
+      res.status(403).json({
+        success: false,
+        error: "Access denied",
+      });
+      return;
+    }
+
+    // Delete all associated data in a transaction
+    await prisma.$transaction(async (tx) => {
+      // Delete video jobs first
+      await tx.videoJob.deleteMany({
+        where: { listingId },
+      });
+
+      // Delete photos from S3 and database
+      for (const photo of listing.photos) {
+        // Delete from S3
+        if (photo.filePath) {
+          await storageService.deleteFile(photo.filePath);
+        }
+        if (photo.processedFilePath) {
+          await storageService.deleteFile(photo.processedFilePath);
+        }
+      }
+
+      // Delete all photos from database
+      await tx.photo.deleteMany({
+        where: { listingId },
+      });
+
+      // Finally delete the listing
+      await tx.listing.delete({
+        where: { id: listingId },
+      });
+    });
+
+    logger.info("[Listings] Listing deleted", {
+      listingId,
+      userId,
+    });
+
+    res.status(204).send();
+  } catch (error) {
+    logger.error("[Listings] Error deleting listing", {
       error: error instanceof Error ? error.message : "Unknown error",
       stack: error instanceof Error ? error.stack : undefined,
     });
@@ -334,5 +477,6 @@ router.post(
   upload.single("file"), // Handle single file upload
   uploadPhoto
 );
+router.delete("/:listingId", isAuthenticated, deleteListing);
 
 export default router;

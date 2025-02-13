@@ -9,7 +9,7 @@ async function seedTemplates() {
 
   const templates = [
     {
-      name: "Google Zoom Intro",
+      name: "googlezoomintro",
       description:
         "Start with a dramatic Google Maps zoom into the property location, followed by property highlights",
       tiers: ["free", "pro", "enterprise", "admin"],

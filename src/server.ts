@@ -8,6 +8,7 @@ import adminRouter from "./routes/admin";
 import creditsRouter from "./routes/credits";
 import jobsRouter from "./routes/job";
 import listingsRouter from "./routes/listings";
+import photosRouter from "./routes/photos";
 import queueRouter from "./routes/queue";
 import subscriptionRouter from "./routes/subscription";
 import templatesRouter from "./routes/templates";
@@ -41,7 +42,7 @@ app.get("/health", (_req: Request, res: Response) => {
 // Routes
 app.use("/api/listings", listingsRouter);
 app.use("/api/users", usersRouter);
-app.use("/api/jobs", jobsRouter);
+app.use("/api/photos", photosRouter);
 app.use("/api/templates", templatesRouter);
 // Mount all admin routes under /api/admin
 app.use("/api/admin", adminRouter);

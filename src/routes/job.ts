@@ -41,7 +41,7 @@ async function recoverPendingJobs() {
             inputFiles: Array.isArray(job.inputFiles)
               ? job.inputFiles.map(String)
               : [],
-            template: job.template || "Google Zoom Intro",
+            template: job.template || "googlezoomintro",
             coordinates: job.listing?.coordinates as
               | { lat: number; lng: number }
               | undefined,
@@ -69,13 +69,16 @@ const createJobSchema = z.object({
   body: z.object({
     listingId: z.string().uuid(),
     template: z.string().optional(),
-    inputFiles: z.array(z.string()).optional(),
+    inputFiles: z
+      .array(z.string().min(1))
+      .transform((files) => files.filter(Boolean))
+      .optional(),
   }),
 });
 
 const updateJobSchema = z.object({
   body: z.object({
-    status: z.enum(["pending", "processing", "completed", "error"]).optional(),
+    status: z.enum(["QUEUED", "PROCESSING", "COMPLETED", "FAILED"]).optional(),
     progress: z.number().min(0).max(100).optional(),
     template: z.string().optional(),
     inputFiles: z.array(z.string()).optional(),
@@ -125,6 +128,13 @@ const createJob: RequestHandler = async (req, res) => {
 
     const { listingId, template, inputFiles } = req.body;
 
+    // Ensure inputFiles is an array and filter out any invalid values
+    const validInputFiles = Array.isArray(inputFiles)
+      ? inputFiles.filter(
+          (file): file is string => typeof file === "string" && file.length > 0
+        )
+      : [];
+
     const listing = await prisma.listing.findUnique({
       where: {
         id: listingId,
@@ -148,7 +158,7 @@ const createJob: RequestHandler = async (req, res) => {
     if (!templateId) {
       const defaultTemplate = await prisma.template.findFirst({
         where: {
-          name: "Google Zoom Intro",
+          name: "googlezoomintro",
         },
       });
       if (!defaultTemplate) {
@@ -165,10 +175,10 @@ const createJob: RequestHandler = async (req, res) => {
       data: {
         userId: req.user!.id,
         listingId,
-        status: "PENDING" as VideoGenerationStatus,
+        status: "QUEUED",
         progress: 0,
-        template: templateId || "Google Zoom Intro",
-        inputFiles: inputFiles || [],
+        template: templateId || "googlezoomintro",
+        inputFiles: validInputFiles,
       },
       include: {
         listing: true,
@@ -189,7 +199,7 @@ const createJob: RequestHandler = async (req, res) => {
         inputFiles: Array.isArray(job.inputFiles)
           ? job.inputFiles.map(String)
           : [],
-        template: job.template || "Google Zoom Intro",
+        template: job.template || "googlezoomintro",
         coordinates: (
           await prisma.listing.findUnique({ where: { id: job.listingId } })
         )?.coordinates as { lat: number; lng: number } | undefined,
@@ -361,20 +371,20 @@ const regenerateJob: RequestHandler = async (req, res) => {
     // Create a new job with the same parameters
     const template = await prisma.template.findFirst({
       where: {
-        name: "Google Zoom Intro",
+        name: "googlezoomintro",
       },
     });
 
     if (!template) {
-      throw new Error("Template 'Google Zoom Intro' not found in database");
+      throw new Error("Template 'googlezoomintro' not found in database");
     }
 
     const newJob = await prisma.videoJob.create({
       data: {
         userId: req.user!.id,
         listingId: existingJob.listingId,
-        status: "PENDING" as VideoGenerationStatus,
-        template: template.name || "Google Zoom Intro",
+        status: "QUEUED",
+        template: template.name || "googlezoomintro",
         inputFiles: existingJob.inputFiles || [],
       },
       include: {
@@ -402,7 +412,7 @@ const regenerateJob: RequestHandler = async (req, res) => {
         inputFiles: Array.isArray(newJob.inputFiles)
           ? newJob.inputFiles.map(String)
           : [],
-        template: newJob.template || "Google Zoom Intro",
+        template: newJob.template || "googlezoomintro",
         coordinates: (
           await prisma.listing.findUnique({ where: { id: newJob.listingId } })
         )?.coordinates as { lat: number; lng: number } | undefined,

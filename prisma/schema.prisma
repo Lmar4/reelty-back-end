@@ -249,10 +249,11 @@ model VideoJob {
   error       String?
   position    Int      @default(0)
   priority    Int      @default(1)
-  startedAt   DateTime? @map("started_at")
-  completedAt DateTime? @map("completed_at")
+  metadata    Json?    @map("metadata")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
 
   // Relations
   user        User     @relation(fields: [userId], references: [id])

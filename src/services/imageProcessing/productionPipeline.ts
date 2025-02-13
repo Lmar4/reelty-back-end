@@ -45,88 +45,64 @@ interface ProductionPipelineInput {
 }
 
 export class ProductionPipeline {
+  private s3Client: S3Client;
   private imageToVideoConverter: ImageToVideoConverter;
-  private mapCapture: MapCapture;
   private visionProcessor: VisionProcessor;
-  private processingSteps: Map<string, ProcessingStep>;
+  private mapCapture: MapCapture;
   private thumbnailService: ThumbnailService;
+  private processingSteps: Map<string, ProcessingStep>;
 
   constructor() {
+    this.s3Client = new S3Client({
+      region: process.env.AWS_REGION || "us-east-1",
+    });
     this.imageToVideoConverter = new ImageToVideoConverter(
       process.env.RUNWAYML_API_KEY || "",
       process.env.TEMP_OUTPUT_DIR || "./temp"
     );
-    this.mapCapture = new MapCapture(process.env.TEMP_OUTPUT_DIR || "./temp");
     this.visionProcessor = new VisionProcessor();
-    this.processingSteps = new Map();
+    this.mapCapture = new MapCapture(process.env.TEMP_OUTPUT_DIR || "./temp");
     this.thumbnailService = new ThumbnailService();
+    this.processingSteps = new Map();
   }
 
   private async updateJobStatus(
     jobId: string,
-    status: "processing" | "completed" | "error",
+    status: VideoGenerationStatus,
     error?: string
   ): Promise<void> {
     console.log("Updating job status:", { jobId, status, error });
     await prismaClient.videoJob.update({
       where: { id: jobId },
       data: {
-        status: status.toUpperCase() as VideoGenerationStatus,
-        ...(error && { error }),
+        status,
+        error,
       },
     });
   }
 
   private parseS3Path(s3Path: string): { bucket: string; key: string } {
-    try {
-      const url = new URL(s3Path);
-      const bucket = url.hostname.split(".")[0];
-      const key = url.pathname.substring(1); // Remove leading slash
-      return { bucket, key };
-    } catch (error) {
-      // If not a URL, try the old s3:// format
-      const [, bucket, ...keyParts] = s3Path.replace("s3://", "").split("/");
-      return { bucket, key: keyParts.join("/") };
-    }
+    return this.imageToVideoConverter.parseS3Path(s3Path);
   }
 
-  private async downloadFromS3(s3Path: string): Promise<string> {
-    console.log("Downloading from S3:", { s3Path });
+  private async downloadFromS3(
+    s3Path: string,
+    outputPath?: string
+  ): Promise<string> {
     try {
-      const s3Client = new S3Client({ region: process.env.AWS_REGION });
-      const { bucket, key } = this.parseS3Path(s3Path);
-      const localPath = path.join(os.tmpdir(), path.basename(key));
+      // Use ImageToVideoConverter's comprehensive processing
+      const { localWebpPath, uploadPromise } =
+        await this.imageToVideoConverter.processImage(s3Path);
 
-      console.log("Parsed S3 path:", { bucket, key, localPath });
+      // Wait for the upload to complete to ensure consistency
+      await uploadPromise;
 
-      const command = new GetObjectCommand({
-        Bucket: bucket,
-        Key: decodeURIComponent(key), // Decode the URL-encoded key
-      });
-
-      const response = await s3Client.send(command);
-
-      if (response.Body) {
-        const writeStream = fs.createWriteStream(localPath);
-        await new Promise((resolve, reject) => {
-          if (response.Body instanceof Readable) {
-            response.Body.pipe(writeStream)
-              .on("finish", () => {
-                console.log("S3 download complete:", { localPath });
-                resolve(localPath);
-              })
-              .on("error", reject);
-          } else {
-            reject(new Error("Invalid response body type"));
-          }
-        });
-      }
-
-      return localPath;
+      return localWebpPath;
     } catch (error) {
-      console.error("Error downloading from S3:", {
+      console.error("S3 download and processing failed:", {
         error: error instanceof Error ? error.message : "Unknown error",
         s3Path,
+        outputPath,
       });
       throw error;
     }
@@ -136,22 +112,19 @@ export class ProductionPipeline {
     localPath: string,
     destinationPath: string
   ): Promise<string> {
-    const s3Client = new S3Client({ region: process.env.AWS_REGION });
-    const { bucket, key } = this.parseS3Path(destinationPath);
-
-    const fileStream = fs.createReadStream(localPath);
-    const upload = new Upload({
-      client: s3Client,
-      params: {
-        Bucket: bucket,
-        Key: key,
-        Body: fileStream,
-        ContentType: "image/webp",
-      },
-    });
-
-    await upload.done();
-    return `s3://${bucket}/${key}`;
+    try {
+      await this.imageToVideoConverter.uploadToS3(localPath, destinationPath);
+      return `s3://${this.parseS3Path(destinationPath).bucket}/${
+        this.parseS3Path(destinationPath).key
+      }`;
+    } catch (error) {
+      console.error("S3 upload failed:", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        localPath,
+        destinationPath,
+      });
+      throw error;
+    }
   }
 
   private async cleanupFile(filePath: string): Promise<void> {
@@ -164,7 +137,6 @@ export class ProductionPipeline {
 
   private async checkWebPExists(s3Path: string): Promise<boolean> {
     try {
-      const s3Client = new S3Client({ region: process.env.AWS_REGION });
       const webpS3Path = s3Path.replace(/\.[^.]+$/, ".webp");
       const { bucket, key } = this.parseS3Path(webpS3Path);
 
@@ -173,7 +145,7 @@ export class ProductionPipeline {
         Key: key,
       });
 
-      await s3Client.send(command);
+      await this.s3Client.send(command);
       return true;
     } catch (error) {
       return false;
@@ -198,103 +170,84 @@ export class ProductionPipeline {
     };
   }
 
-  private async processImage(
-    s3Path: string,
-    isRegeneration: boolean = false
-  ): Promise<{
+  private async processImage(s3Path: string): Promise<{
     localWebpPath: string;
     s3WebpPath: string;
-    uploadPromise: Promise<void>;
+    uploadPromise: Promise<any>;
   }> {
-    // For regeneration, directly use the processed WebP path
-    if (isRegeneration) {
-      const originalKey = this.parseS3Path(s3Path).key;
-      const photo = await prismaClient.photo.findFirst({
-        where: {
-          filePath: originalKey,
-          processedFilePath: { not: null },
-        },
-      });
+    // Create a unique process directory
+    const processDir = path.join(
+      os.tmpdir(),
+      `process-${Date.now()}-${Math.random().toString(36).substring(7)}`
+    );
+    await fs.promises.mkdir(processDir, { recursive: true });
 
-      if (!photo?.processedFilePath) {
-        throw new Error(`WebP version not found for image: ${originalKey}`);
-      }
-
-      // Construct S3 path for the WebP and download it
-      const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${photo.processedFilePath}`;
-      const localWebpPath = await this.downloadFromS3(s3WebpPath);
-
-      return {
-        localWebpPath,
-        s3WebpPath,
-        uploadPromise: Promise.resolve(), // No need to upload since it already exists
-      };
-    }
-
-    // First check if WebP version exists in the database
+    // Check if WebP version already exists
     const originalKey = this.parseS3Path(s3Path).key;
     const existingPhoto = await prismaClient.photo.findFirst({
-      where: {
-        filePath: originalKey,
-        processedFilePath: { not: null },
-      },
+      where: { filePath: originalKey, processedFilePath: { not: null } },
     });
 
     if (existingPhoto?.processedFilePath) {
-      console.log("Found existing WebP in database:", {
-        originalPath: originalKey,
-        webpPath: existingPhoto.processedFilePath,
-      });
-
       const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${existingPhoto.processedFilePath}`;
-      const localWebpPath = await this.downloadFromS3(s3WebpPath);
+      const localWebpPath = path.join(
+        processDir,
+        path.basename(existingPhoto.processedFilePath)
+      );
+      await this.downloadFromS3(s3WebpPath, localWebpPath);
 
       return {
         localWebpPath,
         s3WebpPath,
-        uploadPromise: Promise.resolve(), // No need to upload since it already exists
+        uploadPromise: Promise.resolve(),
       };
     }
 
     // If no WebP exists, proceed with the original conversion process
     let originalPath: string | null = null;
     let webpPath: string | null = null;
+    let uploadPromise: Promise<any> = Promise.resolve();
 
     try {
-      // Download original
-      originalPath = await this.downloadFromS3(s3Path);
+      // Download original to the process directory
+      originalPath = path.join(processDir, path.basename(s3Path));
+      await this.downloadFromS3(s3Path, originalPath);
 
-      // Convert to WebP
-      webpPath = await this.imageToVideoConverter.convertToWebP(
-        originalPath,
-        path.join(
-          os.tmpdir(),
-          `${Date.now()}-${path.basename(s3Path, path.extname(s3Path))}.webp`
-        ),
-        {
-          quality: 80,
-          width: 1080,
-          height: 1920,
-          fit: "cover",
-        }
+      // Validate the downloaded image
+      const validation = await this.imageToVideoConverter.validateImage(
+        originalPath
       );
+      if (!validation.isValid) {
+        throw new Error(`Invalid image: ${validation.error}`);
+      }
+
+      // Convert to WebP in the same process directory
+      webpPath = path.join(
+        processDir,
+        `${path.basename(s3Path, path.extname(s3Path))}.webp`
+      );
+
+      await this.imageToVideoConverter.convertToWebP(originalPath, webpPath, {
+        quality: 80,
+        width: 1080,
+        height: 1920,
+        fit: "cover",
+      });
 
       // Create upload promise that includes S3 upload and database update
       const webpS3Path = s3Path.replace(/\.[^.]+$/, ".webp");
-      const uploadPromise = this.uploadToS3(webpPath, webpS3Path)
-        .then(() => {
+      uploadPromise = this.uploadToS3(webpPath, webpS3Path)
+        .then(async () => {
           // Update the photo record in the database with the WebP path
-          const originalKey = this.parseS3Path(s3Path).key;
           const webpKey = this.parseS3Path(webpS3Path).key;
-          return prismaClient.photo.updateMany({
+          await prismaClient.photo.updateMany({
             where: { filePath: originalKey },
             data: { processedFilePath: webpKey },
           });
-        })
-        .then(() => {
+
           console.log("Updated photo record with WebP path:", {
-            original: this.parseS3Path(s3Path).key,
-            webp: this.parseS3Path(webpS3Path).key,
+            original: originalKey,
+            webp: webpKey,
           });
         })
         .catch((error) => {
@@ -302,7 +255,18 @@ export class ProductionPipeline {
             error: error instanceof Error ? error.message : "Unknown error",
             s3Path: webpS3Path,
           });
-          throw error; // Re-throw to handle in the main pipeline
+          throw error;
+        })
+        .finally(async () => {
+          try {
+            // Clean up the process directory after upload is complete
+            await fs.promises.rm(processDir, { recursive: true, force: true });
+          } catch (error) {
+            console.error("Failed to cleanup process directory:", {
+              dir: processDir,
+              error: error instanceof Error ? error.message : "Unknown error",
+            });
+          }
         });
 
       return {
@@ -311,14 +275,24 @@ export class ProductionPipeline {
         uploadPromise,
       };
     } catch (error) {
+      // Clean up on error
+      try {
+        await fs.promises.rm(processDir, { recursive: true, force: true });
+      } catch (cleanupError) {
+        console.error("Failed to cleanup on error:", {
+          dir: processDir,
+          error:
+            cleanupError instanceof Error
+              ? cleanupError.message
+              : "Unknown error",
+        });
+      }
+
       console.error("Error processing image:", {
         s3Path,
         error: error instanceof Error ? error.message : "Unknown error",
       });
       throw error;
-    } finally {
-      // Only cleanup the original file, keep WebP for processing
-      if (originalPath) await this.cleanupFile(originalPath);
     }
   }
 
@@ -384,7 +358,7 @@ export class ProductionPipeline {
     try {
       const results = await Promise.all(
         input.map(async (file) => {
-          const result = await this.processImage(file, isRegeneration);
+          const result = await this.processImage(file);
           return result.localWebpPath;
         })
       );
@@ -539,12 +513,35 @@ export class ProductionPipeline {
 
       // Process map video if needed
       let mapVideoPath: string | undefined;
-      if (coordinates && template.toLowerCase().includes("google_zoom")) {
-        const mapFrames = await this.mapCapture.captureMapAnimation(
-          job.listing.address
-        );
-        if (mapFrames.length > 0) {
+      if (template === "googlezoomintro") {
+        if (!coordinates) {
+          throw new Error(
+            "Coordinates are required for Google Maps zoom template"
+          );
+        }
+
+        if (!process.env.GOOGLE_MAPS_API_KEY) {
+          throw new Error("Google Maps API key is not configured");
+        }
+
+        try {
+          const mapFrames = await this.mapCapture.captureMapAnimation(
+            job.listing.address,
+            coordinates
+          );
+
+          if (!mapFrames || mapFrames.length === 0) {
+            throw new Error("Failed to generate map frames");
+          }
+
           mapVideoPath = mapFrames[0];
+          console.log("Successfully generated map video:", mapVideoPath);
+        } catch (error) {
+          throw new Error(
+            `Failed to generate map video: ${
+              error instanceof Error ? error.message : "Unknown error"
+            }`
+          );
         }
       }
 
@@ -604,7 +601,7 @@ export class ProductionPipeline {
       });
       await this.updateJobStatus(
         jobId,
-        "error",
+        VideoGenerationStatus.FAILED,
         error instanceof Error ? error.message : "Unknown error"
       );
       throw error;
@@ -629,7 +626,7 @@ export class ProductionPipeline {
 
     try {
       // Update job status
-      await this.updateJobStatus(jobId, "processing");
+      await this.updateJobStatus(jobId, VideoGenerationStatus.PROCESSING);
 
       // Regenerate videos for selected photos
       const regeneratedVideos =
@@ -643,16 +640,18 @@ export class ProductionPipeline {
           if (regeneratedIndex !== -1) {
             return regeneratedVideos[regeneratedIndex];
           }
-          // @ts-ignore - property exists after Prisma generate
           return photo.runwayVideoPath || null;
         })
-        .filter(Boolean) as string[]; // Type assertion after filtering out nulls
+        .filter(Boolean) as string[];
+
+      if (!job.template) {
+        throw new Error("Job template is required");
+      }
 
       // Create a new final video with the updated segments
       const outputPath = await this.imageToVideoConverter.createTemplate(
         job.template as TemplateKey,
-        videoSegments,
-        undefined // mapVideoPath if needed
+        videoSegments
       );
 
       // Upload the new video to S3
@@ -667,7 +666,7 @@ export class ProductionPipeline {
         where: { id: jobId },
         data: {
           outputFile: s3Url,
-          status: "COMPLETED",
+          status: VideoGenerationStatus.COMPLETED,
           error: null,
         },
       });
@@ -675,7 +674,7 @@ export class ProductionPipeline {
       console.error("Error during photo regeneration:", error);
       await this.updateJobStatus(
         jobId,
-        "error",
+        VideoGenerationStatus.FAILED,
         error instanceof Error
           ? error.message
           : "Unknown error during regeneration"
