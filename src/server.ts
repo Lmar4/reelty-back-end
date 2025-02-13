@@ -44,6 +44,7 @@ app.use("/api/listings", listingsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/photos", photosRouter);
 app.use("/api/templates", templatesRouter);
+app.use("/api/jobs", jobsRouter);
 // Mount all admin routes under /api/admin
 app.use("/api/admin", adminRouter);
 app.use("/api/queue", queueRouter);
