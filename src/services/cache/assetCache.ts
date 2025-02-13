@@ -1,23 +1,50 @@
 import { PrismaClient, Prisma } from "@prisma/client";
 import { createHash } from "crypto";
+import { TempFile } from "../storage/temp-file.service";
 
-interface CachedAsset {
+export type AssetType = "webp" | "video" | "map" | "ffmpeg" | "runway";
+
+export interface CachedAsset {
   id: string;
-  type: "webp" | "video" | "map";
+  type: AssetType;
   path: string;
+  cacheKey: string;
   metadata: {
     timestamp: Date;
     settings: Record<string, unknown>;
     hash: string;
+    index?: number;
   };
+}
+
+interface LockOptions {
+  timeout?: number;
+  retryInterval?: number;
+  maxRetries?: number;
+}
+
+const DEFAULT_LOCK_OPTIONS: Required<LockOptions> = {
+  timeout: 30000, // 30 seconds
+  retryInterval: 1000, // 1 second
+  maxRetries: 5,
+};
+
+export interface ProcessedImage {
+  webpPath: TempFile;
+  s3WebpPath: string;
+  uploadPromise: Promise<void>;
 }
 
 export class AssetCacheService {
   private static instance: AssetCacheService;
   private prisma: PrismaClient;
+  private processId: string;
 
   private constructor() {
     this.prisma = new PrismaClient();
+    this.processId = `process_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2)}`;
   }
 
   public static getInstance(): AssetCacheService {
@@ -27,88 +54,243 @@ export class AssetCacheService {
     return AssetCacheService.instance;
   }
 
-  private generateHash(
-    input: string,
-    settings?: Record<string, unknown>
+  public generateCacheKey(
+    type: AssetType,
+    settings: Record<string, unknown>
   ): string {
-    const content = settings ? `${input}-${JSON.stringify(settings)}` : input;
-    return createHash("sha256").update(content).digest("hex");
+    const settingsStr = JSON.stringify(settings, Object.keys(settings).sort());
+    return createHash("sha256").update(`${type}:${settingsStr}`).digest("hex");
   }
 
-  async getCachedAsset(
-    input: string,
-    type: CachedAsset["type"],
-    settings?: Record<string, unknown>
-  ): Promise<CachedAsset | null> {
-    const hash = this.generateHash(input, settings);
+  public generateHash(path: string): string {
+    return createHash("sha256").update(path).digest("hex");
+  }
 
-    const cachedAsset = await this.prisma.processedAsset.findFirst({
+  private async cleanupExpiredLocks(): Promise<void> {
+    await this.prisma.cacheLock.deleteMany({
       where: {
-        hash,
-        type,
+        expiresAt: {
+          lt: new Date(),
+        },
       },
     });
+  }
 
-    if (!cachedAsset) {
-      return null;
+  private async acquireLock(
+    key: string,
+    options: LockOptions = {}
+  ): Promise<boolean> {
+    const opts = { ...DEFAULT_LOCK_OPTIONS, ...options };
+    let retries = 0;
+
+    while (retries < opts.maxRetries) {
+      try {
+        await this.cleanupExpiredLocks();
+
+        // Try to acquire the lock using a transaction
+        await this.prisma.$transaction(async (tx) => {
+          const existingLock = await tx.cacheLock.findUnique({
+            where: { key },
+          });
+
+          if (existingLock) {
+            if (existingLock.expiresAt < new Date()) {
+              // Lock has expired, we can take it
+              await tx.cacheLock.update({
+                where: { key },
+                data: {
+                  owner: this.processId,
+                  expiresAt: new Date(Date.now() + opts.timeout),
+                  updatedAt: new Date(),
+                },
+              });
+            } else {
+              throw new Error("Lock is held by another process");
+            }
+          } else {
+            // Create new lock
+            await tx.cacheLock.create({
+              data: {
+                key,
+                owner: this.processId,
+                expiresAt: new Date(Date.now() + opts.timeout),
+              },
+            });
+          }
+        });
+
+        return true;
+      } catch (error) {
+        retries++;
+        if (retries >= opts.maxRetries) {
+          console.error("Failed to acquire lock after max retries:", {
+            key,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          return false;
+        }
+        await new Promise((resolve) => setTimeout(resolve, opts.retryInterval));
+      }
     }
 
-    return this.mapToCachedAsset(cachedAsset);
+    return false;
   }
 
-  async cacheAsset(asset: Omit<CachedAsset, "id">): Promise<CachedAsset> {
-    const hash = this.generateHash(asset.path, asset.metadata.settings);
+  private async releaseLock(key: string): Promise<void> {
+    try {
+      await this.prisma.cacheLock.deleteMany({
+        where: {
+          key,
+          owner: this.processId,
+        },
+      });
+    } catch (error) {
+      console.error("Error releasing lock:", {
+        key,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
 
-    const cachedAsset = await this.prisma.processedAsset.create({
-      data: {
-        type: asset.type,
+  async getCachedAsset(cacheKey: string): Promise<CachedAsset | null> {
+    const lockAcquired = await this.acquireLock(`read_${cacheKey}`);
+    if (!lockAcquired) {
+      throw new Error("Failed to acquire read lock for cache operation");
+    }
+
+    try {
+      const asset = await this.prisma.processedAsset.findUnique({
+        where: { cacheKey },
+      });
+
+      if (!asset) {
+        return null;
+      }
+
+      return {
+        id: asset.id,
+        type: asset.type as AssetType,
         path: asset.path,
-        hash,
-        settings: asset.metadata.settings as Prisma.InputJsonValue,
-      },
-    });
+        cacheKey: asset.cacheKey,
+        metadata: {
+          timestamp: asset.createdAt,
+          settings: asset.settings as Record<string, unknown>,
+          hash: asset.hash,
+        },
+      };
+    } finally {
+      await this.releaseLock(`read_${cacheKey}`);
+    }
+  }
 
-    return this.mapToCachedAsset(cachedAsset);
+  async cacheAsset(asset: {
+    type: AssetType;
+    path: string;
+    cacheKey: string;
+    metadata: {
+      timestamp: Date;
+      settings: Record<string, unknown>;
+      hash: string;
+    };
+  }): Promise<CachedAsset> {
+    const lockAcquired = await this.acquireLock(`write_${asset.cacheKey}`);
+    if (!lockAcquired) {
+      throw new Error("Failed to acquire write lock for cache operation");
+    }
+
+    try {
+      const processedAsset = await this.prisma.processedAsset.create({
+        data: {
+          type: asset.type,
+          path: asset.path,
+          cacheKey: asset.cacheKey,
+          hash: asset.metadata.hash,
+          settings: asset.metadata.settings as Prisma.InputJsonValue,
+        },
+      });
+
+      return {
+        id: processedAsset.id,
+        type: processedAsset.type as AssetType,
+        path: processedAsset.path,
+        cacheKey: processedAsset.cacheKey,
+        metadata: {
+          timestamp: processedAsset.createdAt,
+          settings: processedAsset.settings as Record<string, unknown>,
+          hash: processedAsset.hash,
+        },
+      };
+    } finally {
+      await this.releaseLock(`write_${asset.cacheKey}`);
+    }
   }
 
   async invalidateAsset(id: string): Promise<void> {
-    await this.prisma.processedAsset.delete({
+    const asset = await this.prisma.processedAsset.findUnique({
       where: { id },
     });
+
+    if (!asset) return;
+
+    const lockAcquired = await this.acquireLock(`invalidate_${asset.cacheKey}`);
+    if (!lockAcquired) {
+      throw new Error("Failed to acquire lock for cache invalidation");
+    }
+
+    try {
+      await this.prisma.processedAsset.delete({
+        where: { id },
+      });
+    } finally {
+      await this.releaseLock(`invalidate_${asset.cacheKey}`);
+    }
   }
 
-  async invalidateByType(type: CachedAsset["type"]): Promise<void> {
-    await this.prisma.processedAsset.deleteMany({
-      where: { type },
-    });
+  async invalidateByType(type: AssetType): Promise<void> {
+    const lockAcquired = await this.acquireLock(`invalidate_type_${type}`);
+    if (!lockAcquired) {
+      throw new Error("Failed to acquire lock for type invalidation");
+    }
+
+    try {
+      await this.prisma.processedAsset.deleteMany({
+        where: { type },
+      });
+    } finally {
+      await this.releaseLock(`invalidate_type_${type}`);
+    }
   }
 
   async getAssetsByInput(input: string): Promise<CachedAsset[]> {
     const hash = this.generateHash(input);
+    const lockAcquired = await this.acquireLock(`read_input_${hash}`);
+    if (!lockAcquired) {
+      console.warn("Failed to acquire read lock for input hash:", hash);
+      return [];
+    }
 
-    const assets = await this.prisma.processedAsset.findMany({
-      where: {
-        hash: {
-          startsWith: hash.substring(0, 32), // Use first 32 chars for partial matching
+    try {
+      const assets = await this.prisma.processedAsset.findMany({
+        where: {
+          hash: {
+            startsWith: hash.substring(0, 32),
+          },
         },
-      },
-    });
+      });
 
-    return assets.map(this.mapToCachedAsset);
-  }
-
-  private mapToCachedAsset(
-    asset: Prisma.ProcessedAssetGetPayload<{}>
-  ): CachedAsset {
-    return {
-      id: asset.id,
-      type: asset.type as CachedAsset["type"],
-      path: asset.path,
-      metadata: {
-        timestamp: asset.createdAt,
-        settings: (asset.settings as Record<string, unknown>) ?? {},
-        hash: asset.hash,
-      },
-    };
+      return assets.map((asset) => ({
+        id: asset.id,
+        type: asset.type as AssetType,
+        path: asset.path,
+        cacheKey: asset.cacheKey,
+        metadata: {
+          timestamp: asset.createdAt,
+          settings: (asset.settings as Record<string, unknown>) ?? {},
+          hash: asset.hash,
+        },
+      }));
+    } finally {
+      await this.releaseLock(`read_input_${hash}`);
+    }
   }
 }
