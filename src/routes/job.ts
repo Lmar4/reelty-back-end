@@ -23,19 +23,45 @@ async function recoverPendingJobs() {
     const pendingJobs = await prisma.videoJob.findMany({
       where: {
         status: "QUEUED",
+        createdAt: {
+          // Only recover jobs from the last 24 hours
+          gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
+        },
       },
       include: {
         listing: true,
       },
+      orderBy: {
+        createdAt: "desc",
+      },
+      // Limit the number of jobs to recover
+      take: 5,
     });
 
     if (pendingJobs.length > 0) {
       console.log(
         `[RECOVERY] Found ${pendingJobs.length} pending jobs to recover`
       );
+
+      // Process jobs one at a time to avoid overwhelming the system
       for (const job of pendingJobs) {
+        // Check if there's already a processing job for this listing
+        const existingProcessingJob = await prisma.videoJob.findFirst({
+          where: {
+            listingId: job.listingId,
+            status: "PROCESSING",
+          },
+        });
+
+        if (existingProcessingJob) {
+          console.log(
+            `[RECOVERY] Skipping job ${job.id} as listing ${job.listingId} already has a processing job`
+          );
+          continue;
+        }
+
         console.log(`[RECOVERY] Restarting job: ${job.id}`);
-        productionPipeline
+        await productionPipeline
           .execute({
             jobId: job.id,
             inputFiles: Array.isArray(job.inputFiles)
@@ -52,6 +78,9 @@ async function recoverPendingJobs() {
               error: error instanceof Error ? error.message : "Unknown error",
             });
           });
+
+        // Wait a bit before processing the next job
+        await new Promise((resolve) => setTimeout(resolve, 5000));
       }
     } else {
       console.log("[RECOVERY] No pending jobs found");
@@ -334,78 +363,52 @@ const deleteJob: RequestHandler = async (req, res) => {
 // Regenerate specific job
 const regenerateJob: RequestHandler = async (req, res) => {
   try {
-    const { jobId } = req.params;
-    console.log("[REGENERATE_JOB] Starting regeneration:", {
-      jobId,
-      userId: req.user?.id,
-    });
+    const jobId = req.params.jobId;
+    const userId = req.user!.id;
 
-    // Find the existing job
-    const existingJob = await prisma.videoJob.findUnique({
+    const recentRegenerations = await prisma.videoJob.count({
       where: {
-        id: jobId,
-        userId: req.user!.id,
-      },
-      include: {
-        listing: true,
+        userId,
+        createdAt: {
+          gte: new Date(Date.now() - 1000 * 60 * 60),
+        },
+        status: "QUEUED",
       },
     });
 
-    console.log("[REGENERATE_JOB] Found existing job:", {
-      jobId,
-      listingId: existingJob?.listingId,
-      template: existingJob?.template,
-      inputFilesCount: Array.isArray(existingJob?.inputFiles)
-        ? existingJob.inputFiles.length
-        : 0,
-    });
-
-    if (!existingJob) {
-      res.status(404).json({
-        success: false,
-        error: "Job not found",
+    if (recentRegenerations >= 5) {
+      res.status(429).json({
+        error: "Too many regeneration attempts. Please try again later.",
       });
       return;
     }
 
-    // Create a new job with the same parameters
-    const template = await prisma.template.findFirst({
-      where: {
-        name: "googlezoomintro",
-      },
+    const existingJob = await prisma.videoJob.findUnique({
+      where: { id: jobId },
+      include: { listing: true },
     });
 
-    if (!template) {
-      throw new Error("Template 'googlezoomintro' not found in database");
+    if (!existingJob) {
+      res.status(404).json({ error: "Job not found" });
+      return;
+    }
+
+    if (existingJob.userId !== userId) {
+      res.status(403).json({ error: "Not authorized" });
+      return;
     }
 
     const newJob = await prisma.videoJob.create({
       data: {
-        userId: req.user!.id,
+        userId,
         listingId: existingJob.listingId,
         status: "QUEUED",
-        template: template.name || "googlezoomintro",
-        inputFiles: existingJob.inputFiles || [],
-      },
-      include: {
-        listing: true,
+        template: existingJob.template,
+        inputFiles: existingJob.inputFiles as any,
+        priority: existingJob.priority,
       },
     });
 
-    console.log("[REGENERATE_JOB] Created new job:", {
-      newJobId: newJob.id,
-      template: newJob.template,
-      listingId: newJob.listingId,
-      inputFilesCount: Array.isArray(newJob.inputFiles)
-        ? newJob.inputFiles.length
-        : 0,
-    });
-
-    // Start the production pipeline asynchronously
-    console.log(
-      "[REGENERATE_JOB] Starting production pipeline for job:",
-      newJob.id
-    );
     productionPipeline
       .execute({
         jobId: newJob.id,
@@ -413,31 +416,23 @@ const regenerateJob: RequestHandler = async (req, res) => {
           ? newJob.inputFiles.map(String)
           : [],
         template: newJob.template || "googlezoomintro",
-        coordinates: (
-          await prisma.listing.findUnique({ where: { id: newJob.listingId } })
-        )?.coordinates as { lat: number; lng: number } | undefined,
+        coordinates: existingJob.listing?.coordinates as
+          | { lat: number; lng: number }
+          | undefined,
       })
       .catch((error) => {
-        console.error("[REGENERATE_JOB] Production pipeline error:", {
+        console.error("[REGENERATE] Production pipeline error:", {
           jobId: newJob.id,
           error: error instanceof Error ? error.message : "Unknown error",
         });
       });
 
-    res.status(201).json({
-      success: true,
-      data: newJob,
-    });
+    res.json(newJob);
   } catch (error) {
-    console.error("[REGENERATE_JOB] Error:", {
-      error: error instanceof Error ? error.message : "Unknown error",
-      jobId: req.params.jobId,
-      userId: req.user?.id,
-      stack: error instanceof Error ? error.stack : undefined,
-    });
+    console.error("[REGENERATE_JOB]", error);
     res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
+      error:
+        error instanceof Error ? error.message : "Failed to regenerate job",
     });
   }
 };

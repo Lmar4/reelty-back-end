@@ -99,7 +99,9 @@ router.post(
       });
 
       // Get all photo URLs in order
-      const photoUrls = photo.listing.photos.map((p) => p.filePath);
+      const photoUrls = photo.listing.photos.map(
+        (p: { filePath: string }) => p.filePath
+      );
 
       // Start the regeneration process in the background
       productionPipeline
@@ -130,6 +132,178 @@ router.post(
     } catch (error) {
       logger.error("[PHOTO_REGENERATE_ERROR] Request failed", {
         photoId: req.params.photoId,
+        userId: req.user?.id,
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      res.status(500).json({
+        success: false,
+        message:
+          error instanceof Error ? error.message : "Unknown error occurred",
+      });
+    }
+  }
+);
+
+// Batch regenerate photos
+router.post(
+  "/regenerate",
+  isAuthenticated,
+  async (req: Request, res: Response): Promise<void> => {
+    logger.info("[PHOTOS_BATCH_REGENERATE] Received request", {
+      userId: req.user?.id,
+      body: req.body,
+    });
+
+    try {
+      const { photoIds } = req.body;
+      const userId = req.user!.id;
+
+      const MAX_BATCH_SIZE = 20;
+
+      if (!Array.isArray(photoIds) || photoIds.length === 0) {
+        res.status(400).json({
+          success: false,
+          message: "Invalid photo IDs array",
+        });
+        return;
+      }
+
+      if (photoIds.length > MAX_BATCH_SIZE) {
+        res.status(400).json({
+          success: false,
+          message: `Cannot process more than ${MAX_BATCH_SIZE} photos at once`,
+        });
+        return;
+      }
+
+      logger.info("[PHOTOS_BATCH_REGENERATE] Finding photos", {
+        photoIds,
+        userId,
+      });
+
+      // Find all photos and check ownership
+      const photos = await prisma.photo.findMany({
+        where: {
+          id: { in: photoIds },
+          userId,
+        },
+        include: {
+          listing: {
+            include: {
+              photos: {
+                orderBy: {
+                  order: "asc",
+                },
+              },
+            },
+          },
+        },
+      });
+
+      // Find which photos were not accessible
+      const foundPhotoIds = new Set(photos.map((photo) => photo.id));
+      const inaccessiblePhotoIds = photoIds.filter(
+        (id) => !foundPhotoIds.has(id)
+      );
+
+      if (photos.length === 0) {
+        logger.error(
+          "[PHOTOS_BATCH_REGENERATE] No photos found or access denied",
+          {
+            photoIds,
+            userId,
+          }
+        );
+        res.status(404).json({
+          success: false,
+          message: "No photos found or access denied",
+          data: {
+            inaccessiblePhotoIds: photoIds,
+          },
+        });
+        return;
+      }
+
+      // Group photos by listing
+      const photosByListing = photos.reduce((acc, photo) => {
+        if (!photo.listing) return acc;
+        if (!acc[photo.listingId]) {
+          acc[photo.listingId] = {
+            listing: photo.listing,
+            photos: [],
+          };
+        }
+        acc[photo.listingId].photos.push(photo);
+        return acc;
+      }, {} as Record<string, { listing: any; photos: typeof photos }>);
+
+      // Create jobs for each listing
+      const jobs = await Promise.all(
+        Object.values(photosByListing).map(async ({ listing }) => {
+          // Create a new job for regeneration
+          const job = await prisma.videoJob.create({
+            data: {
+              listingId: listing.id,
+              userId,
+              status: VideoGenerationStatus.PROCESSING,
+              template: "default",
+            },
+          });
+
+          logger.info("[PHOTOS_BATCH_REGENERATE] Created video job", {
+            jobId: job.id,
+            listingId: listing.id,
+            photoCount: listing.photos.length,
+          });
+
+          // Get all photo URLs in order
+          const photoUrls = listing.photos.map(
+            (p: { filePath: string }) => p.filePath
+          );
+
+          // Start the regeneration process in the background
+          productionPipeline
+            .execute({
+              jobId: job.id,
+              inputFiles: photoUrls,
+              template: "default",
+              coordinates: listing.coordinates as any,
+            })
+            .catch((error) => {
+              logger.error(
+                "[PHOTOS_BATCH_REGENERATE_ERROR] Pipeline execution failed",
+                {
+                  jobId: job.id,
+                  error:
+                    error instanceof Error ? error.message : "Unknown error",
+                  stack: error instanceof Error ? error.stack : undefined,
+                }
+              );
+            });
+
+          return job;
+        })
+      );
+
+      logger.info("[PHOTOS_BATCH_REGENERATE] Sending success response", {
+        jobIds: jobs.map((job) => job.id),
+        inaccessiblePhotoIds,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: "Photo regeneration started",
+        data: {
+          jobs: jobs.map((job) => ({
+            id: job.id,
+            listingId: job.listingId,
+          })),
+          inaccessiblePhotoIds,
+        },
+      });
+    } catch (error) {
+      logger.error("[PHOTOS_BATCH_REGENERATE_ERROR] Request failed", {
         userId: req.user?.id,
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,
