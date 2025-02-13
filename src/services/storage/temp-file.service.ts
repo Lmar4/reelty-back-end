@@ -20,6 +20,55 @@ export class TempFileManager {
     await fs.promises.mkdir(this.baseDir, { recursive: true });
   }
 
+  public async createDirectory(name: string): Promise<TempFile> {
+    const sessionId = uuidv4();
+    const directory = path.join(this.baseDir, sessionId, name);
+    await fs.promises.mkdir(directory, { recursive: true });
+
+    const cleanup = async () => {
+      try {
+        await fs.promises.rm(directory, { recursive: true, force: true });
+      } catch (error) {
+        console.error("Failed to cleanup temp directory:", {
+          directory,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
+    };
+
+    return {
+      path: directory,
+      filename: name,
+      cleanup,
+    };
+  }
+
+  public async createFile(filename: string): Promise<TempFile> {
+    const sessionId = uuidv4();
+    const directory = path.join(this.baseDir, sessionId);
+    await fs.promises.mkdir(directory, { recursive: true });
+
+    const cleanFilename = path.basename(filename).split("?")[0];
+    const filePath = path.join(directory, cleanFilename);
+
+    const cleanup = async () => {
+      try {
+        await fs.promises.rm(directory, { recursive: true, force: true });
+      } catch (error) {
+        console.error("Failed to cleanup temp directory:", {
+          directory,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
+    };
+
+    return {
+      path: filePath,
+      filename: cleanFilename,
+      cleanup,
+    };
+  }
+
   public async createTempPath(
     originalFilename: string,
     subDir?: string
