@@ -231,7 +231,11 @@ export class ProductionPipeline {
                 type: "webp",
                 path: result.s3WebpPath,
                 cacheKey,
-                metadata: step.settings,
+                metadata: {
+                  ...step.settings,
+                  timestamp: new Date(),
+                  hash: this.assetCache.generateHash(result.s3WebpPath),
+                },
               });
 
               await this.updateJobStatus(
