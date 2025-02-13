@@ -15,9 +15,7 @@ export class VideoQueueService {
 
   private constructor() {
     this.prisma = new PrismaClient();
-    this.imageToVideoConverter = new ImageToVideoConverter(
-      process.env.RUNWAYML_API_KEY || ""
-    );
+    this.imageToVideoConverter = ImageToVideoConverter.getInstance();
     this.startProcessing();
   }
 
