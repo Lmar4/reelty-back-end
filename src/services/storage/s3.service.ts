@@ -24,24 +24,28 @@ export class S3Service {
     });
   }
 
+  private cleanUrl(url: string): string {
+    // Remove query parameters from URL
+    return url.split("?")[0];
+  }
+
   public parseUrl(url: string): S3ParsedUrl {
+    // Clean the URL first
+    const cleanUrl = this.cleanUrl(url);
     let bucket: string;
     let key: string;
 
-    if (url.startsWith("s3://")) {
+    if (cleanUrl.startsWith("s3://")) {
       // Handle s3:// protocol
-      const [, , bucketPart, ...keyParts] = url.split("/");
+      const [, , bucketPart, ...keyParts] = cleanUrl.split("/");
       bucket = bucketPart;
       key = keyParts.join("/");
     } else {
       // Handle https:// protocol
-      const urlObj = new URL(url);
+      const urlObj = new URL(cleanUrl);
       bucket = urlObj.hostname.split(".")[0];
       key = decodeURIComponent(urlObj.pathname.substring(1));
     }
-
-    // Remove any query parameters from the key
-    key = key.split("?")[0];
 
     if (!bucket || !key) {
       throw new Error(`Invalid S3 URL format: bucket=${bucket}, key=${key}`);

@@ -2,6 +2,7 @@ import sharp from "sharp";
 import { PrismaClient } from "@prisma/client";
 import { s3Service } from "../storage/s3.service";
 import { tempFileManager, TempFile } from "../storage/temp-file.service";
+import * as path from "path";
 
 const prisma = new PrismaClient();
 
@@ -18,6 +19,16 @@ export interface ImageValidation {
 
 export class ImageProcessor {
   constructor() {}
+
+  private cleanUrl(url: string): string {
+    // Remove query parameters from URL
+    return url.split("?")[0];
+  }
+
+  private getFilenameFromUrl(url: string): string {
+    const cleanUrl = this.cleanUrl(url);
+    return path.basename(cleanUrl);
+  }
 
   public async validateImage(buffer: Buffer): Promise<ImageValidation> {
     try {
@@ -90,12 +101,15 @@ export class ImageProcessor {
     const { key: originalKey } = s3Service.parseUrl(s3Path);
     const webpKey = originalKey.replace(/\.[^.]+$/, ".webp");
 
-    // Create temp files
+    // Create temp files with clean filenames
     const originalFile = await tempFileManager.createTempPath(
-      originalKey,
+      this.getFilenameFromUrl(originalKey),
       "original"
     );
-    const webpFile = await tempFileManager.createTempPath(webpKey, "webp");
+    const webpFile = await tempFileManager.createTempPath(
+      this.getFilenameFromUrl(webpKey),
+      "webp"
+    );
 
     try {
       // Check if WebP version exists in database
