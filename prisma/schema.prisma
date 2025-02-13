@@ -338,8 +338,6 @@ model BulkDiscount {
   @@map("bulk_discounts")
 }
 
-
-
 model SubscriptionHistory {
   id            String   @id @default(uuid()) @db.Uuid
   userId        String
@@ -359,17 +357,18 @@ model SubscriptionHistory {
 
 model ProcessedAsset {
   id        String   @id @default(cuid())
-  type      String   // 'webp' | 'video' | 'map'
+  type      String   // 'webp' | 'video' | 'map' | 'ffmpeg' | 'runway'
   path      String
+  cacheKey  String   @unique
   hash      String
   settings  Json?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@index([hash])
   @@index([type])
+  @@index([cacheKey])
+  @@index([hash])
 }
-
 
 model VideoGenerationJob {
   id          String               @id @default(uuid())
@@ -390,4 +389,43 @@ model VideoGenerationJob {
   agency      User?                @relation("AgencyUsers", fields: [agencyId], references: [id], onDelete: SetNull)
 
   @@map("video_generation_jobs")
+}
+
+model CachedAsset {
+  id        String   @id @default(cuid())
+  type      String
+  path      String
+  cacheKey  String   @unique
+  metadata  Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([type])
+  @@index([cacheKey])
+}
+
+model CacheLock {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  owner     String?  // Process/request ID that owns the lock
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([key])
+  @@index([expiresAt])
+}
+
+model ListingLock {
+  id          String   @id @default(cuid())
+  listingId   String   @unique @db.Uuid
+  jobId       String   @db.Uuid
+  processId   String
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([listingId])
+  @@index([expiresAt])
+  @@map("listing_locks")
 }
