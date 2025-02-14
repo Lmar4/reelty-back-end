@@ -1,10 +1,12 @@
-import puppeteer, { Browser, Page } from "puppeteer";
+import puppeteer, { Browser } from "puppeteer";
 import * as fs from "fs";
 import * as path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import sharp from "sharp";
 import { tempFileManager } from "../storage/temp-file.service";
 import { logger } from "../../utils/logger";
+import { mapVideoCacheService } from "../map-cache/map-video-cache.service";
+import { retryService } from "../retry/retry.service";
 
 // Declare types for Google Maps objects
 declare global {
@@ -308,6 +310,29 @@ export class MapCaptureService {
       });
       throw error;
     }
+  }
+
+  public async generateMapVideo(
+    coordinates: { lat: number; lng: number },
+    jobId: string
+  ): Promise<string> {
+    return mapVideoCacheService.getOrGenerate(
+      coordinates,
+      async () => {
+        return retryService.withRetry(
+          async () => {
+            const framesDir = await this.captureMapFrames(coordinates);
+            return this.createVideo(framesDir);
+          },
+          {
+            jobId,
+            maxRetries: 3,
+            delays: [2000, 5000, 10000],
+          }
+        );
+      },
+      jobId
+    );
   }
 }
 

@@ -1,4 +1,4 @@
-import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 import { SUBSCRIPTION_TIERS } from "../../constants/subscription-tiers";
 import { JobMetadata, JobProgress } from "../../types/job-types";
 import { logger } from "../../utils/logger";

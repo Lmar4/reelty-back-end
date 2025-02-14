@@ -1,28 +1,45 @@
-import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
+import {
+  Listing,
+  Prisma,
+  PrismaClient,
+  User,
+  VideoGenerationStatus,
+  VideoJob,
+} from "@prisma/client";
+import ffmpeg from "fluent-ffmpeg";
+import * as fsPromises from "fs/promises";
 import * as path from "path";
-import { prisma } from "../../lib/prisma";
+import { AssetCacheService } from "../cache/assetCache";
+import { runwayService } from "../video/runway.service";
+import { s3VideoService } from "../video/s3-video.service";
+import { videoProcessingService } from "../video/video-processing.service";
+import { videoTemplateService } from "../video/video-template.service";
 import { imageProcessor } from "./image.service";
 import { MapCapture } from "./mapCapture";
 import { TemplateKey } from "./templates/types";
 import { VisionProcessor } from "./visionProcessor";
-import { runwayService } from "../video/runway.service";
-import { videoProcessingService } from "../video/video-processing.service";
-import { s3VideoService } from "../video/s3-video.service";
-import { videoTemplateService } from "../video/video-template.service";
-import * as fs from "fs/promises";
-import { AssetCacheService } from "../cache/assetCache";
+
+interface ProcessingStepSettings {
+  width?: number;
+  height?: number;
+  quality?: number;
+  template?: string;
+  duration?: number;
+  [key: string]: unknown;
+}
 
 interface ProcessingStep {
   id: string;
   type: "webp" | "crop" | "runway" | "ffmpeg";
   input: string[];
   output: string[];
-  settings: any;
+  settings: ProcessingStepSettings;
   status: "pending" | "processing" | "completed" | "failed";
   error?: string;
   metadata?: {
     cacheKey?: string;
     processingTime?: number;
+    localPath?: string;
   };
 }
 
@@ -38,61 +55,57 @@ interface ProductionPipelineInput {
   jobId: string;
   inputFiles: string[];
   template: string;
-  coordinates?: { lat: number; lng: number };
-  isRegeneration?: boolean;
+  coordinates?: {
+    lat: number;
+    lng: number;
+  };
+  _isRegeneration?: boolean; // Prefixed with _ to indicate it's intentionally unused
+}
+
+interface ProcessingPhoto {
+  path: string;
+  url?: string;
+  metadata?: Record<string, unknown>;
 }
 
 interface S3VideoService {
+  // Define methods for S3 video operations
   parseS3Path(path: string): { bucket: string; key: string };
   getPublicUrl(bucket: string, key: string): string;
   uploadVideo(localPath: string, s3Path: string): Promise<string>;
   checkFileExists(bucket: string, key: string): Promise<boolean>;
+  uploadFile(file: Buffer, s3Key: string): Promise<string>;
 }
 
+type VideoJobUpdateInput = Prisma.VideoJobUpdateInput;
+
+/**
+ * ProductionPipeline handles the end-to-end process of converting images to videos.
+ * The pipeline consists of three main stages:
+ * 1. WebP Processing: Convert images to WebP format
+ * 2. Runway Processing: Generate videos from WebP images
+ * 3. Template Processing: Create final videos using templates
+ */
 export class ProductionPipeline {
   private visionProcessor: VisionProcessor;
   private mapCapture: MapCapture;
-  private processingSteps: Map<string, ProcessingStep>;
   private prisma: PrismaClient;
   private assetCache: AssetCacheService;
   private readonly batchSize = 3;
-  private readonly processingLocks = new Map<string, Promise<any>>();
+  private readonly outputDir: string;
 
-  constructor() {
+  constructor(outputDir: string = process.env.TEMP_OUTPUT_DIR || "./temp") {
     this.prisma = new PrismaClient();
     this.visionProcessor = new VisionProcessor();
     this.mapCapture = new MapCapture(process.env.TEMP_OUTPUT_DIR || "./temp");
-    this.processingSteps = new Map();
     this.assetCache = AssetCacheService.getInstance();
-  }
-
-  private async withProcessingLock<T>(
-    key: string,
-    operation: () => Promise<T>
-  ): Promise<T> {
-    // Wait for any existing operation with the same key
-    const existingLock = this.processingLocks.get(key);
-    if (existingLock) {
-      await existingLock;
-    }
-
-    // Create new lock
-    const operationPromise = operation();
-    this.processingLocks.set(key, operationPromise);
-
-    try {
-      const result = await operationPromise;
-      return result;
-    } finally {
-      // Clean up lock after operation completes or fails
-      this.processingLocks.delete(key);
-    }
+    this.outputDir = outputDir;
   }
 
   private generateCacheKey(
     type: string,
     input: string | string[],
-    metadata?: any
+    metadata?: Record<string, unknown>
   ): string {
     const inputHash = Array.isArray(input) ? input.join("|") : input;
     return `${type}:${inputHash}${
@@ -100,6 +113,13 @@ export class ProductionPipeline {
     }`;
   }
 
+  /**
+   * Updates the job status and progress in the database
+   * @param jobId - The ID of the job to update
+   * @param status - The new status
+   * @param error - Optional error message
+   * @param metadata - Optional metadata including stage and progress information
+   */
   private async updateJobStatus(
     jobId: string,
     status: VideoGenerationStatus,
@@ -123,7 +143,7 @@ export class ProductionPipeline {
       userMessage = "Almost ready...";
     }
 
-    await prisma.videoJob.update({
+    await this.prisma.videoJob.update({
       where: { id: jobId },
       data: {
         status,
@@ -151,412 +171,395 @@ export class ProductionPipeline {
     });
   }
 
-  private async processWebP(
-    jobId: string,
-    input: string[],
-    isRegeneration: boolean = false
-  ): Promise<ProcessingStep> {
-    await this.updateJobStatus(
-      jobId,
-      VideoGenerationStatus.PROCESSING,
-      undefined,
-      {
-        stage: "webp",
-        currentFile: 0,
-        totalFiles: input.length,
-        progress: 0,
-      }
-    );
+  /**
+   * Processes items in batches to control concurrency
+   * @param items - Array of items to process
+   * @param processor - Function to process each item
+   * @param batchSize - Optional batch size (defaults to this.batchSize)
+   */
+  private async processBatch<T>(
+    items: T[],
+    processor: (
+      item: T,
+      index: number
+    ) => Promise<{ path: string | null; error?: string }>,
+    batchSize: number = this.batchSize
+  ): Promise<Array<{ path: string | null; error?: string }>> {
+    console.log("[BATCH_PROCESSING] Starting batch processing:", {
+      totalItems: items.length,
+      batchSize,
+      totalBatches: Math.ceil(items.length / batchSize),
+    });
 
-    const step: ProcessingStep = {
-      id: `webp-${Date.now()}`,
-      type: "webp",
-      input,
-      output: [],
-      settings: {
-        quality: 80,
-        width: 1080,
-        height: 1920,
-        fit: "cover",
-      },
-      status: "processing",
-    };
+    const results: Array<{ path: string | null; error?: string }> = new Array(
+      items.length
+    ).fill({ path: null });
+    let completedBatches = 0;
 
-    try {
-      const results = await Promise.all(
-        input.map(async (url, index) => {
-          const cacheKey = this.generateCacheKey("webp", url, step.settings);
-
-          return await this.withProcessingLock(cacheKey, async () => {
-            try {
-              // Check cache first
-              const cachedAsset = await this.assetCache.getCachedAsset(
-                cacheKey
-              );
-              if (cachedAsset) {
-                console.log("Cache hit for WebP:", { url, cachedAsset });
-                await this.updateJobStatus(
-                  jobId,
-                  VideoGenerationStatus.PROCESSING,
-                  undefined,
-                  {
-                    stage: "webp",
-                    currentFile: index + 1,
-                    totalFiles: input.length,
-                    progress: Math.round(((index + 1) / input.length) * 25),
-                  }
-                );
-                return cachedAsset.path;
-              }
-
-              let inputUrl = url;
-              if (url.includes("s3.") || url.startsWith("s3://")) {
-                const { bucket, key } = s3VideoService.parseS3Path(url);
-                const exists = await s3VideoService.checkFileExists(
-                  bucket,
-                  key
-                );
-                if (!exists) {
-                  throw new Error(`S3 file not found: ${bucket}/${key}`);
-                }
-                inputUrl = s3VideoService.getPublicUrl(bucket, key);
-              } else {
-                await fs.access(url);
-              }
-
-              const result = await imageProcessor.processImage(inputUrl);
-
-              // Cache the result
-              await this.assetCache.cacheAsset({
-                type: "webp",
-                path: result.s3WebpPath,
-                cacheKey,
-                metadata: {
-                  ...step.settings,
-                  timestamp: new Date(),
-                  hash: this.assetCache.generateHash(result.s3WebpPath),
-                },
-              });
-
-              await this.updateJobStatus(
-                jobId,
-                VideoGenerationStatus.PROCESSING,
-                undefined,
-                {
-                  stage: "webp",
-                  currentFile: index + 1,
-                  totalFiles: input.length,
-                  progress: Math.round(((index + 1) / input.length) * 25),
-                }
-              );
-
-              return result.s3WebpPath;
-            } catch (error) {
-              console.error(`Failed to process image ${index + 1}:`, error);
-              throw error;
-            }
-          });
-        })
-      );
-
-      step.output = results;
-      step.status = "completed";
-    } catch (error) {
-      step.status = "failed";
-      step.error = error instanceof Error ? error.message : "Unknown error";
-      console.error("WebP processing failed:", {
-        error: step.error,
-        input,
-        jobId,
-        isRegeneration,
+    for (let i = 0; i < items.length; i += batchSize) {
+      const batchNumber = Math.floor(i / batchSize) + 1;
+      const batch = items.slice(i, i + batchSize);
+      console.log(`[BATCH_PROCESSING] Processing batch ${batchNumber}:`, {
+        batchSize: batch.length,
+        startIndex: i,
+        endIndex: i + batch.length,
       });
 
-      await this.updateJobStatus(
-        jobId,
-        VideoGenerationStatus.FAILED,
-        `WebP processing failed: ${step.error}`
-      );
+      const batchPromises = batch.map(async (item, batchIndex) => {
+        const index = i + batchIndex;
+        try {
+          console.log(
+            `[BATCH_PROCESSING] Processing item ${index + 1}/${items.length}`
+          );
+          const result = await processor(item, index);
+          results[index] = result;
+          console.log(
+            `[BATCH_PROCESSING] Item ${index + 1}/${items.length} completed:`,
+            {
+              success: true,
+              path: result.path,
+            }
+          );
+          return result;
+        } catch (error) {
+          console.error(
+            `[BATCH_PROCESSING] Item ${index + 1}/${items.length} failed:`,
+            {
+              error: error instanceof Error ? error.message : "Unknown error",
+            }
+          );
+          results[index] = {
+            path: null,
+            error: error instanceof Error ? error.message : "Unknown error",
+          };
+          return results[index];
+        }
+      });
+
+      await Promise.all(batchPromises);
+      completedBatches++;
+      console.log(`[BATCH_PROCESSING] Batch ${batchNumber} completed:`, {
+        completedBatches,
+        totalBatches: Math.ceil(items.length / batchSize),
+        successfulItems: results.filter((r) => r.path !== null).length,
+        failedItems: results.filter((r) => r.error).length,
+      });
     }
 
-    this.processingSteps.set(step.id, step);
-    return step;
-  }
-
-  private async getCachedRunwayVideo(
-    imageUrl: string,
-    index: number
-  ): Promise<string | null> {
-    const cacheKey = this.generateCacheKey("runway", imageUrl, { index });
-    const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
-    return cachedAsset?.path || null;
-  }
-
-  private async cacheRunwayVideo(
-    imageUrl: string,
-    videoPath: string,
-    index: number
-  ): Promise<void> {
-    const cacheKey = this.generateCacheKey("runway", imageUrl, { index });
-    await this.assetCache.cacheAsset({
-      type: "runway",
-      path: videoPath,
-      cacheKey,
-      metadata: {
-        timestamp: new Date(),
-        settings: { index },
-        hash: this.generateCacheKey("runway", imageUrl, { index }),
-      },
+    console.log("[BATCH_PROCESSING] All batches completed:", {
+      totalProcessed: results.length,
+      successful: results.filter((r) => r.path !== null).length,
+      failed: results.filter((r) => r.error).length,
+      results: results.map((r, i) => ({
+        index: i,
+        success: !!r.path,
+        error: r.error,
+      })),
     });
+
+    return results;
   }
 
-  private async getCachedTemplate(
-    template: string,
-    inputVideos: string[],
-    mapVideoPath?: string
-  ): Promise<string | null> {
-    const settings = {
-      template,
-      inputs: inputVideos,
-      mapVideo: mapVideoPath,
-    };
-    const cacheKey = this.generateCacheKey("ffmpeg", template, settings);
-    const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
-    return cachedAsset?.path || null;
-  }
-
-  private async cacheTemplate(
-    template: string,
-    outputPath: string,
-    inputVideos: string[],
-    mapVideoPath?: string
-  ): Promise<void> {
-    const settings = {
-      template,
-      inputs: inputVideos,
-      mapVideo: mapVideoPath,
-    };
-    const cacheKey = this.generateCacheKey("ffmpeg", template, settings);
-    await this.assetCache.cacheAsset({
-      type: "ffmpeg",
-      path: outputPath,
-      cacheKey,
-      metadata: {
-        timestamp: new Date(),
-        settings,
-        hash: this.generateCacheKey("ffmpeg", template, settings),
-      },
-    });
-  }
-
-  private async processRunway(
-    jobId: string,
-    input: string[]
-  ): Promise<ProcessingStep> {
-    await this.updateJobStatus(
-      jobId,
-      VideoGenerationStatus.PROCESSING,
-      undefined,
-      {
-        stage: "runway",
-        currentFile: 0,
-        totalFiles: input.length,
-        progress: 25,
-      }
+  /**
+   * Processes photos to WebP format with retry logic
+   * Uses AssetCacheService for caching
+   * @param photos - Array of photos to process
+   * @param jobId - The ID of the job
+   */
+  private async processPhotosWithRetry(
+    photos: ProcessingPhoto[],
+    jobId: string
+  ): Promise<Array<{ path: string | null; error?: string }>> {
+    console.log(
+      `[${jobId}] Starting WebP processing for ${photos.length} photos`
     );
 
-    const step: ProcessingStep = {
-      id: `runway-${Date.now()}`,
-      type: "runway",
-      input,
-      output: [],
-      settings: {},
-      status: "processing",
-    };
+    const results = await this.processBatch(photos, async (photo, index) => {
+      try {
+        const inputPath = photo.path;
+        console.log(
+          `[${jobId}] Processing WebP ${index + 1}/${photos.length}:`,
+          {
+            path: inputPath,
+            cached: false,
+          }
+        );
 
-    try {
-      const batches = [];
-      for (let i = 0; i < input.length; i += this.batchSize) {
-        const batch = input.slice(i, i + this.batchSize);
-        batches.push(batch);
-      }
-
-      const results: string[] = [];
-
-      for (const [batchIndex, batch] of batches.entries()) {
-        const batchPromises = batch.map(async (imageUrl, index) => {
-          const absoluteIndex = batchIndex * this.batchSize + index;
-          const cacheKey = this.generateCacheKey("runway", imageUrl, {
-            index: absoluteIndex,
-          });
-
-          return await this.withProcessingLock(cacheKey, async () => {
-            try {
-              // Check cache first
-              const cachedAsset = await this.assetCache.getCachedAsset(
-                cacheKey
-              );
-              if (cachedAsset) {
-                console.log("Cache hit for runway video:", {
-                  imageUrl,
-                  cachedAsset,
-                });
-                return cachedAsset.path;
-              }
-
-              const videoPath = await runwayService.generateVideo(
-                imageUrl,
-                absoluteIndex
-              );
-
-              // Cache the result
-              await this.assetCache.cacheAsset({
-                type: "runway",
-                path: videoPath,
-                cacheKey,
-                metadata: {
-                  timestamp: new Date(),
-                  settings: { index: absoluteIndex },
-                  hash: this.generateCacheKey("runway", imageUrl, {
-                    index: absoluteIndex,
-                  }),
-                },
-              });
-
-              await this.updateJobStatus(
-                jobId,
-                VideoGenerationStatus.PROCESSING,
-                undefined,
-                {
-                  stage: "runway",
-                  currentFile: absoluteIndex + 1,
-                  totalFiles: input.length,
-                  progress: Math.min(
-                    25 + Math.floor(((absoluteIndex + 1) / input.length) * 40),
-                    65
-                  ),
-                }
-              );
-
-              return videoPath;
-            } catch (error) {
-              console.error("Video generation failed:", {
-                imageUrl,
-                index: absoluteIndex,
-                error: error instanceof Error ? error.message : "Unknown error",
-              });
-              throw error;
-            }
-          });
+        // Check cache first using AssetCacheService
+        const cacheKey = this.assetCache.generateCacheKey("webp", {
+          path: inputPath,
+          index,
         });
 
-        const batchResults = await Promise.all(batchPromises);
-        results.push(...batchResults);
+        const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
+        if (cachedAsset) {
+          console.log(`[${jobId}] Cache hit for WebP:`, {
+            path: inputPath,
+            cached: cachedAsset.path,
+          });
+          return { path: cachedAsset.path };
+        }
+
+        const processedImage = await imageProcessor.processImage(inputPath);
+        await processedImage.uploadPromise;
+
+        // Cache the result
+        await this.assetCache.cacheAsset({
+          type: "webp",
+          path: processedImage.s3WebpPath,
+          cacheKey,
+          metadata: {
+            timestamp: new Date(),
+            settings: { index },
+            hash: this.assetCache.generateHash(processedImage.s3WebpPath),
+          },
+        });
+
+        console.log(
+          `[${jobId}] WebP processing complete ${index + 1}/${photos.length}:`,
+          {
+            path: inputPath,
+            output: processedImage.s3WebpPath,
+          }
+        );
+
+        return { path: processedImage.s3WebpPath };
+      } catch (error) {
+        console.error(
+          `[${jobId}] WebP processing failed ${index + 1}/${photos.length}:`,
+          {
+            path: photo.path,
+            error: error instanceof Error ? error.message : "Unknown error",
+          }
+        );
+        return {
+          path: null,
+          error: error instanceof Error ? error.message : "Unknown error",
+        };
       }
+    });
 
-      step.output = results;
-      step.status = "completed";
-    } catch (error) {
-      console.error("Runway processing failed:", error);
-      step.status = "failed";
-      step.error = error instanceof Error ? error.message : "Unknown error";
-      throw error;
-    }
+    console.log(`[${jobId}] WebP processing completed:`, {
+      total: photos.length,
+      successful: results.filter((r) => r.path !== null).length,
+      failed: results.filter((r) => r.error).length,
+    });
 
-    this.processingSteps.set(step.id, step);
-    return step;
+    return results;
   }
 
-  private async processTemplates(
-    jobId: string,
-    input: string[],
-    templates: string[],
-    mapVideoPath?: string
-  ): Promise<ProcessingStep> {
-    await this.updateJobStatus(
-      jobId,
-      VideoGenerationStatus.PROCESSING,
-      undefined,
-      {
-        stage: "template",
-        currentFile: 0,
-        totalFiles: templates.length,
-        progress: 75,
-      }
-    );
+  /**
+   * Processes WebP images to videos using Runway
+   * Uses AssetCacheService for caching
+   * @param webpPaths - Array of WebP paths to process
+   * @param jobId - The ID of the job
+   */
+  private async processRunwayVideos(
+    webpPaths: Array<{ path: string | null; error?: string }>,
+    jobId: string
+  ): Promise<Array<{ path: string | null; error?: string }>> {
+    const validPaths = webpPaths.filter((item) => item.path !== null);
 
-    const step: ProcessingStep = {
-      id: `templates-${Date.now()}`,
-      type: "ffmpeg",
-      input,
-      output: [],
-      settings: { templates },
-      status: "processing",
-    };
+    console.log(`[${jobId}] Starting Runway processing:`, {
+      totalWebPs: webpPaths.length,
+      validWebPs: validPaths.length,
+      invalidWebPs: webpPaths.length - validPaths.length,
+    });
 
-    try {
-      const results = await Promise.all(
-        templates.map(async (template, index) => {
-          // Check cache first
-          const cachedTemplate = await this.getCachedTemplate(
-            template,
-            input,
-            mapVideoPath
-          );
-          if (cachedTemplate) {
-            console.log("Cache hit for template:", {
-              template,
-              cachedTemplate,
-            });
-            return cachedTemplate;
+    const results = await this.processBatch(validPaths, async (item, index) => {
+      if (!item.path) return { path: null, error: "Invalid WebP path" };
+
+      try {
+        // Check cache first using AssetCacheService
+        const cacheKey = this.assetCache.generateCacheKey("runway", {
+          path: item.path,
+          index,
+        });
+
+        const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
+        if (cachedAsset) {
+          console.log(`[${jobId}] Cache hit for Runway video:`, {
+            webp: item.path,
+            cached: cachedAsset.path,
+          });
+          return { path: cachedAsset.path };
+        }
+
+        console.log(
+          `[${jobId}] Processing Runway video ${index + 1}/${
+            validPaths.length
+          }:`,
+          {
+            webpPath: item.path,
+            startTime: new Date().toISOString(),
           }
+        );
 
-          const clips = await videoTemplateService.createTemplate(
-            template.toLowerCase().replace(/\s+/g, "_") as TemplateKey,
-            input,
-            mapVideoPath
-          );
+        const videoPath = await runwayService.generateVideo(item.path, index);
 
-          const outputPath = path.join(
-            process.env.TEMP_OUTPUT_DIR || "./temp",
-            `${template}-${Date.now()}-${Math.random()
-              .toString(36)
-              .slice(2, 7)}.mp4`
-          );
+        // Cache the result
+        await this.assetCache.cacheAsset({
+          type: "runway",
+          path: videoPath,
+          cacheKey,
+          metadata: {
+            timestamp: new Date(),
+            settings: { index },
+            hash: this.assetCache.generateHash(videoPath),
+          },
+        });
 
-          await videoProcessingService.stitchVideos(
-            clips.map((clip) => clip.path),
-            clips.map((clip) => clip.duration),
-            outputPath
-          );
+        console.log(
+          `[${jobId}] Runway processing complete ${index + 1}/${
+            validPaths.length
+          }:`,
+          {
+            webpPath: item.path,
+            videoPath: videoPath,
+            endTime: new Date().toISOString(),
+          }
+        );
 
-          // Cache the result
-          await this.cacheTemplate(template, outputPath, input, mapVideoPath);
+        return { path: videoPath };
+      } catch (error) {
+        console.error(
+          `[${jobId}] Runway processing failed ${index + 1}/${
+            validPaths.length
+          }:`,
+          {
+            webpPath: item.path,
+            error: error instanceof Error ? error.message : "Unknown error",
+          }
+        );
+        return {
+          path: null,
+          error: error instanceof Error ? error.message : "Unknown error",
+        };
+      }
+    });
 
-          await this.updateJobStatus(
-            jobId,
-            VideoGenerationStatus.PROCESSING,
-            undefined,
-            {
-              stage: "template",
-              currentFile: index + 1,
-              totalFiles: templates.length,
-              progress: Math.round(75 + ((index + 1) / templates.length) * 25),
-            }
-          );
+    console.log(`[${jobId}] Runway processing completed:`, {
+      totalProcessed: validPaths.length,
+      successful: results.filter((r) => r.path !== null).length,
+      failed: results.filter((r) => r.error).length,
+      videos: results.map((r) => r.path).filter(Boolean),
+    });
 
-          return outputPath;
-        })
+    return results;
+  }
+
+  /**
+   * Creates final videos using templates
+   * Uses AssetCacheService for caching
+   * @param runwayVideos - Array of Runway video paths
+   * @param jobId - The ID of the job
+   * @param templateKeys - Array of template keys to process
+   */
+  private async processTemplates(
+    runwayVideos: Array<{ path: string | null; error?: string }>,
+    jobId: string,
+    templateKeys: TemplateKey[] = [
+      "storyteller",
+      "crescendo",
+      "wave",
+      "googlezoomintro",
+    ]
+  ): Promise<Array<{ path: string | null; error?: string }>> {
+    const validVideos = runwayVideos
+      .filter((item) => item.path !== null)
+      .map((item) => item.path) as string[];
+
+    console.log(`[${jobId}] Starting template processing:`, {
+      totalVideos: runwayVideos.length,
+      validVideos: validVideos.length,
+      videoList: validVideos,
+    });
+
+    if (validVideos.length === 0) {
+      console.error(
+        `[${jobId}] No valid videos available for template processing`
       );
-
-      step.output = results;
-      step.status = "completed";
-    } catch (error) {
-      step.status = "failed";
-      step.error = error instanceof Error ? error.message : "Unknown error";
+      throw new Error("No valid videos available for template processing");
     }
 
-    this.processingSteps.set(step.id, step);
-    return step;
+    const processTemplate = async (template: TemplateKey, index: number) => {
+      try {
+        // Check cache first using AssetCacheService
+        const cacheKey = this.assetCache.generateCacheKey("template", {
+          template,
+          videos: validVideos,
+          index,
+        });
+
+        const cachedAsset = await this.assetCache.getCachedAsset(cacheKey);
+        if (cachedAsset) {
+          console.log(`[${jobId}] Cache hit for template:`, {
+            template,
+            cached: cachedAsset.path,
+          });
+          return { path: cachedAsset.path };
+        }
+
+        console.log(`[${jobId}] Creating template ${template}:`, {
+          templateIndex: index,
+          videosAvailable: validVideos.length,
+          startTime: new Date().toISOString(),
+        });
+
+        const clips = await videoTemplateService.createTemplate(
+          template,
+          validVideos
+        );
+
+        console.log(`[${jobId}] Template clips created for ${template}:`, {
+          clipCount: clips.length,
+          clipPaths: clips.map((c) => c.path),
+          durations: clips.map((c) => c.duration),
+        });
+
+        const outputPath = path.join(
+          this.outputDir,
+          `${template}-${Date.now()}-${index}.mp4`
+        );
+        await videoProcessingService.stitchVideos(
+          clips.map((clip) => clip.path),
+          clips.map((clip) => clip.duration),
+          outputPath
+        );
+
+        console.log(
+          `[${jobId}] Template processing complete for ${template}:`,
+          {
+            outputPath,
+            endTime: new Date().toISOString(),
+          }
+        );
+
+        return { path: outputPath };
+      } catch (error) {
+        console.error(
+          `[${jobId}] Template processing failed for ${template}:`,
+          {
+            error: error instanceof Error ? error.message : "Unknown error",
+          }
+        );
+        return {
+          path: null,
+          error: error instanceof Error ? error.message : "Unknown error",
+        };
+      }
+    };
+
+    const results = await this.processBatch(templateKeys, processTemplate, 2);
+
+    console.log(`[${jobId}] Template processing completed:`, {
+      totalTemplates: templateKeys.length,
+      successful: results.filter((r) => r.path !== null).length,
+      failed: results.filter((r) => r.error).length,
+      outputs: results.map((r) => r.path).filter(Boolean),
+    });
+
+    return results;
   }
 
   async execute({
@@ -564,11 +567,19 @@ export class ProductionPipeline {
     inputFiles,
     template,
     coordinates,
-    isRegeneration = false,
+    _isRegeneration = false,
   }: ProductionPipelineInput): Promise<string> {
+    let job:
+      | (VideoJob & {
+          listing: Listing & {
+            user: User;
+          };
+        })
+      | null = null;
+
     try {
       // Get job details
-      const job = await prisma.videoJob.findUnique({
+      job = await this.prisma.videoJob.findUnique({
         where: { id: jobId },
         include: {
           listing: {
@@ -583,86 +594,162 @@ export class ProductionPipeline {
         throw new Error(`Invalid job data for ${jobId}`);
       }
 
+      // Update job status to PROCESSING
+      await this.updateJobStatus(jobId, VideoGenerationStatus.PROCESSING);
+
       // Get all templates
-      const allTemplates = await prisma.template.findMany({
+      const allTemplates = await this.prisma.template.findMany({
         orderBy: { order: "asc" },
       });
 
-      // Process WebP conversion or download existing WebPs if regenerating
-      const webpStep = await this.processWebP(
-        jobId,
-        inputFiles,
-        isRegeneration
+      console.log(`[EXECUTE] Starting processing pipeline for job ${jobId}:`, {
+        totalInputFiles: inputFiles.length,
+        template,
+        hasCoordinates: !!coordinates,
+      });
+
+      // Process WebP conversion for all images
+      console.log(`[EXECUTE] Starting WebP processing stage`);
+      const webpResults = await this.processPhotosWithRetry(
+        inputFiles.map((path) => ({ path })),
+        jobId
       );
-      if (webpStep.status === "failed") {
-        throw new Error(`WebP processing failed: ${webpStep.error}`);
+
+      // Validate WebP results
+      const validWebpResults = webpResults.filter(
+        (result) => result.path !== null
+      );
+      console.log(`[EXECUTE] WebP processing stage completed:`, {
+        totalProcessed: webpResults.length,
+        successful: validWebpResults.length,
+        failed: webpResults.length - validWebpResults.length,
+      });
+
+      if (validWebpResults.length === 0) {
+        throw new Error(
+          "WebP processing failed: No valid WebP files were generated"
+        );
       }
 
-      // Process map video if needed
-      let mapVideoPath: string | undefined;
-      if (template === "googlezoomintro") {
-        if (!coordinates) {
-          throw new Error(
-            "Coordinates are required for Google Maps zoom template"
-          );
-        }
-
-        if (!process.env.GOOGLE_MAPS_API_KEY) {
-          throw new Error("Google Maps API key is not configured");
-        }
-
-        try {
-          const mapFrames = await this.mapCapture.captureMapAnimation(
-            job.listing.address,
-            coordinates
-          );
-
-          if (!mapFrames || mapFrames.length === 0) {
-            throw new Error("Failed to generate map frames");
-          }
-
-          mapVideoPath = mapFrames[0];
-          console.log("Successfully generated map video:", mapVideoPath);
-        } catch (error) {
-          throw new Error(
-            `Failed to generate map video: ${
-              error instanceof Error ? error.message : "Unknown error"
-            }`
-          );
-        }
+      if (validWebpResults.length < inputFiles.length) {
+        console.warn(`[EXECUTE] Some WebP conversions failed:`, {
+          expected: inputFiles.length,
+          successful: validWebpResults.length,
+          failed: webpResults.filter((r) => r.error).map((r) => r.error),
+        });
       }
 
-      // Process Runway videos
-      const runwayStep = await this.processRunway(jobId, webpStep.output);
-      if (runwayStep.status === "failed") {
-        throw new Error(`Runway processing failed: ${runwayStep.error}`);
+      // Process Runway videos for all WebP files
+      console.log(`[EXECUTE] Starting Runway processing stage`);
+      const runwayResults = await this.processRunwayVideos(
+        validWebpResults,
+        jobId
+      );
+
+      // Validate Runway results
+      const validRunwayResults = runwayResults.filter(
+        (result) => result.path !== null
+      );
+      console.log(`[EXECUTE] Runway processing stage completed:`, {
+        totalProcessed: runwayResults.length,
+        successful: validRunwayResults.length,
+        failed: runwayResults.length - validRunwayResults.length,
+      });
+
+      if (validRunwayResults.length === 0) {
+        throw new Error(
+          "Runway processing failed: No valid videos were generated"
+        );
+      }
+
+      if (validRunwayResults.length < validWebpResults.length) {
+        console.warn(`[EXECUTE] Some Runway conversions failed:`, {
+          expected: validWebpResults.length,
+          successful: validRunwayResults.length,
+          failed: runwayResults.filter((r) => r.error).map((r) => r.error),
+        });
       }
 
       // Process all templates
-      const templateStep = await this.processTemplates(
+      console.log(`[EXECUTE] Starting template processing stage`);
+      const templateResults = await this.processTemplates(
+        validRunwayResults,
         jobId,
-        runwayStep.output,
-        allTemplates.map((t) => t.name),
-        mapVideoPath
+        allTemplates.map((t) => t.name as TemplateKey)
       );
 
-      if (templateStep.status === "failed") {
-        throw new Error(`Template processing failed: ${templateStep.error}`);
+      // Validate template results
+      const validTemplateResults = templateResults.filter(
+        (result) => result.path !== null
+      );
+      console.log(`[EXECUTE] Template processing stage completed:`, {
+        totalProcessed: templateResults.length,
+        successful: validTemplateResults.length,
+        failed: templateResults.length - validTemplateResults.length,
+      });
+
+      if (validTemplateResults.length === 0) {
+        throw new Error(
+          "Template processing failed: No valid templates were generated"
+        );
+      }
+
+      // Get the first valid template result
+      const outputFile = validTemplateResults[0].path;
+      if (!outputFile) {
+        throw new Error("No valid output file found from template processing");
       }
 
       // Upload final video to S3
-      const outputFile = templateStep.output[0]; // Use the first template output as main output
       const s3Key = `videos/${path.basename(outputFile)}`;
       const s3Url = await s3VideoService.uploadVideo(
         outputFile,
         `s3://${process.env.AWS_BUCKET}/${s3Key}`
       );
 
-      // Update job with S3 URL
-      await prisma.videoJob.update({
-        where: { id: jobId },
-        data: { outputFile: s3Url, status: "COMPLETED" },
+      // Generate thumbnail using ffmpeg
+      const thumbnailPath = path.join(
+        process.env.TEMP_OUTPUT_DIR || "./temp",
+        `thumbnail-${path.basename(outputFile, ".mp4")}.jpg`
+      );
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(outputFile)
+          .screenshots({
+            timestamps: ["1"],
+            filename: path.basename(thumbnailPath),
+            folder: path.dirname(thumbnailPath),
+            size: "720x1280",
+          })
+          .on("end", resolve)
+          .on("error", reject);
       });
+
+      // Upload thumbnail to S3
+      const thumbnailS3Key = `thumbnails/${path.basename(thumbnailPath)}`;
+      const thumbnailBuffer = await fsPromises.readFile(thumbnailPath);
+      const thumbnailS3Url = await s3VideoService.uploadFile(
+        thumbnailBuffer,
+        thumbnailS3Key
+      );
+
+      // Update job with S3 URLs and metadata
+      await this.prisma.videoJob.update({
+        where: { id: jobId },
+        data: {
+          outputFile: s3Url,
+          thumbnailUrl: thumbnailS3Url,
+          status: VideoGenerationStatus.COMPLETED,
+          completedAt: new Date(),
+          metadata: {
+            ...((job.metadata as Record<string, any>) || {}),
+            endTime: new Date().toISOString(),
+          },
+        } as Prisma.VideoJobUpdateInput,
+      });
+
+      // Clean up temporary files
+      await fsPromises.unlink(thumbnailPath);
 
       return s3Url;
     } catch (error) {
@@ -680,12 +767,16 @@ export class ProductionPipeline {
   }
 
   async regeneratePhotos(jobId: string, photoIds: string[]): Promise<void> {
-    const job = await prisma.videoJob.findUnique({
+    const job = await this.prisma.videoJob.findUnique({
       where: { id: jobId },
       include: {
         listing: {
           include: {
-            photos: true,
+            photos: {
+              orderBy: {
+                order: "asc",
+              },
+            },
           },
         },
       },
@@ -699,37 +790,104 @@ export class ProductionPipeline {
       // Update job status
       await this.updateJobStatus(jobId, VideoGenerationStatus.PROCESSING);
 
-      // Process each photo
-      const regeneratedVideos = await Promise.all(
-        photoIds.map(async (photoId, index) => {
-          const photo = job.listing?.photos.find((p) => p.id === photoId);
-          if (!photo || !photo.processedFilePath) {
-            throw new Error(`Invalid photo data for ${photoId}`);
-          }
+      console.log(`[REGENERATE] Starting regeneration for photos:`, {
+        jobId,
+        photoIds,
+        totalPhotos: job.listing.photos.length,
+      });
 
-          const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${photo.processedFilePath}`;
-          const { bucket, key } = s3VideoService.parseS3Path(s3WebpPath);
-          const publicUrl = s3VideoService.getPublicUrl(bucket, key);
-
-          return await runwayService.generateVideo(publicUrl, index);
-        })
-      );
-
-      // Get all video segments (both regenerated and existing)
+      // Get all photos in order
       const allPhotos = job.listing.photos;
-      const videoSegments = allPhotos
-        .map((photo) => {
-          const regeneratedIndex = photoIds.indexOf(photo.id);
-          if (regeneratedIndex !== -1) {
-            return regeneratedVideos[regeneratedIndex];
+      const videoSegments: string[] = [];
+
+      // Process each photo in sequence
+      for (const photo of allPhotos) {
+        try {
+          let videoPath: string;
+
+          if (photoIds.includes(photo.id)) {
+            // This photo needs regeneration
+            console.log(`[REGENERATE] Processing photo for regeneration:`, {
+              photoId: photo.id,
+              hasProcessedFile: !!photo.processedFilePath,
+            });
+
+            if (!photo.processedFilePath) {
+              throw new Error(`Photo ${photo.id} has no processed file path`);
+            }
+
+            const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${photo.processedFilePath}`;
+            const { bucket, key } = s3VideoService.parseS3Path(s3WebpPath);
+            const publicUrl = s3VideoService.getPublicUrl(bucket, key);
+
+            // Generate new video for this photo
+            videoPath = await runwayService.generateVideo(
+              publicUrl,
+              allPhotos.indexOf(photo)
+            );
+
+            // Update the photo's runway video path
+            await this.prisma.photo.update({
+              where: { id: photo.id },
+              data: {
+                runwayVideoPath: videoPath,
+                status: "completed",
+                error: null,
+              },
+            });
+          } else {
+            // Reuse existing video if available
+            if (!photo.runwayVideoPath) {
+              console.log(`[REGENERATE] Generating missing video for photo:`, {
+                photoId: photo.id,
+                hasProcessedFile: !!photo.processedFilePath,
+              });
+
+              if (!photo.processedFilePath) {
+                throw new Error(`Photo ${photo.id} has no processed file path`);
+              }
+
+              const s3WebpPath = `s3://${process.env.AWS_BUCKET}/${photo.processedFilePath}`;
+              const { bucket, key } = s3VideoService.parseS3Path(s3WebpPath);
+              const publicUrl = s3VideoService.getPublicUrl(bucket, key);
+
+              videoPath = await runwayService.generateVideo(
+                publicUrl,
+                allPhotos.indexOf(photo)
+              );
+
+              // Update the photo's runway video path
+              await this.prisma.photo.update({
+                where: { id: photo.id },
+                data: { runwayVideoPath: videoPath },
+              });
+            } else {
+              console.log(`[REGENERATE] Reusing existing video for photo:`, {
+                photoId: photo.id,
+                videoPath: photo.runwayVideoPath,
+              });
+              videoPath = photo.runwayVideoPath;
+            }
           }
-          return photo.runwayVideoPath || null;
-        })
-        .filter(Boolean) as string[];
+
+          videoSegments.push(videoPath);
+        } catch (error) {
+          console.error(`[REGENERATE] Failed to process photo:`, {
+            photoId: photo.id,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          throw error;
+        }
+      }
 
       if (!job.template) {
         throw new Error("Job template is required");
       }
+
+      console.log(`[REGENERATE] Creating template with video segments:`, {
+        template: job.template,
+        segmentCount: videoSegments.length,
+      });
 
       // Create clips configuration
       const clips = await videoTemplateService.createTemplate(
@@ -737,7 +895,7 @@ export class ProductionPipeline {
         videoSegments
       );
 
-      // Create a new final video with the updated segments
+      // Create a new final video
       const outputPath = path.join(
         process.env.TEMP_OUTPUT_DIR || "./temp",
         `${job.template}-${Date.now()}-${Math.random()
@@ -758,24 +916,63 @@ export class ProductionPipeline {
         `s3://${process.env.AWS_BUCKET}/${s3Key}`
       );
 
+      // Generate thumbnail
+      const thumbnailPath = path.join(
+        process.env.TEMP_OUTPUT_DIR || "./temp",
+        `thumbnail-${path.basename(outputPath, ".mp4")}.jpg`
+      );
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(outputPath)
+          .screenshots({
+            timestamps: ["1"],
+            filename: path.basename(thumbnailPath),
+            folder: path.dirname(thumbnailPath),
+            size: "720x1280",
+          })
+          .on("end", resolve)
+          .on("error", reject);
+      });
+
+      // Upload thumbnail to S3
+      const thumbnailS3Key = `thumbnails/${path.basename(thumbnailPath)}`;
+      const thumbnailBuffer = await fsPromises.readFile(thumbnailPath);
+      const thumbnailS3Url = await s3VideoService.uploadFile(
+        thumbnailBuffer,
+        thumbnailS3Key
+      );
+
       // Update job with new video URL
-      await prisma.videoJob.update({
+      await this.prisma.videoJob.update({
         where: { id: jobId },
         data: {
           outputFile: s3Url,
+          thumbnailUrl: thumbnailS3Url,
           status: VideoGenerationStatus.COMPLETED,
           error: null,
+          completedAt: new Date(),
+        } as Prisma.VideoJobUpdateInput,
+      });
+
+      // Clean up temporary files
+      await fsPromises.unlink(thumbnailPath);
+      await fsPromises.unlink(outputPath);
+    } catch (error) {
+      console.error(`[REGENERATE] Job failed:`, {
+        jobId,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+
+      // Update job as failed
+      await this.prisma.videoJob.update({
+        where: { id: jobId },
+        data: {
+          status: VideoGenerationStatus.FAILED,
+          error: error instanceof Error ? error.message : "Unknown error",
+          completedAt: new Date(),
         },
       });
-    } catch (error) {
-      console.error("Error during photo regeneration:", error);
-      await this.updateJobStatus(
-        jobId,
-        VideoGenerationStatus.FAILED,
-        error instanceof Error
-          ? error.message
-          : "Unknown error during regeneration"
-      );
+
       throw error;
     }
   }

@@ -117,8 +117,9 @@ export class MapCapture {
       const tempHtmlPath = path.join(this.outputDir, "map.html");
       await fs.promises.writeFile(tempHtmlPath, htmlContent);
 
-      // Navigate to the local HTML file
-      await page.goto(`file://${tempHtmlPath}`);
+      // Navigate to the local HTML file using absolute path
+      const absoluteTempHtmlPath = path.resolve(tempHtmlPath);
+      await page.goto(`file://${absoluteTempHtmlPath}`);
       await page.waitForFunction("typeof map !== 'undefined'");
 
       // Ensure output directory exists

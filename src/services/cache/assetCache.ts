@@ -2,7 +2,7 @@ import { PrismaClient, Prisma } from "@prisma/client";
 import { createHash } from "crypto";
 import { TempFile } from "../storage/temp-file.service";
 
-export type AssetType = "webp" | "video" | "map" | "ffmpeg" | "runway";
+export type AssetType = "webp" | "runway" | "ffmpeg" | "map" | "template";
 
 export interface CachedAsset {
   id: string;
@@ -14,6 +14,7 @@ export interface CachedAsset {
     settings: Record<string, unknown>;
     hash: string;
     index?: number;
+    localPath?: string;
   };
 }
 
@@ -24,9 +25,9 @@ interface LockOptions {
 }
 
 const DEFAULT_LOCK_OPTIONS: Required<LockOptions> = {
-  timeout: 30000, // 30 seconds
-  retryInterval: 1000, // 1 second
-  maxRetries: 5,
+  timeout: 60000, // 60 seconds - doubled for large files
+  retryInterval: 500, // 500ms - faster retries
+  maxRetries: 10, // More retries for better resilience
 };
 
 export interface ProcessedImage {
@@ -191,6 +192,8 @@ export class AssetCacheService {
       timestamp: Date;
       settings: Record<string, unknown>;
       hash: string;
+      index?: number;
+      localPath?: string;
     };
   }): Promise<CachedAsset> {
     const lockAcquired = await this.acquireLock(`write_${asset.cacheKey}`);
@@ -199,8 +202,17 @@ export class AssetCacheService {
     }
 
     try {
-      const processedAsset = await this.prisma.processedAsset.create({
-        data: {
+      const processedAsset = await this.prisma.processedAsset.upsert({
+        where: {
+          cacheKey: asset.cacheKey,
+        },
+        update: {
+          path: asset.path,
+          hash: asset.metadata.hash,
+          settings: asset.metadata.settings as Prisma.InputJsonValue,
+          updatedAt: new Date(),
+        },
+        create: {
           type: asset.type,
           path: asset.path,
           cacheKey: asset.cacheKey,
