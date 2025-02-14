@@ -1,6 +1,23 @@
+/**
+ * Video Template Service
+ *
+ * Handles the generation of video content based on predefined templates.
+ * Manages template processing, asset integration, and video composition.
+ *
+ * Features:
+ * - Template-based video generation
+ * - Asset management (images, maps, music)
+ * - Video composition with ffmpeg
+ * - Error handling and retry mechanisms
+ *
+ * @module VideoTemplateService
+ */
+
 import { VideoClip } from "./video-processing.service";
 import { reelTemplates } from "../imageProcessing/templates/types";
 import { TemplateKey } from "../imageProcessing/templates/types";
+import { logger } from "../../utils/logger";
+import * as path from "path";
 
 export interface VideoTemplate {
   duration: 5 | 10; // Only 5 or 10 seconds allowed
@@ -28,16 +45,16 @@ export class VideoTemplateService {
     inputVideos: string[],
     mapVideoPath?: string
   ): Promise<VideoClip[]> {
-    console.log(
-      "Creating template",
+    logger.info("Creating template", {
       templateKey,
-      "with",
-      inputVideos.length,
-      "videos..."
-    );
+      videoCount: inputVideos.length,
+      hasMapVideo: !!mapVideoPath,
+    });
 
+    // Validate template exists
     const template = reelTemplates[templateKey];
     if (!template) {
+      logger.error("Template not found", { templateKey });
       throw new Error(`Template ${templateKey} not found`);
     }
 
@@ -45,7 +62,7 @@ export class VideoTemplateService {
     const imageSlots = template.sequence.filter((s) => s !== "map").length;
     const availableImages = inputVideos.length;
 
-    console.log("Template analysis:", {
+    logger.info("Template analysis", {
       totalSlots: template.sequence.length,
       imageSlots,
       availableImages,
@@ -62,7 +79,7 @@ export class VideoTemplateService {
         return index % availableImages; // Use modulo to wrap around available images
       });
 
-      console.log("Adapted sequence for fewer images:", {
+      logger.info("Adapted sequence for fewer images", {
         originalLength: template.sequence.length,
         adaptedLength: adaptedSequence.length,
         sequence: adaptedSequence,
@@ -74,6 +91,7 @@ export class VideoTemplateService {
     for (const sequenceItem of adaptedSequence) {
       if (sequenceItem === "map") {
         if (!mapVideoPath) {
+          logger.error("Map video required but not provided", { templateKey });
           throw new Error("Map video required but not provided");
         }
         const mapDuration =
@@ -95,11 +113,39 @@ export class VideoTemplateService {
           typeof template.durations === "object"
             ? (template.durations as Record<string, number>)[String(index)]
             : (template.durations as number[])[clips.length];
+
+        // Validate video path exists
+        if (!inputVideos[normalizedIndex]) {
+          logger.error("Video not found at index", {
+            index: normalizedIndex,
+            totalVideos: inputVideos.length,
+          });
+          throw new Error(`Video not found at index ${normalizedIndex}`);
+        }
+
         clips.push({
           path: inputVideos[normalizedIndex],
           duration,
         });
       }
+    }
+
+    // Validate we have all required clips
+    if (clips.length !== adaptedSequence.length) {
+      logger.error("Clip count mismatch", {
+        expected: adaptedSequence.length,
+        actual: clips.length,
+      });
+      throw new Error("Failed to create all required clips");
+    }
+
+    // Resolve music path if present
+    if (template.music?.path) {
+      const musicPath = path.join(process.cwd(), template.music.path);
+      logger.info("Resolved music path", {
+        original: template.music.path,
+        resolved: musicPath,
+      });
     }
 
     return clips;

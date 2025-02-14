@@ -1,4 +1,24 @@
-import puppeteer, { Browser } from "puppeteer";
+/**
+ * Map Capture Service
+ *
+ * Handles the generation of map videos by capturing frames of Google Maps with zoom animations.
+ * Uses Puppeteer for browser automation and ffmpeg for video processing.
+ *
+ * Features:
+ * - Automated map video generation with smooth zoom transitions
+ * - Resource cleanup and memory management
+ * - Error handling and retry mechanisms
+ * - Health monitoring
+ *
+ * Requirements:
+ * - Google Maps API key in environment variables
+ * - Chrome/Chromium installed for Puppeteer
+ * - Writable temp directory
+ *
+ * @module MapCaptureService
+ */
+
+import puppeteer, { Browser, Page } from "puppeteer";
 import * as fs from "fs";
 import * as path from "path";
 import ffmpeg from "fluent-ffmpeg";
@@ -7,36 +27,44 @@ import { tempFileManager } from "../storage/temp-file.service";
 import { logger } from "../../utils/logger";
 import { mapVideoCacheService } from "../map-cache/map-video-cache.service";
 import { retryService } from "../retry/retry.service";
+import { MAP_CAPTURE_CONFIG } from "./map-capture.config";
 
 // Declare types for Google Maps objects
 declare global {
-  var google: {
-    maps: {
-      Map: any;
-      event: {
-        addListenerOnce: (
-          instance: any,
-          event: string,
-          handler: () => void
-        ) => void;
+  interface Window {
+    google: {
+      maps: {
+        Map: any;
+        event: {
+          addListenerOnce: (
+            instance: any,
+            event: string,
+            handler: () => void
+          ) => void;
+        };
       };
     };
-  };
-  var mapInstance: any;
+    mapInstance: any;
+  }
 }
 
 export class MapCaptureService {
   private static instance: MapCaptureService;
-  private googleMapsApiKey: string;
+  private googleMapsApiKey: string = "";
   private browser: Browser | null = null;
 
+  /**
+   * Private constructor for singleton pattern.
+   * Validates environment variables and setup.
+   */
   private constructor() {
-    this.googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY || "";
-    if (!this.googleMapsApiKey) {
-      throw new Error("Google Maps API key is required");
-    }
+    this.validateEnvironment();
   }
 
+  /**
+   * Gets the singleton instance of MapCaptureService.
+   * @returns {MapCaptureService} The singleton instance
+   */
   public static getInstance(): MapCaptureService {
     if (!MapCaptureService.instance) {
       MapCaptureService.instance = new MapCaptureService();
@@ -44,6 +72,79 @@ export class MapCaptureService {
     return MapCaptureService.instance;
   }
 
+  /**
+   * Validates required environment variables and directory permissions.
+   * @throws {Error} If required environment variables are missing or temp directory is not writable
+   */
+  private validateEnvironment(): void {
+    const requiredEnvVars = {
+      GOOGLE_MAPS_API_KEY: process.env.GOOGLE_MAPS_API_KEY,
+      TEMP_DIR: process.env.TEMP_DIR || "./temp",
+    };
+
+    const missingVars = Object.entries(requiredEnvVars)
+      .filter(([_, value]) => !value)
+      .map(([key]) => key);
+
+    if (missingVars.length > 0) {
+      throw new Error(
+        `Missing required environment variables: ${missingVars.join(", ")}`
+      );
+    }
+
+    this.googleMapsApiKey = requiredEnvVars.GOOGLE_MAPS_API_KEY!;
+
+    // Validate temp directory exists and is writable
+    const tempDir = requiredEnvVars.TEMP_DIR;
+    try {
+      fs.accessSync(tempDir, fs.constants.W_OK);
+    } catch (error) {
+      throw new Error(`Temp directory ${tempDir} is not writable`);
+    }
+  }
+
+  /**
+   * Validates that the Google Map has loaded properly in the page.
+   * @param {Page} page - Puppeteer page instance
+   * @throws {Error} If map fails to load within timeout period
+   */
+  private async validateMapLoaded(page: Page): Promise<void> {
+    try {
+      await page.waitForFunction(
+        function (this: Window) {
+          return (
+            typeof this.google !== "undefined" &&
+            typeof this.mapInstance !== "undefined" &&
+            this.mapInstance.getDiv().getBoundingClientRect().width > 0
+          );
+        },
+        { timeout: MAP_CAPTURE_CONFIG.TIMEOUTS.MAP_LOAD }
+      );
+    } catch (error) {
+      throw new Error(
+        "Map failed to load properly: " +
+          (error instanceof Error ? error.message : "Unknown error")
+      );
+    }
+  }
+
+  /**
+   * Cleans up page resources and closes the page.
+   * @param {Page} page - Puppeteer page instance
+   */
+  private async clearPageResources(page: Page): Promise<void> {
+    await page.evaluate(function (this: Window) {
+      delete (this as any).google;
+      delete (this as any).mapInstance;
+    });
+    await page.close();
+  }
+
+  /**
+   * Crops and resizes a captured frame to portrait orientation.
+   * @param {string} inputPath - Path to input image
+   * @param {string} outputPath - Path for output image
+   */
   private async cropToPortrait(
     inputPath: string,
     outputPath: string
@@ -70,6 +171,10 @@ export class MapCaptureService {
       .toFile(outputPath);
   }
 
+  /**
+   * Cleans up temporary frame files.
+   * @param {string} framesDir - Directory containing frame files
+   */
   private async cleanupFrames(framesDir: string): Promise<void> {
     try {
       const files = await fs.promises.readdir(framesDir);
@@ -87,21 +192,28 @@ export class MapCaptureService {
     }
   }
 
+  /**
+   * Captures a series of map frames with zoom animation.
+   * @param {Object} coordinates - Latitude and longitude coordinates
+   * @param {number} coordinates.lat - Latitude
+   * @param {number} coordinates.lng - Longitude
+   * @returns {Promise<string>} Path to directory containing captured frames
+   */
   public async captureMapFrames(coordinates: {
     lat: number;
     lng: number;
   }): Promise<string> {
+    let browser: Browser | null = null;
+    let page: Page | null = null;
     try {
       const framesDir = await tempFileManager.createDirectory("map-frames");
-      const browser = await puppeteer.launch({
+      browser = await puppeteer.launch({
         headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--window-size=1920,3413",
-        ],
+        args: MAP_CAPTURE_CONFIG.BROWSER_ARGS,
+        executablePath: process.env.CHROME_PATH || undefined,
       });
-      const page = await browser.newPage();
+
+      page = await browser.newPage();
       await page.setViewport({ width: 1920, height: 3413 });
 
       // Create HTML content for the map with additional styles
@@ -153,28 +265,14 @@ export class MapCaptureService {
       const tempHtmlPath = path.join(framesDir.path, "map.html");
       await fs.promises.writeFile(tempHtmlPath, htmlContent);
 
-      // Load the HTML file
+      // Load the HTML file and validate
       await page.goto(`file://${tempHtmlPath}`);
-      await page.waitForFunction("typeof mapInstance !== 'undefined'");
+      await this.validateMapLoaded(page);
 
       // Wait for initial map load
-      await page.evaluate(() => {
-        return new Promise<void>((resolve) => {
-          if (
-            typeof google !== "undefined" &&
-            typeof mapInstance !== "undefined"
-          ) {
-            google.maps.event.addListenerOnce(mapInstance, "idle", () =>
-              resolve()
-            );
-          } else {
-            resolve();
-          }
-        });
-      });
-
-      // Reduced wait time for initial load
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) =>
+        setTimeout(resolve, MAP_CAPTURE_CONFIG.TIMEOUTS.INITIAL_LOAD)
+      );
 
       // Capture frames with smooth zoom transition
       const START_ZOOM = 6;
@@ -193,14 +291,16 @@ export class MapCaptureService {
         `);
 
         // Wait for the map to be idle after zoom change
-        await page.evaluate(() => {
+        await page.evaluate(function (this: Window) {
           return new Promise<void>((resolve) => {
             if (
-              typeof google !== "undefined" &&
-              typeof mapInstance !== "undefined"
+              typeof this.google !== "undefined" &&
+              typeof this.mapInstance !== "undefined"
             ) {
-              google.maps.event.addListenerOnce(mapInstance, "idle", () =>
-                resolve()
+              this.google.maps.event.addListenerOnce(
+                this.mapInstance,
+                "idle",
+                () => resolve()
               );
             } else {
               resolve();
@@ -236,7 +336,8 @@ export class MapCaptureService {
         });
       }
 
-      await browser.close();
+      if (page) await this.clearPageResources(page);
+      if (browser) await browser.close();
       await fs.promises.unlink(tempHtmlPath);
 
       return framesDir.path;
@@ -246,9 +347,17 @@ export class MapCaptureService {
         coordinates,
       });
       throw error;
+    } finally {
+      if (page) await this.clearPageResources(page);
+      if (browser) await browser.close();
     }
   }
 
+  /**
+   * Creates a video from captured frames.
+   * @param {string} framesDir - Directory containing frame files
+   * @returns {Promise<string>} Path to generated video file
+   */
   public async createVideo(framesDir: string): Promise<string> {
     try {
       const outputPath = await tempFileManager.createFile("map.mp4");
@@ -312,6 +421,12 @@ export class MapCaptureService {
     }
   }
 
+  /**
+   * Generates a map video for given coordinates with caching and retry logic.
+   * @param {Object} coordinates - Latitude and longitude coordinates
+   * @param {string} jobId - Unique identifier for the job
+   * @returns {Promise<string>} Path to generated video file
+   */
   public async generateMapVideo(
     coordinates: { lat: number; lng: number },
     jobId: string
@@ -333,6 +448,40 @@ export class MapCaptureService {
       },
       jobId
     );
+  }
+
+  /**
+   * Performs a health check of the service.
+   * Verifies browser launch capability and environment setup.
+   * @returns {Promise<Object>} Health check results
+   */
+  public async healthCheck(): Promise<{
+    status: "healthy" | "unhealthy";
+    details: Record<string, unknown>;
+  }> {
+    try {
+      const browser = await puppeteer.launch({
+        headless: true,
+        args: ["--no-sandbox"],
+      });
+      await browser.close();
+
+      return {
+        status: "healthy",
+        details: {
+          browserLaunch: true,
+          googleMapsApiKey: !!this.googleMapsApiKey,
+          tempDirWritable: true,
+        },
+      };
+    } catch (error) {
+      return {
+        status: "unhealthy",
+        details: {
+          error: error instanceof Error ? error.message : "Unknown error",
+        },
+      };
+    }
   }
 }
 

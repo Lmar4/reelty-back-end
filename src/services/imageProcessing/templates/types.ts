@@ -1,24 +1,69 @@
-export interface ReelTemplate {
-  name: string;
-  description: string;
-  sequence: (number | string)[];
-  durations: number[] | Record<string | number, number>;
-  music?: {
-    path: string;
-    volume?: number;
-    startTime?: number;
-  };
-  transitions?: {
-    type: "crossfade" | "fade" | "slide";
-    duration: number;
-  }[];
-}
+/**
+ * Video Template Types
+ *
+ * Type definitions and configurations for video templates.
+ * Defines the structure and options for different video templates
+ * used in the video generation process.
+ *
+ * Template Features:
+ * - Template identification
+ * - Asset requirements
+ * - Processing options
+ * - Composition settings
+ *
+ * @module TemplateTypes
+ */
 
+/**
+ * Available template keys for video generation
+ */
 export type TemplateKey =
   | "crescendo"
   | "wave"
   | "storyteller"
   | "googlezoomintro";
+
+/**
+ * Base configuration for all templates
+ */
+export interface TemplateConfig {
+  /** Unique identifier for the template */
+  key: TemplateKey;
+  /** Required assets for template processing */
+  requiredAssets: string[];
+  /** Processing options specific to the template */
+  options: Record<string, unknown>;
+}
+
+/**
+ * Defines the structure of a video template
+ */
+export interface ReelTemplate {
+  /** Display name of the template */
+  name: string;
+  /** Description of the template's style and purpose */
+  description: string;
+  /** Sequence of clip indices for composition */
+  sequence: (number | string)[];
+  /** Duration of each clip in seconds */
+  durations: number[] | Record<string | number, number>;
+  /** Music configuration for the template */
+  music?: {
+    /** Path to the music file */
+    path: string;
+    /** Volume level for the music (optional) */
+    volume?: number;
+    /** Start time offset in seconds (optional) */
+    startTime?: number;
+  };
+  /** Optional transition effects between clips */
+  transitions?: {
+    /** Type of transition effect */
+    type: "crossfade" | "fade" | "slide";
+    /** Duration of the transition in seconds */
+    duration: number;
+  }[];
+}
 
 export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
   crescendo: {
@@ -39,7 +84,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       2.8333, // Original 24fps timings
     ],
     music: {
-      path: "../../assets/music/upbeat.mp3",
+      path: "assets/music/upbeat.mp3",
       volume: 0.85,
     },
   },
@@ -50,7 +95,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
     sequence: [6, 2, 8, 1, 4, 9, 0, 3, 5, 7],
     durations: [3.0, 0.4, 0.33, 2.63, 0.73, 1.3, 1.3, 0.73, 3.57, 3.57],
     music: {
-      path: "../../assets/music/smooth.mp3",
+      path: "assets/music/smooth.mp3",
       volume: 0.8,
     },
   },
@@ -63,7 +108,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       3.75, 3.6667, 3.625, 3.625, 3.625, 3.625, 3.625, 3.625, 3.625, 3.625,
     ],
     music: {
-      path: "../../assets/music/minimal.mp3",
+      path: "assets/music/minimal.mp3",
       volume: 0.75,
     },
   },
@@ -86,7 +131,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       9: 1.9583,
     },
     music: {
-      path: "../../assets/music/zoom.mp3",
+      path: "assets/music/zoom.mp3",
       volume: 0.8,
     },
   },

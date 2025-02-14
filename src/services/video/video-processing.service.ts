@@ -1,3 +1,25 @@
+/**
+ * Video Processing Service
+ *
+ * Core service for video processing operations including composition,
+ * encoding, and asset management. Provides low-level video manipulation
+ * capabilities used by higher-level services.
+ *
+ * Features:
+ * - Video composition and encoding
+ * - Audio integration
+ * - Frame rate management
+ * - Quality control
+ * - Resource cleanup
+ *
+ * Dependencies:
+ * - ffmpeg for video processing
+ * - Proper codec support (libx264, etc.)
+ * - Sufficient disk space for temporary files
+ *
+ * @module VideoProcessingService
+ */
+
 import ffmpeg from "fluent-ffmpeg";
 import * as fs from "fs";
 import * as path from "path";
@@ -61,7 +83,8 @@ export class VideoProcessingService {
 
     // Add music track if provided
     if (musicConfig) {
-      command.input(path.join(__dirname, musicConfig.path));
+      console.log("Using music path:", musicConfig.path);
+      command.input(musicConfig.path);
     }
 
     // Build complex filter
