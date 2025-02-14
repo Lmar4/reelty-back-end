@@ -1,18 +1,21 @@
 import {
   S3Client,
   GetObjectCommand,
-  PutObjectCommand,
   HeadObjectCommand,
 } from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
 import * as fs from "fs";
+import { logger } from "../../utils/logger";
+import "dotenv/config";
 
 export class S3VideoService {
   private static instance: S3VideoService;
   private s3Client: S3Client;
 
   private constructor() {
+    // Initialize S3 client with credentials from environment variables
     this.s3Client = new S3Client({
-      region: process.env.AWS_REGION || "us-east-2",
+      region: process.env.AWS_REGION || "us-east-1",
       credentials: {
         accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
         secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
@@ -47,20 +50,33 @@ export class S3VideoService {
 
   public async uploadVideo(localPath: string, s3Path: string): Promise<string> {
     try {
-      const fileContent = await fs.promises.readFile(localPath);
-      const { bucket, key } = this.parseS3Path(s3Path);
+      const fileStream = fs.createReadStream(localPath);
+      const bucketName = process.env.AWS_BUCKET;
 
-      const command = new PutObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        Body: fileContent,
-        ContentType: "video/mp4",
+      if (!bucketName) {
+        throw new Error("AWS_BUCKET environment variable is not set");
+      }
+
+      // Parse the S3 path to get the key
+      const { key } = this.parseS3Path(s3Path);
+
+      const upload = new Upload({
+        client: this.s3Client,
+        params: {
+          Bucket: bucketName,
+          Key: key,
+          Body: fileStream,
+          ContentType: "video/mp4",
+        },
       });
 
-      await this.s3Client.send(command);
-      return this.getPublicUrl(bucket, key);
+      await upload.done();
+      logger.info("Video uploaded successfully", { localPath, s3Path });
+
+      // Return public HTTPS URL instead of S3 protocol URL
+      return this.getPublicUrl(bucketName, key);
     } catch (error) {
-      console.error("S3 video upload failed:", {
+      logger.error("S3 video upload failed:", {
         error: error instanceof Error ? error.message : "Unknown error",
         localPath,
         s3Path,
@@ -112,6 +128,37 @@ export class S3VideoService {
       if ((error as any)?.name === "NotFound") {
         return false;
       }
+      throw error;
+    }
+  }
+
+  public async uploadFile(fileBuffer: Buffer, s3Key: string): Promise<string> {
+    try {
+      const bucketName = process.env.AWS_BUCKET;
+
+      if (!bucketName) {
+        throw new Error("AWS_BUCKET environment variable is not set");
+      }
+
+      const upload = new Upload({
+        client: this.s3Client,
+        params: {
+          Bucket: bucketName,
+          Key: s3Key,
+          Body: fileBuffer,
+          ContentType: "image/jpeg", // For thumbnails
+        },
+      });
+
+      await upload.done();
+      logger.info("File uploaded successfully", { s3Key });
+
+      return this.getPublicUrl(bucketName, s3Key);
+    } catch (error) {
+      logger.error("S3 file upload failed:", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        s3Key,
+      });
       throw error;
     }
   }

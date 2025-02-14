@@ -13,6 +13,11 @@ export interface MusicConfig {
   startTime?: number;
 }
 
+export interface VideoProcessingOptions {
+  music?: MusicConfig;
+  reverse?: boolean;
+}
+
 export class VideoProcessingService {
   private static instance: VideoProcessingService;
 
@@ -26,147 +31,112 @@ export class VideoProcessingService {
   }
 
   public async stitchVideos(
-    videoFiles: string[],
+    inputFiles: string[],
     durations: number[],
     outputPath: string,
-    music?: MusicConfig,
-    reverse: boolean = false
+    musicConfig?: MusicConfig
   ): Promise<void> {
     console.log("Starting video stitching with:", {
-      videoCount: videoFiles.length,
+      videoCount: inputFiles.length,
       durations,
       outputPath,
-      hasMusicTrack: !!music,
-      reverse,
+      hasMusicTrack: !!musicConfig,
+      reverse: false,
     });
 
-    return new Promise((resolve, reject) => {
-      let command = ffmpeg();
+    if (inputFiles.length === 0) {
+      throw new Error("No input files provided");
+    }
 
-      // Add input files
-      videoFiles.forEach((file) => {
-        command = command.input(file);
-      });
+    if (inputFiles.length !== durations.length) {
+      throw new Error("Number of input files must match number of durations");
+    }
 
-      // Add music if provided
-      if (music) {
-        const musicPath = path.resolve(__dirname, music.path);
-        if (fs.existsSync(musicPath)) {
-          command = command.input(musicPath);
-        } else {
-          console.warn(`Music file not found: ${musicPath}`);
-        }
-      }
+    const command = ffmpeg();
 
-      // Build complex filter
-      const filterComplex: string[] = [];
-
-      // Add trim and scale filters for each video
-      videoFiles.forEach((_, i) => {
-        filterComplex.push(
-          `[${i}:v]setpts=PTS-STARTPTS,scale=768:1280:force_original_aspect_ratio=decrease,` +
-            `pad=768:1280:(ow-iw)/2:(oh-ih)/2,trim=duration=${durations[i]},` +
-            `${reverse ? "reverse," : ""}setpts=PTS-STARTPTS[v${i}]`
-        );
-      });
-
-      // Create concat inputs string
-      const concatInputs = Array.from(
-        { length: videoFiles.length },
-        (_, i) => `[v${i}]`
-      ).join("");
-
-      // Add concat filter
-      filterComplex.push(
-        `${concatInputs}concat=n=${videoFiles.length}:v=1:a=0[concat]`
-      );
-
-      // Add watermark if provided
-      if (music) {
-        const opacity = 0.5;
-        const totalDuration = durations.reduce((a, b) => a + b, 0);
-        filterComplex.push(
-          `[concat][${videoFiles.length}:v]overlay=W-w-10:H-h-10:enable='between(t,0,${totalDuration})':alpha=${opacity}[outv]`
-        );
-      } else {
-        filterComplex.push(`[concat]copy[outv]`);
-      }
-
-      // Add audio filters if music is provided
-      if (music) {
-        const volume = music.volume || 0.5;
-        const startTime = music.startTime || 0;
-        const totalDuration = durations.reduce((a, b) => a + b, 0);
-        const fadeStart = Math.max(0, totalDuration - 1);
-        filterComplex.push(
-          `[${videoFiles.length}:a]asetpts=PTS-STARTPTS,` +
-            `atrim=start=${startTime}:duration=${totalDuration},` +
-            `volume=${volume}:eval=frame,` +
-            `afade=t=out:st=${fadeStart}:d=1[outa]`
-        );
-      }
-
-      // Apply complex filter
-      command = command.complexFilter(filterComplex);
-
-      // Map outputs
-      command = command.outputOptions(["-map", "[outv]"]);
-      if (music) {
-        command = command.outputOptions(["-map", "[outa]"]);
-      }
-
-      // Set output options
-      command = command
-        .outputOptions([
-          "-c:v",
-          "libx264",
-          "-preset",
-          "slow",
-          "-crf",
-          "18",
-          "-r",
-          "24",
-          "-c:a",
-          "aac",
-          "-shortest",
-        ])
-        .output(outputPath);
-
-      // Handle events
-      command
-        .on("start", (commandLine) => {
-          console.log("FFmpeg started:", commandLine);
-        })
-        .on("progress", (progress) => {
-          console.log("FFmpeg progress:", progress);
-        })
-        .on("end", () => {
-          console.log("FFmpeg processing finished");
-          resolve();
-        })
-        .on("error", (err) => {
-          console.error("FFmpeg error:", err);
-          reject(new Error(`FFmpeg error: ${err.message}`));
-        });
-
-      // Run the command
-      command.run();
+    // Add input videos
+    inputFiles.forEach((file) => {
+      command.input(file);
     });
+
+    // Add music track if provided
+    if (musicConfig) {
+      command.input(path.join(__dirname, musicConfig.path));
+    }
+
+    // Build complex filter
+    let filterComplex = "";
+    const videoLabels: string[] = [];
+
+    // Process each video
+    inputFiles.forEach((_, i) => {
+      const label = `v${i}`;
+      filterComplex += `[${i}:v]setpts=PTS-STARTPTS,scale=768:1280:force_original_aspect_ratio=decrease,pad=768:1280:(ow-iw)/2:(oh-ih)/2,trim=duration=${durations[i]},setpts=PTS-STARTPTS[${label}];`;
+      videoLabels.push(`[${label}]`);
+    });
+
+    // Concatenate videos
+    filterComplex += `${videoLabels.join("")}concat=n=${
+      inputFiles.length
+    }:v=1:a=0[outv]`;
+
+    // Process audio if music is provided
+    if (musicConfig) {
+      const totalDuration = durations.reduce((sum, d) => sum + d, 0);
+      const audioIndex = inputFiles.length; // Audio input is after all videos
+      const volume = musicConfig.volume || 0.8; // Default volume if not specified
+      const startTime = musicConfig.startTime || 0;
+      filterComplex += `;[${audioIndex}:a]asetpts=PTS-STARTPTS,atrim=start=${startTime}:duration=${totalDuration},volume=${volume}:eval=frame,afade=t=out:st=${
+        totalDuration - 1
+      }:d=1[outa]`;
+    }
+
+    command
+      .complexFilter(filterComplex)
+      .outputOptions("-c:v", "libx264")
+      .outputOptions("-preset", "slow")
+      .outputOptions("-crf", "18")
+      .outputOptions("-r", "24")
+      .outputOptions("-c:a", "aac")
+      .outputOptions("-shortest");
+
+    if (musicConfig) {
+      command.outputOptions("-map", "[outv]").outputOptions("-map", "[outa]");
+    } else {
+      command.outputOptions("-map", "[outv]");
+    }
+
+    command.output(outputPath);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        command
+          .on("start", (commandLine) => {
+            console.log("FFmpeg started:", commandLine);
+          })
+          .on("error", (err, stdout, stderr) => {
+            console.error("FFmpeg error:", err);
+            reject(new Error(`FFmpeg error: ${err.message}`));
+          })
+          .on("end", () => {
+            resolve();
+          })
+          .run();
+      });
+    } catch (error) {
+      console.error("Error during video stitching:", error);
+      throw error;
+    }
   }
 
   public async batchProcessVideos(
     inputVideos: string[],
     outputPath: string,
-    options: {
-      template?: string;
-      music?: MusicConfig;
-      reverse?: boolean;
-    } = {}
+    options: VideoProcessingOptions = {}
   ): Promise<void> {
     console.log("Starting batch video processing with:", {
       videoCount: inputVideos.length,
       outputPath,
-      hasTemplate: !!options.template,
       hasMusicTrack: !!options.music,
       reverse: options.reverse,
     });
@@ -198,8 +168,7 @@ export class VideoProcessingService {
               [video],
               [5], // Default duration
               outputFile,
-              options.music,
-              options.reverse
+              options.music
             );
             return outputFile;
           })
@@ -222,8 +191,7 @@ export class VideoProcessingService {
         processedPaths,
         processedPaths.map(() => 5), // Default duration for each segment
         outputPath,
-        options.music,
-        options.reverse
+        options.music
       );
     } finally {
       // Cleanup temporary files

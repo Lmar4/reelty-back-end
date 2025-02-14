@@ -55,17 +55,18 @@ export class VideoTemplateService {
     // If we have fewer images than slots, adapt the sequence
     let adaptedSequence = [...template.sequence];
     if (availableImages < imageSlots) {
-      // Keep the map and use available images in a round-robin fashion
-      adaptedSequence = template.sequence.filter((item) => {
-        if (item === "map") return true;
+      // Keep the map and reuse available images in a round-robin fashion
+      adaptedSequence = template.sequence.map((item) => {
+        if (item === "map") return item;
         const index = typeof item === "number" ? item : parseInt(item);
-        return index < availableImages;
+        return index % availableImages; // Use modulo to wrap around available images
       });
 
       console.log("Adapted sequence for fewer images:", {
         originalLength: template.sequence.length,
         adaptedLength: adaptedSequence.length,
         sequence: adaptedSequence,
+        availableImages,
       });
     }
 
