@@ -1,5 +1,5 @@
 import express, { Request, Response } from "express";
-import { PrismaClient, Prisma, VideoGenerationStatus } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import { z } from "zod";
 import { validateRequest } from "../middleware/validate";
 import { logger } from "../utils/logger";

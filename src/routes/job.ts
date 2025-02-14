@@ -1,4 +1,4 @@
-import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 import express, { RequestHandler } from "express";
 import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
