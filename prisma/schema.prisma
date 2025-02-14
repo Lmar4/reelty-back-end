@@ -246,6 +246,7 @@ model VideoJob {
   template    String?
   inputFiles  Json?    @map("input_files")
   outputFile  String?  @map("output_file")
+  thumbnailUrl String? @map("thumbnail_url")
   error       String?
   position    Int      @default(0)
   priority    Int      @default(1)
@@ -362,6 +363,7 @@ model ProcessedAsset {
   cacheKey  String   @unique
   hash      String
   settings  Json?
+  metadata  Json?    // Store additional metadata like localPath
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
