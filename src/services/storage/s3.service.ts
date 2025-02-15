@@ -95,6 +95,16 @@ export class S3Service {
   public async downloadFile(url: string): Promise<Buffer> {
     return this.retryWithBackoff(async () => {
       try {
+        // If the URL contains X-Amz-Signature, it's a pre-signed URL
+        if (url.includes("X-Amz-")) {
+          const response = await fetch(url);
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+          return Buffer.from(await response.arrayBuffer());
+        }
+
+        // Otherwise, use GetObjectCommand for direct S3 paths
         const { bucket, key } = this.parseUrl(url);
         console.log("Downloading from S3:", { bucket, key });
 

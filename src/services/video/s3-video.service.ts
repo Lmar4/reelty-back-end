@@ -4,6 +4,7 @@ import {
   HeadObjectCommand,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import * as fs from "fs";
 import { logger } from "../../utils/logger";
 import "dotenv/config";
@@ -156,6 +157,28 @@ export class S3VideoService {
       return this.getPublicUrl(bucketName, s3Key);
     } catch (error) {
       logger.error("S3 file upload failed:", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        s3Key,
+      });
+      throw error;
+    }
+  }
+
+  public async getPresignedUrl(s3Key: string): Promise<string> {
+    try {
+      const bucketName = process.env.AWS_BUCKET;
+      if (!bucketName) {
+        throw new Error("AWS_BUCKET environment variable is not set");
+      }
+
+      const command = new GetObjectCommand({
+        Bucket: bucketName,
+        Key: s3Key,
+      });
+
+      return getSignedUrl(this.s3Client, command, { expiresIn: 3600 });
+    } catch (error) {
+      logger.error("Failed to generate pre-signed URL:", {
         error: error instanceof Error ? error.message : "Unknown error",
         s3Key,
       });

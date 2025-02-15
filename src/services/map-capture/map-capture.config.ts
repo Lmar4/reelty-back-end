@@ -13,12 +13,19 @@ export const MAP_CAPTURE_CONFIG = {
    * Configured for headless operation and optimal performance
    */
   BROWSER_ARGS: [
-    "--no-sandbox", // Required for running in containers
-    "--disable-setuid-sandbox", // Security setting for running as non-root
-    "--window-size=1920,3413", // Viewport size for map capture
-    "--disable-dev-shm-usage", // Prevents memory issues
-    "--disable-gpu", // Reduces issues on certain systems
-    "--ignore-certificate-errors", // Handles SSL issues
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--window-size=1920,3413",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--ignore-certificate-errors",
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--single-process",
+    "--no-zygote",
+    "--disable-web-security",
+    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-site-isolation-trials",
   ],
 
   /**
@@ -26,11 +33,11 @@ export const MAP_CAPTURE_CONFIG = {
    */
   TIMEOUTS: {
     /** Maximum time to wait for map to load (ms) */
-    MAP_LOAD: 10000,
+    MAP_LOAD: 30000,
     /** Time between frame captures (ms) */
     FRAME_CAPTURE: 100,
     /** Initial wait time after map load (ms) */
-    INITIAL_LOAD: 1000,
+    INITIAL_LOAD: 2000,
   },
 
   /**

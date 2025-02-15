@@ -3,6 +3,7 @@ import { tempFileManager } from "../storage/temp-file.service";
 import { s3Service } from "../storage/s3.service";
 import { imageProcessor } from "../imageProcessing/image.service";
 import * as fs from "fs/promises";
+import { logger } from "../../utils/logger";
 
 // Our custom constraints on the SDK types
 type RunwayModel = "gen3a_turbo";
@@ -17,13 +18,30 @@ interface ImageToVideoCreateParams {
   ratio: RunwayRatio;
 }
 
+// Retry configuration
+const RETRY_CONFIG = {
+  maxRetries: 3,
+  baseDelay: 1000, // 1 second
+  maxDelay: 10000, // 10 seconds
+  retryableStatuses: [429, 502, 503, 504],
+};
+
+interface RunwayError {
+  status?: number;
+  message?: string;
+}
+
 export class RunwayService {
   private static instance: RunwayService;
   private client: RunwayML;
 
   private constructor(apiKey: string) {
     if (!apiKey) throw new Error("RunwayML API key is required");
-    this.client = new RunwayML({ apiKey });
+    this.client = new RunwayML({
+      apiKey,
+      maxRetries: RETRY_CONFIG.maxRetries,
+      timeout: 60000, // 1 minute timeout
+    });
   }
 
   public static getInstance(
@@ -35,48 +53,148 @@ export class RunwayService {
     return RunwayService.instance;
   }
 
+  private calculateBackoff(attempt: number): number {
+    // Exponential backoff with jitter
+    const exponentialDelay = Math.min(
+      RETRY_CONFIG.maxDelay,
+      RETRY_CONFIG.baseDelay * Math.pow(2, attempt)
+    );
+    // Add jitter (random delay up to 50% of the calculated delay)
+    const jitter = Math.random() * 0.5 * exponentialDelay;
+    return exponentialDelay + jitter;
+  }
+
+  private isRetryableError(error: RunwayError | unknown): boolean {
+    if (error && typeof error === "object" && "status" in error) {
+      return RETRY_CONFIG.retryableStatuses.includes(error.status as number);
+    }
+    return false;
+  }
+
+  private async retryWithBackoff<T>(
+    operation: () => Promise<T>,
+    context: string
+  ): Promise<T> {
+    let attempt = 0;
+
+    while (attempt < RETRY_CONFIG.maxRetries) {
+      try {
+        return await operation();
+      } catch (error) {
+        attempt++;
+        const runwayError = error as RunwayError;
+
+        if (
+          !this.isRetryableError(runwayError) ||
+          attempt === RETRY_CONFIG.maxRetries
+        ) {
+          logger.error(`${context} failed permanently:`, {
+            error: error instanceof Error ? error.message : "Unknown error",
+            status: runwayError.status,
+            attempt,
+          });
+          throw error;
+        }
+
+        const backoffTime = this.calculateBackoff(attempt);
+        logger.warn(`${context} failed, retrying in ${backoffTime}ms:`, {
+          error: error instanceof Error ? error.message : "Unknown error",
+          status: runwayError.status,
+          attempt,
+          nextAttemptIn: backoffTime,
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, backoffTime));
+      }
+    }
+
+    throw new Error(
+      `${context} failed after ${RETRY_CONFIG.maxRetries} retries`
+    );
+  }
+
   public async generateVideo(imageUrl: string, index: number): Promise<string> {
     try {
-      // Create task
-      const taskId = await this.createTask(imageUrl, index);
-      console.log("Task created on Runway:", { taskId });
+      // Create task with retry
+      const taskId = await this.retryWithBackoff(
+        () => this.createTask(imageUrl, index),
+        "Task creation"
+      );
+      logger.info("Task created on Runway:", { taskId });
 
       // Poll for completion
       const status = await this.pollTaskStatus(taskId);
       if (status !== "SUCCEEDED") {
-        throw new Error(
-          `Video generation was ${status.toLowerCase()} due to rate limits`
-        );
+        throw new Error(`Video generation was ${status.toLowerCase()}`);
       }
 
-      // Download result
-      const localPath = await this.downloadResult(taskId, index);
+      // Download result with retry
+      const localPath = await this.retryWithBackoff(
+        () => this.downloadResult(taskId, index),
+        "Result download"
+      );
 
-      // Return just the local path
       return localPath;
     } catch (error) {
-      console.error("Failed to generate video:", error);
+      if (error instanceof RunwayML.APIError) {
+        switch (error.status) {
+          case 400:
+            throw new Error(`Invalid input: ${error.message}`);
+          case 401:
+            throw new Error("Invalid API key");
+          case 404:
+            throw new Error("Resource not found");
+          case 429:
+            throw new Error("Rate limit exceeded");
+          default:
+            throw new Error(`Runway API error: ${error.message}`);
+        }
+      }
       throw error;
     }
   }
 
   private async createTask(imageUrl: string, index: number): Promise<string> {
-    console.log("Starting video generation:", { imageUrl, index });
+    logger.info("Starting video generation:", { imageUrl, index });
 
-    // Download the image from S3 and convert to data URL
-    const imageBuffer = await s3Service.downloadFile(imageUrl);
-    const dataUrl = await imageProcessor.bufferToDataUrl(imageBuffer);
+    try {
+      let imageBuffer: Buffer;
 
-    const imageToVideo = await this.client.imageToVideo.create({
-      model: "gen3a_turbo",
-      promptImage: dataUrl,
-      promptText: "Move forward slowly",
-      duration: 5,
-      ratio: "768:1280",
-    });
+      if (imageUrl.includes("X-Amz-") || imageUrl.startsWith("s3://")) {
+        // Handle pre-signed URL or direct S3 URL
+        imageBuffer = await s3Service.downloadFile(imageUrl);
+      } else {
+        // Handle regular HTTPS URL
+        const response = await fetch(imageUrl);
+        if (!response.ok) {
+          throw new Error(`Failed to download image: ${response.statusText}`);
+        }
+        imageBuffer = Buffer.from(await response.arrayBuffer());
+      }
 
-    if (!imageToVideo?.id) throw new Error("No task ID received");
-    return imageToVideo.id;
+      const dataUrl = await imageProcessor.bufferToDataUrl(imageBuffer);
+
+      const imageToVideo = await this.client.imageToVideo.create({
+        model: "gen3a_turbo",
+        promptImage: dataUrl,
+        promptText: "Move forward slowly",
+        duration: 5,
+        ratio: "768:1280",
+      });
+
+      if (!imageToVideo?.id) throw new Error("No task ID received");
+      return imageToVideo.id;
+    } catch (error) {
+      if (error instanceof RunwayML.APIError) {
+        logger.error("Task creation failed:", {
+          status: error.status,
+          message: error.message,
+          imageUrl,
+          index,
+        });
+      }
+      throw error;
+    }
   }
 
   private async pollTaskStatus(taskId: string): Promise<string> {
@@ -85,27 +203,41 @@ export class RunwayService {
 
     while (attempts < maxAttempts) {
       await new Promise((resolve) => setTimeout(resolve, 10000));
-      const task = await this.client.tasks.retrieve(taskId);
-      attempts++;
 
-      console.log("Status:", {
-        taskId,
-        status: task.status,
-        attempt: attempts,
-        maxAttempts,
-      });
+      try {
+        const task = await this.retryWithBackoff(
+          () => this.client.tasks.retrieve(taskId),
+          "Task status check"
+        );
+        attempts++;
 
-      if (task.status === "FAILED") {
-        throw new Error(task.failure || "Video generation failed");
-      }
-      if (task.status === "CANCELLED") {
-        throw new Error("Video generation was cancelled");
-      }
-      if (task.status === "THROTTLED") {
-        throw new Error("Video generation was throttled due to rate limits");
-      }
-      if (task.status === "SUCCEEDED") {
-        return task.status;
+        logger.info("Task status:", {
+          taskId,
+          status: task.status,
+          attempt: attempts,
+          maxAttempts,
+        });
+
+        switch (task.status) {
+          case "FAILED":
+            throw new Error(task.failure || "Video generation failed");
+          case "CANCELLED":
+            throw new Error("Video generation was cancelled");
+          case "THROTTLED":
+            throw new Error("Video generation was throttled");
+          case "SUCCEEDED":
+            return task.status;
+        }
+      } catch (error) {
+        if (!this.isRetryableError(error)) {
+          throw error;
+        }
+        // For retryable errors, continue polling
+        logger.warn("Task status check failed, continuing polling:", {
+          error: error instanceof Error ? error.message : "Unknown error",
+          taskId,
+          attempt: attempts,
+        });
       }
     }
 
@@ -130,22 +262,23 @@ export class RunwayService {
     const videoBuffer = Buffer.from(await videoResponse.arrayBuffer());
     await tempFileManager.writeFile(tempFile, videoBuffer);
 
-    // Upload to S3 in background
+    // Upload to S3 and wait for it to complete
     const s3Key = `videos/runway/${Date.now()}_segment_${index}.mp4`;
-    const s3Url = s3Service.getPublicUrl(process.env.AWS_BUCKET || "");
-
-    // Start upload but don't await it
-    fs.readFile(tempFile.path)
-      .then((buffer) => s3Service.uploadFile(buffer, s3Key))
-      .catch((error) => {
-        console.error("Failed to upload video to S3:", error);
+    try {
+      await s3Service.uploadFile(videoBuffer, s3Key);
+      logger.info("Video saved:", {
+        taskId,
+        localPath: tempFile.path,
+        s3Key,
       });
-
-    console.log("Video saved:", {
-      taskId,
-      localPath: tempFile.path,
-      s3Url,
-    });
+    } catch (error) {
+      logger.error("Failed to upload video to S3:", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        taskId,
+        s3Key,
+      });
+      // Continue with the local file even if S3 upload fails
+    }
 
     return tempFile.path;
   }

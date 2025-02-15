@@ -14,6 +14,8 @@ export class TempFileManager {
 
   constructor(baseDir?: string) {
     this.baseDir = baseDir || path.join(os.tmpdir(), "reelty-processing");
+    // Initialize synchronously to ensure directory exists
+    fs.mkdirSync(this.baseDir, { recursive: true });
   }
 
   public async initialize(): Promise<void> {

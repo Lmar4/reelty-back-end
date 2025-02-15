@@ -11,6 +11,8 @@ import { TemplateKey } from "./templates/types";
 import { reelTemplates } from "./templates/types";
 import { AssetCacheService } from "../cache/assetCache";
 import { s3Service } from "../storage/s3.service";
+import { ProductionPipeline } from "./productionPipeline";
+import { MapCaptureService } from "../map-capture/map-capture.service";
 
 const prisma = new PrismaClient();
 
@@ -30,6 +32,7 @@ export interface VideoTemplate {
   duration: 5 | 10; // Only 5 or 10 seconds allowed
   ratio?: "1280:768" | "768:1280"; // Only these aspect ratios allowed
   watermark?: boolean; // Optional watermark flag
+  templateKey?: TemplateKey; // Template to use for video generation
   headers?: {
     [key: string]: string;
   };
@@ -114,17 +117,25 @@ export class ImageToVideoConverter {
 
       let publicUrl: string;
 
-      // Handle local file paths
-      if (imageUrl.startsWith("/")) {
-        // Upload local file to S3 temporarily
+      // Handle local file paths (including temp WebP files)
+      if (imageUrl.startsWith("/") || imageUrl.startsWith("temp/")) {
+        // Read the local file
         const fileBuffer = await fs.promises.readFile(imageUrl);
+
+        // Generate a unique S3 key for this temp file
         const key = `temp/runway-inputs/${Date.now()}-${path.basename(
           imageUrl
         )}`;
+
+        // Upload to S3
         await s3Service.uploadFile(fileBuffer, key);
+
+        // Get the public URL
         publicUrl = s3Service.getPublicUrl(key);
-        console.log("Uploaded local file to S3:", {
+
+        console.log("Uploaded local WebP to S3:", {
           originalPath: imageUrl,
+          s3Key: key,
           publicUrl,
         });
       } else if (imageUrl.startsWith("s3://")) {
@@ -232,6 +243,7 @@ export class ImageToVideoConverter {
   async regenerateVideos(
     photoIds: string[]
   ): Promise<Array<{ id: string; listingId: string }>> {
+    // Get photos that need regeneration
     const photos = await prisma.photo.findMany({
       where: {
         id: { in: photoIds },
@@ -282,19 +294,18 @@ export class ImageToVideoConverter {
 
         jobs.push({ id: job.id, listingId: job.listingId });
 
-        // Update all photos status
+        // Update photos status to processing
         await prisma.photo.updateMany({
           where: { id: { in: photos.map((p) => p.id) } },
           data: { status: "processing", error: null },
         });
 
-        // Process photos in background
-        this.processPhotosForJob(job.id, photos).catch((error) => {
-          console.error("Background processing failed:", {
-            jobId: job.id,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
-        });
+        // Use ProductionPipeline to regenerate the specific photos
+        const pipeline = new ProductionPipeline();
+        await pipeline.regeneratePhotos(
+          job.id,
+          photos.map((p) => p.id)
+        );
       } catch (error) {
         console.error("Failed to create job for listing:", {
           listingId: listing.id,
@@ -605,9 +616,45 @@ export class ImageToVideoConverter {
 
       // Create template and get output path
       console.log(`[TEMPLATE_PROCESSING] Creating template ${template}...`);
+
+      // Handle map video for googlezoomintro template
+      let mapVideo: string | undefined;
+      if (template === "googlezoomintro") {
+        const job = await prisma.videoJob.findUnique({
+          where: { id: jobId },
+          include: { listing: true },
+        });
+
+        if (job?.listing?.coordinates) {
+          const coordinates =
+            typeof job.listing.coordinates === "string"
+              ? JSON.parse(job.listing.coordinates)
+              : job.listing.coordinates;
+
+          console.log(
+            `[TEMPLATE_PROCESSING] Generating map video for coordinates:`,
+            {
+              coordinates,
+              template,
+            }
+          );
+
+          mapVideo = await MapCaptureService.getInstance().generateMapVideo(
+            coordinates,
+            jobId
+          );
+
+          console.log(`[TEMPLATE_PROCESSING] Map video generated:`, {
+            mapVideoPath: mapVideo,
+            template,
+          });
+        }
+      }
+
       const clips = await videoTemplateService.createTemplate(
         template,
-        validVideos
+        validVideos,
+        mapVideo
       );
       console.log(`[TEMPLATE_PROCESSING] Template clips created:`, {
         template,
@@ -635,7 +682,7 @@ export class ImageToVideoConverter {
         clips.map((clip) => clip.path),
         clips.map((clip) => clip.duration),
         outputPath,
-        templateConfig.music
+        templateConfig
       );
 
       // Cache the result
@@ -785,11 +832,10 @@ export class ImageToVideoConverter {
       console.log(`Generated ${runwayVideos.length} videos`);
 
       // Create final video using template
-      const outputPath = path.join(this.outputDir, `${Date.now()}-final.mp4`);
-
       // Get clips configuration from template service
+      const templateKey = template.templateKey || "storyteller";
       const clips = await videoTemplateService.createTemplate(
-        "storyteller",
+        templateKey,
         runwayVideos
       );
 
@@ -797,11 +843,12 @@ export class ImageToVideoConverter {
       await videoProcessingService.stitchVideos(
         clips.map((clip) => clip.path),
         clips.map((clip) => clip.duration),
-        outputPath
+        outputFile,
+        reelTemplates[templateKey]
       );
 
-      console.log("Final video created at:", outputPath);
-      return outputPath;
+      console.log("Final video created at:", outputFile);
+      return outputFile;
     } catch (error: unknown) {
       throw new Error(
         `Failed to convert images to video: ${

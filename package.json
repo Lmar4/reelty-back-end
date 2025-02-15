@@ -94,5 +94,10 @@
         }
       ]
     }
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "puppeteer"
+    ]
   }
 }

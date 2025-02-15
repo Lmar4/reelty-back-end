@@ -13,19 +13,21 @@
  * @module VideoTemplateService
  */
 
-import { VideoClip } from "./video-processing.service";
-import { reelTemplates } from "../imageProcessing/templates/types";
-import { TemplateKey } from "../imageProcessing/templates/types";
-import { logger } from "../../utils/logger";
+import * as fs from "fs";
 import * as path from "path";
+import { logger } from "../../utils/logger";
+import {
+  ReelTemplate,
+  reelTemplates,
+  TemplateKey,
+} from "../imageProcessing/templates/types";
+import { VideoClip } from "./video-processing.service";
+import { promises as fsPromises } from "fs";
 
-export interface VideoTemplate {
-  duration: 5 | 10; // Only 5 or 10 seconds allowed
-  ratio?: "1280:768" | "768:1280"; // Only these aspect ratios allowed
-  watermark?: boolean; // Optional watermark flag
-  headers?: {
-    [key: string]: string;
-  };
+interface MusicConfig {
+  path: string;
+  volume?: number;
+  startTime?: number;
 }
 
 export class VideoTemplateService {
@@ -38,6 +40,51 @@ export class VideoTemplateService {
       VideoTemplateService.instance = new VideoTemplateService();
     }
     return VideoTemplateService.instance;
+  }
+
+  /**
+   * Resolves the music file path by checking multiple possible locations
+   * @param musicPath - The original music path from the template
+   * @returns The resolved absolute path if found, null otherwise
+   */
+  private async resolveMusicPath(musicPath: string): Promise<string | null> {
+    // Define possible locations to check
+    const possiblePaths = [
+      path.join(process.cwd(), "public", musicPath),
+      path.join(process.cwd(), musicPath),
+      path.join(process.cwd(), "assets", "music", path.basename(musicPath)),
+      path.join(__dirname, "../../../public", musicPath),
+      path.join(__dirname, "../../../", musicPath),
+      path.join(__dirname, "../../../assets/music", path.basename(musicPath)),
+    ];
+
+    logger.info("Checking possible music file locations", {
+      originalPath: musicPath,
+      searchPaths: possiblePaths,
+    });
+
+    // Try each path in sequence
+    for (const possiblePath of possiblePaths) {
+      try {
+        await fs.promises.access(possiblePath, fs.constants.R_OK);
+        logger.info("Found music file", {
+          originalPath: musicPath,
+          resolvedPath: possiblePath,
+        });
+        return possiblePath;
+      } catch (error) {
+        logger.debug("Music file not found at path", {
+          path: possiblePath,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
+    }
+
+    logger.warn("Music file not found in any location", {
+      originalPath: musicPath,
+      searchedPaths: possiblePaths,
+    });
+    return null;
   }
 
   public async createTemplate(
@@ -56,6 +103,28 @@ export class VideoTemplateService {
     if (!template) {
       logger.error("Template not found", { templateKey });
       throw new Error(`Template ${templateKey} not found`);
+    }
+
+    // Resolve music path if present and update template
+    if (template.music?.path) {
+      const resolvedMusicPath = await this.resolveMusicPath(
+        template.music.path
+      );
+      if (resolvedMusicPath) {
+        template.music.path = resolvedMusicPath;
+        template.music.isValid = true;
+        logger.info("Music file resolved and verified", {
+          originalPath: template.music.path,
+          resolvedPath: resolvedMusicPath,
+          volume: template.music.volume,
+          startTime: template.music.startTime,
+        });
+      } else {
+        template.music.isValid = false;
+        logger.warn("No valid music file found, proceeding without music", {
+          originalPath: template.music.path,
+        });
+      }
     }
 
     // Count how many actual image slots we need (excluding map)
@@ -139,30 +208,7 @@ export class VideoTemplateService {
       throw new Error("Failed to create all required clips");
     }
 
-    // Resolve music path if present
-    if (template.music?.path) {
-      const musicPath = path.join(process.cwd(), template.music.path);
-      logger.info("Resolved music path", {
-        original: template.music.path,
-        resolved: musicPath,
-      });
-    }
-
     return clips;
-  }
-
-  public validateTemplate(template: VideoTemplate): void {
-    if (template.duration !== 5 && template.duration !== 10) {
-      throw new Error("Invalid duration. Must be 5 or 10 seconds.");
-    }
-
-    if (
-      template.ratio &&
-      template.ratio !== "1280:768" &&
-      template.ratio !== "768:1280"
-    ) {
-      throw new Error('Invalid ratio. Must be "1280:768" or "768:1280".');
-    }
   }
 }
 

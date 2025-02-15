@@ -509,29 +509,77 @@ export class TemplateService {
           | { path: string; volume?: number; startTime?: number }
           | undefined;
         if (music?.path) {
-          // Resolve the absolute path correctly
-          const musicPath = path.join(process.cwd(), "public", music.path);
+          // First try in public directory
+          const publicMusicPath = path.join(
+            process.cwd(),
+            "public",
+            music.path
+          );
+          logger.info("Resolving music path", {
+            original: music.path,
+            publicPath: publicMusicPath,
+          });
           try {
-            await fs.promises.access(musicPath);
+            await fs.promises.access(publicMusicPath);
             musicConfig = {
-              path: musicPath,
+              path: publicMusicPath,
               volume: music.volume,
               startTime: music.startTime,
             };
-            logger.info(`[${jobId}] Using music track`, {
+            logger.info(`[${jobId}] Using music track from public directory`, {
               originalPath: music.path,
-              resolvedPath: musicPath,
+              resolvedPath: publicMusicPath,
               volume: music.volume,
               startTime: music.startTime,
             });
           } catch (error) {
             logger.warn(
-              `[${jobId}] Music file not found, proceeding without music`,
+              `[${jobId}] Music file not found in public directory, trying alternative paths`,
               {
-                path: musicPath,
                 error: error instanceof Error ? error.message : "Unknown error",
               }
             );
+            // Try alternative paths
+            const altPaths = [
+              path.join(process.cwd(), music.path),
+              path.join(__dirname, "../../../public", music.path),
+              path.join(__dirname, "../../../", music.path),
+            ];
+
+            for (const altPath of altPaths) {
+              try {
+                await fs.promises.access(altPath);
+                musicConfig = {
+                  path: altPath,
+                  volume: music.volume,
+                  startTime: music.startTime,
+                };
+                logger.info(
+                  `[${jobId}] Using music track from alternative path`,
+                  {
+                    originalPath: music.path,
+                    resolvedPath: altPath,
+                    volume: music.volume,
+                    startTime: music.startTime,
+                  }
+                );
+                break;
+              } catch (err) {
+                // Continue to next path
+              }
+            }
+
+            if (!musicConfig) {
+              logger.error(
+                `[${jobId}] Music file not found in any location, proceeding without music`,
+                {
+                  originalPath: music.path,
+                  triedPaths: [publicMusicPath, ...altPaths],
+                  error:
+                    error instanceof Error ? error.message : "Unknown error",
+                }
+              );
+            }
           }
         }
 
@@ -539,7 +587,7 @@ export class TemplateService {
           clips.map((clip) => clip.path),
           clips.map((clip) => clip.duration),
           outputPath,
-          musicConfig
+          musicConfig ? { music: musicConfig } : undefined
         );
 
         return outputPath;
@@ -550,6 +598,89 @@ export class TemplateService {
         delays: [2000, 5000, 10000],
       }
     );
+  }
+
+  public async createTemplate(
+    templateKey: TemplateKey,
+    videoFiles: string[],
+    mapVideo?: string
+  ): Promise<Array<{ path: string; duration: number }>> {
+    logger.info("Creating template", {
+      hasMapVideo: !!mapVideo,
+      templateKey,
+      videoCount: videoFiles.length,
+    });
+
+    const template = reelTemplates[templateKey];
+    if (!template) {
+      throw new Error(`Template ${templateKey} not found`);
+    }
+
+    // Validate video count
+    if (videoFiles.length === 0) {
+      throw new Error("No video files provided");
+    }
+
+    // For templates with map video
+    if (templateKey === "googlezoomintro") {
+      if (!mapVideo) {
+        throw new Error("Map video is required for googlezoomintro template");
+      }
+
+      const orderedVideos: Array<{ path: string; duration: number }> = [];
+      const durations = template.durations as Record<string | number, number>;
+
+      // Process each item in the sequence
+      for (const key of template.sequence) {
+        if (key === "map") {
+          orderedVideos.push({ path: mapVideo, duration: durations["map"] });
+        } else {
+          const index = typeof key === "string" ? parseInt(key) : key;
+          if (index < 0 || index >= videoFiles.length) {
+            throw new Error(
+              `Invalid video index ${index} for template ${templateKey}`
+            );
+          }
+          orderedVideos.push({
+            path: videoFiles[index],
+            duration: durations[key.toString()],
+          });
+        }
+      }
+
+      logger.info("Template clips created", {
+        clipCount: orderedVideos.length,
+        clipPaths: orderedVideos.map((c) => c.path),
+        durations: orderedVideos.map((c) => c.duration),
+        hasMapVideo: true,
+      });
+
+      return orderedVideos;
+    }
+
+    // Regular template processing
+    const orderedVideos = template.sequence.map((index) => {
+      const videoIndex = typeof index === "number" ? index : parseInt(index);
+      if (videoIndex < 0 || videoIndex >= videoFiles.length) {
+        throw new Error(
+          `Invalid video index ${videoIndex} for template ${templateKey}`
+        );
+      }
+      const durations = template.durations as number[];
+      return {
+        path: videoFiles[videoIndex],
+        duration: durations[videoIndex],
+      };
+    });
+
+    logger.info("Template clips created", {
+      clipCount: orderedVideos.length,
+      clipPaths: orderedVideos.map((c) => c.path),
+      durations: orderedVideos.map((c) => c.duration),
+      hasMapVideo: false,
+    });
+
+    return orderedVideos;
   }
 }
 

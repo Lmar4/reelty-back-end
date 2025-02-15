@@ -55,6 +55,8 @@ export interface ReelTemplate {
     volume?: number;
     /** Start time offset in seconds (optional) */
     startTime?: number;
+    /** Whether the music track is available and valid */
+    isValid?: boolean;
   };
   /** Optional transition effects between clips */
   transitions?: {

@@ -288,4 +288,33 @@ export class VisionProcessor {
       })
       .toBuffer();
   }
+
+  /**
+   * Gets the dimensions of an image
+   * @param imagePath Path to the image file
+   * @returns Promise with the width and height of the image
+   */
+  async getImageDimensions(
+    imagePath: string
+  ): Promise<{ width: number; height: number }> {
+    try {
+      await this.validateImage(imagePath);
+      const metadata = await sharp(imagePath).metadata();
+
+      if (!metadata.width || !metadata.height) {
+        throw new Error("Unable to get image dimensions");
+      }
+
+      return {
+        width: metadata.width,
+        height: metadata.height,
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to get image dimensions: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
 }

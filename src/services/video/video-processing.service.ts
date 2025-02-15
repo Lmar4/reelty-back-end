@@ -22,28 +22,62 @@
 
 import ffmpeg from "fluent-ffmpeg";
 import * as fs from "fs";
+import * as fsPromises from "fs/promises";
 import * as path from "path";
+import { logger } from "../../utils/logger";
+import { ReelTemplate } from "../imageProcessing/templates/types";
 
 export interface VideoClip {
   path: string;
   duration: number;
 }
 
-export interface MusicConfig {
-  path: string;
-  volume?: number;
-  startTime?: number;
-}
-
 export interface VideoProcessingOptions {
-  music?: MusicConfig;
+  music?: ReelTemplate;
   reverse?: boolean;
 }
 
 export class VideoProcessingService {
   private static instance: VideoProcessingService;
+  private readonly TEMP_DIR = process.env.TEMP_OUTPUT_DIR || "./temp";
 
-  private constructor() {}
+  private constructor() {
+    // Ensure temp directory exists
+    if (!fs.existsSync(this.TEMP_DIR)) {
+      fs.mkdirSync(this.TEMP_DIR, { recursive: true });
+    }
+
+    // Setup periodic cleanup
+    setInterval(() => this.cleanupStaleFiles(), 3600000); // Run every hour
+  }
+
+  private async cleanupStaleFiles() {
+    try {
+      const files = await fs.promises.readdir(this.TEMP_DIR);
+      const now = Date.now();
+      const TWO_HOURS = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
+
+      for (const file of files) {
+        const filePath = path.join(this.TEMP_DIR, file);
+        try {
+          const stats = await fs.promises.stat(filePath);
+
+          // Check if file is older than 2 hours
+          if (now - stats.mtimeMs > TWO_HOURS) {
+            // Check if it's a failed video (0 bytes) or a regular file
+            if (stats.size === 0 || path.extname(file) === ".mp4") {
+              await fs.promises.unlink(filePath);
+              logger.info("Cleaned up stale file:", { filePath });
+            }
+          }
+        } catch (error) {
+          logger.error("Error checking file:", { file, error });
+        }
+      }
+    } catch (error) {
+      logger.error("Error during cleanup:", { error });
+    }
+  }
 
   public static getInstance(): VideoProcessingService {
     if (!VideoProcessingService.instance) {
@@ -53,103 +87,181 @@ export class VideoProcessingService {
   }
 
   public async stitchVideos(
-    inputFiles: string[],
+    clipPaths: string[],
     durations: number[],
     outputPath: string,
-    musicConfig?: MusicConfig
+    template?:
+      | ReelTemplate
+      | { music?: { path: string; volume?: number; startTime?: number } }
   ): Promise<void> {
-    console.log("Starting video stitching with:", {
-      videoCount: inputFiles.length,
-      durations,
-      outputPath,
-      hasMusicTrack: !!musicConfig,
-      reverse: false,
-    });
-
-    if (inputFiles.length === 0) {
+    if (clipPaths.length === 0) {
       throw new Error("No input files provided");
     }
 
-    if (inputFiles.length !== durations.length) {
+    if (clipPaths.length !== durations.length) {
       throw new Error("Number of input files must match number of durations");
     }
 
     const command = ffmpeg();
 
-    // Add input videos
-    inputFiles.forEach((file) => {
-      command.input(file);
+    // Add input clips
+    clipPaths.forEach((path) => {
+      command.input(path);
     });
 
-    // Add music track if provided
-    if (musicConfig) {
-      console.log("Using music path:", musicConfig.path);
-      command.input(musicConfig.path);
+    // Add music track if available
+    let musicIndex = -1;
+    if (template?.music?.path) {
+      try {
+        await fsPromises.access(template.music.path, fs.constants.R_OK);
+        musicIndex = clipPaths.length;
+        command.input(template.music.path);
+      } catch (error) {
+        logger.warn("Music file not accessible:", {
+          path: template.music.path,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
     }
 
-    // Build complex filter
-    let filterComplex = "";
-    const videoLabels: string[] = [];
+    // Create filter complex commands
+    const filterCommands = [];
 
-    // Process each video
-    inputFiles.forEach((_, i) => {
-      const label = `v${i}`;
-      filterComplex += `[${i}:v]setpts=PTS-STARTPTS,scale=768:1280:force_original_aspect_ratio=decrease,pad=768:1280:(ow-iw)/2:(oh-ih)/2,trim=duration=${durations[i]},setpts=PTS-STARTPTS[${label}];`;
-      videoLabels.push(`[${label}]`);
-    });
-
-    // Concatenate videos
-    filterComplex += `${videoLabels.join("")}concat=n=${
-      inputFiles.length
-    }:v=1:a=0[outv]`;
-
-    // Process audio if music is provided
-    if (musicConfig) {
-      const totalDuration = durations.reduce((sum, d) => sum + d, 0);
-      const audioIndex = inputFiles.length; // Audio input is after all videos
-      const volume = musicConfig.volume || 0.8; // Default volume if not specified
-      const startTime = musicConfig.startTime || 0;
-      filterComplex += `;[${audioIndex}:a]asetpts=PTS-STARTPTS,atrim=start=${startTime}:duration=${totalDuration},volume=${volume}:eval=frame,afade=t=out:st=${
-        totalDuration - 1
-      }:d=1[outa]`;
-    }
-
-    command
-      .complexFilter(filterComplex)
-      .outputOptions("-c:v", "libx264")
-      .outputOptions("-preset", "slow")
-      .outputOptions("-crf", "18")
-      .outputOptions("-r", "24")
-      .outputOptions("-c:a", "aac")
-      .outputOptions("-shortest");
-
-    if (musicConfig) {
-      command.outputOptions("-map", "[outv]").outputOptions("-map", "[outa]");
-    } else {
-      command.outputOptions("-map", "[outv]");
-    }
-
-    command.output(outputPath);
-
-    try {
-      await new Promise<void>((resolve, reject) => {
-        command
-          .on("start", (commandLine) => {
-            console.log("FFmpeg started:", commandLine);
-          })
-          .on("error", (err, stdout, stderr) => {
-            console.error("FFmpeg error:", err);
-            reject(new Error(`FFmpeg error: ${err.message}`));
-          })
-          .on("end", () => {
-            resolve();
-          })
-          .run();
+    // Process each clip with scaling and padding
+    for (let i = 0; i < clipPaths.length; i++) {
+      // Scale all videos to 768x1280 to match map zoom video dimensions
+      filterCommands.push({
+        filter: "scale",
+        options: "768:1280:force_original_aspect_ratio=decrease",
+        inputs: [`${i}:v`],
+        outputs: [`scaled${i}`],
       });
-    } catch (error) {
-      console.error("Error during video stitching:", error);
-      throw error;
+
+      // Add padding to maintain aspect ratio
+      filterCommands.push({
+        filter: "pad",
+        options: "768:1280:(ow-iw)/2:(oh-ih)/2",
+        inputs: [`scaled${i}`],
+        outputs: [`padded${i}`],
+      });
+
+      // Add contrast and color adjustments
+      filterCommands.push({
+        filter: "eq",
+        options: "contrast=0.9:brightness=0.05:saturation=0.95",
+        inputs: [`padded${i}`],
+        outputs: [`eq${i}`],
+      });
+
+      // Set presentation timestamp (PTS) for proper timing
+      filterCommands.push({
+        filter: "setpts",
+        options: "PTS-STARTPTS",
+        inputs: [`eq${i}`],
+        outputs: [`pts${i}`],
+      });
     }
+
+    // Add concat filter for video
+    filterCommands.push({
+      filter: "concat",
+      options: `n=${clipPaths.length}:v=1:a=0`,
+      inputs: clipPaths.map((_, i) => `pts${i}`),
+      outputs: ["outv"],
+    });
+
+    // Process audio if available
+    if (musicIndex !== -1) {
+      const totalDuration = durations.reduce((sum, d) => sum + d, 0);
+      const volume = template?.music?.volume || 0.8;
+      const startTime = template?.music?.startTime || 0;
+      const fadeStart = Math.max(0, totalDuration - 1);
+
+      filterCommands.push({
+        filter: "aformat",
+        options: "sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+        inputs: [`${musicIndex}:a`],
+        outputs: ["a1"],
+      });
+
+      if (startTime > 0) {
+        filterCommands.push({
+          filter: "atrim",
+          options: `start=${startTime}`,
+          inputs: ["a1"],
+          outputs: ["a1_trimmed"],
+        });
+      }
+
+      filterCommands.push({
+        filter: "atrim",
+        options: `duration=${totalDuration}`,
+        inputs: [startTime > 0 ? "a1_trimmed" : "a1"],
+        outputs: ["a2"],
+      });
+
+      filterCommands.push({
+        filter: "volume",
+        options: `${volume}:eval=frame`,
+        inputs: ["a2"],
+        outputs: ["a3"],
+      });
+
+      filterCommands.push({
+        filter: "afade",
+        options: `t=out:st=${fadeStart}:d=1`,
+        inputs: ["a3"],
+        outputs: ["outa"],
+      });
+    }
+
+    // Apply filter complex
+    command.complexFilter(filterCommands);
+
+    // Set output options with high quality settings
+    const outputOptions = [
+      "-map",
+      "[outv]",
+      "-c:v",
+      "libx264",
+      "-preset",
+      "slow",
+      "-crf",
+      "18",
+      "-r",
+      "24",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-level",
+      "4.0",
+      "-movflags",
+      "+faststart",
+    ];
+
+    if (musicIndex !== -1) {
+      outputOptions.push(
+        "-map",
+        "[outa]",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest"
+      );
+    }
+
+    command.outputOptions(outputOptions);
+
+    // Execute the command
+    return new Promise<void>((resolve, reject) => {
+      command
+        .output(outputPath)
+        .on("end", () => resolve())
+        .on("error", (err: Error) => reject(err))
+        .run();
+    });
   }
 
   public async batchProcessVideos(
@@ -224,6 +336,27 @@ export class VideoProcessingService {
         console.error("Error cleaning up temporary files:", error);
       }
     }
+  }
+
+  async createVideoFromClips(
+    clips: VideoClip[],
+    outputPath: string,
+    template?: ReelTemplate
+  ): Promise<void> {
+    return this.stitchVideos(
+      clips.map((c) => c.path),
+      clips.map((c) => c.duration),
+      outputPath,
+      template
+    );
+  }
+
+  async processClips(
+    clips: VideoClip[],
+    outputPath: string,
+    template?: ReelTemplate
+  ): Promise<void> {
+    return this.createVideoFromClips(clips, outputPath, template);
   }
 }
 
