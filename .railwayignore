@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+output/
+logs/
+uploads/
+tmp/
+temp/
+prisma/migrations/
+prisma/dev.db
+prisma/dev.db-journal
