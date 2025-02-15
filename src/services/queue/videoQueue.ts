@@ -522,11 +522,14 @@ export class VideoQueueService {
 
   private async createMapVideo(coordinates: any): Promise<string> {
     try {
-      // Create map frames
-      const framesDir = await mapCaptureService.captureMapFrames(coordinates);
+      // Generate a unique job ID for logging
+      const jobId = `map-${Date.now()}`;
 
-      // Create video from frames
-      const outputPath = await mapCaptureService.createVideo(framesDir);
+      // Use the higher-level generateMapVideo function that handles browser/page lifecycle
+      const outputPath = await mapCaptureService.generateMapVideo(
+        coordinates,
+        jobId
+      );
 
       return outputPath;
     } catch (error) {
