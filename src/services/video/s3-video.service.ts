@@ -2,12 +2,15 @@ import {
   S3Client,
   GetObjectCommand,
   HeadObjectCommand,
+  CopyObjectCommand,
+  DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import * as fs from "fs";
 import { logger } from "../../utils/logger";
 import "dotenv/config";
+import * as path from "path";
 
 export class S3VideoService {
   private static instance: S3VideoService;
@@ -45,8 +48,16 @@ export class S3VideoService {
     return { bucket, key: key.split("?")[0] }; // Remove query parameters
   }
 
-  public getPublicUrl(bucket: string, key: string): string {
-    return `https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+  public getPublicUrl(key: string, bucket?: string): string {
+    const region = process.env.AWS_REGION || "us-east-2";
+    const bucketName =
+      bucket || process.env.AWS_BUCKET || "reelty-prod-storage";
+    if (!bucketName) {
+      throw new Error(
+        "AWS_BUCKET environment variable is not set and no bucket name provided"
+      );
+    }
+    return `https://${bucketName}.s3.${region}.amazonaws.com/${key}`;
   }
 
   public async uploadVideo(localPath: string, s3Path: string): Promise<string> {
@@ -75,7 +86,7 @@ export class S3VideoService {
       logger.info("Video uploaded successfully", { localPath, s3Path });
 
       // Return public HTTPS URL instead of S3 protocol URL
-      return this.getPublicUrl(bucketName, key);
+      return this.getPublicUrl(key, bucketName);
     } catch (error) {
       logger.error("S3 video upload failed:", {
         error: error instanceof Error ? error.message : "Unknown error",
@@ -154,7 +165,7 @@ export class S3VideoService {
       await upload.done();
       logger.info("File uploaded successfully", { s3Key });
 
-      return this.getPublicUrl(bucketName, s3Key);
+      return this.getPublicUrl(s3Key, bucketName);
     } catch (error) {
       logger.error("S3 file upload failed:", {
         error: error instanceof Error ? error.message : "Unknown error",
@@ -184,6 +195,54 @@ export class S3VideoService {
       });
       throw error;
     }
+  }
+
+  public async moveFromTempToListing(
+    tempKey: string,
+    listingId: string,
+    photoId: string
+  ): Promise<{ originalUrl: string; webpUrl: string }> {
+    const bucketName = process.env.AWS_BUCKET;
+    if (!bucketName)
+      throw new Error("AWS_BUCKET environment variable is not set");
+
+    const filename = path.basename(tempKey);
+    const originalKey = `properties/${listingId}/images/original/${photoId}-${filename}`;
+    const webpKey = `properties/${listingId}/images/webp/${photoId}-${filename}.webp`;
+
+    // Move original file
+    await this.s3Client.send(
+      new CopyObjectCommand({
+        Bucket: bucketName,
+        CopySource: `${bucketName}/${tempKey}`,
+        Key: originalKey,
+      })
+    );
+
+    // Move WebP version (assuming it exists in temp with .webp extension)
+    const tempWebpKey = tempKey.replace(/\.[^/.]+$/, ".webp");
+    await this.s3Client.send(
+      new CopyObjectCommand({
+        Bucket: bucketName,
+        CopySource: `${bucketName}/${tempWebpKey}`,
+        Key: webpKey,
+      })
+    );
+
+    // Delete temp files
+    await Promise.all([
+      this.s3Client.send(
+        new DeleteObjectCommand({ Bucket: bucketName, Key: tempKey })
+      ),
+      this.s3Client.send(
+        new DeleteObjectCommand({ Bucket: bucketName, Key: tempWebpKey })
+      ),
+    ]);
+
+    return {
+      originalUrl: this.getPublicUrl(originalKey),
+      webpUrl: this.getPublicUrl(webpKey),
+    };
   }
 }
 

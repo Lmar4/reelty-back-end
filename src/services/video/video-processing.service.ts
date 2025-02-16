@@ -35,6 +35,13 @@ export interface VideoClip {
 export interface VideoProcessingOptions {
   music?: ReelTemplate;
   reverse?: boolean;
+  transitions?: {
+    type: 'crossfade' | 'fade' | 'slide';
+    duration: number;
+  }[];
+  colorCorrection?: {
+    ffmpegFilter: string;
+  };
 }
 
 export class VideoProcessingService {
@@ -90,9 +97,7 @@ export class VideoProcessingService {
     clipPaths: string[],
     durations: number[],
     outputPath: string,
-    template?:
-      | ReelTemplate
-      | { music?: { path: string; volume?: number; startTime?: number } }
+    template?: ReelTemplate
   ): Promise<void> {
     if (clipPaths.length === 0) {
       throw new Error("No input files provided");

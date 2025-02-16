@@ -16,13 +16,8 @@
 import * as fs from "fs";
 import * as path from "path";
 import { logger } from "../../utils/logger";
-import {
-  ReelTemplate,
-  reelTemplates,
-  TemplateKey,
-} from "../imageProcessing/templates/types";
+import { reelTemplates, TemplateKey, ReelTemplate } from "../imageProcessing/templates/types";
 import { VideoClip } from "./video-processing.service";
-import { promises as fsPromises } from "fs";
 
 interface MusicConfig {
   path: string;
@@ -85,6 +80,40 @@ export class VideoTemplateService {
       searchedPaths: possiblePaths,
     });
     return null;
+  }
+
+  /**
+   * Validates template transitions configuration
+   */
+  private validateTransitions(template: ReelTemplate): void {
+    if (template.transitions) {
+      if (!Array.isArray(template.transitions)) {
+        throw new Error('Template transitions must be an array');
+      }
+      
+      template.transitions.forEach((transition, index) => {
+        if (!transition.type || !transition.duration) {
+          throw new Error(`Invalid transition at index ${index}`);
+        }
+        if (!['crossfade', 'fade', 'slide'].includes(transition.type)) {
+          throw new Error(`Invalid transition type at index ${index}`);
+        }
+        if (transition.duration <= 0) {
+          throw new Error(`Invalid transition duration at index ${index}`);
+        }
+      });
+    }
+  }
+
+  /**
+   * Validates template color correction configuration
+   */
+  private validateColorCorrection(template: ReelTemplate): void {
+    if (template.colorCorrection) {
+      if (!template.colorCorrection.ffmpegFilter) {
+        throw new Error('Color correction must include ffmpeg filter string');
+      }
+    }
   }
 
   public async createTemplate(
