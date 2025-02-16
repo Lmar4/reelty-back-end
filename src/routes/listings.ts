@@ -1,15 +1,14 @@
 import { Prisma, PrismaClient } from "@prisma/client";
 import express, { Request, Response } from "express";
 import multer from "multer";
+import path from "path";
 import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
 import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
 import { StorageService } from "../services/storage";
-import { logger } from "../utils/logger";
-import { VideoGenerationStatus } from "@prisma/client";
-import path from "path";
 import { s3VideoService } from "../services/video/s3-video.service";
+import { logger } from "../utils/logger";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -240,8 +239,12 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Construct the full S3 URL in the backend
-    const s3Url = `https://${process.env.AWS_BUCKET}.s3.amazonaws.com/${s3Key}`;
+    // Get bucket name from environment variable
+    const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
+    const region = process.env.AWS_REGION || "us-east-2";
+
+    // Construct the full S3 URL with proper bucket name and region
+    const s3Url = `https://${bucketName}.s3.${region}.amazonaws.com/${s3Key}`;
 
     logger.info("[LISTINGS] Processing photo upload:", {
       listingId,
@@ -597,6 +600,97 @@ router.get(
       res.status(500).json({
         success: false,
         error: "Failed to fetch photo status",
+      });
+    }
+  }
+);
+
+// Add this new endpoint to get latest videos
+router.get(
+  "/:listingId/latest-videos",
+  isAuthenticated,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { listingId } = req.params;
+      const userId = req.user!.id;
+
+      // Validate listingId
+      if (!listingId || listingId === "undefined") {
+        logger.error("[LATEST_VIDEOS_ERROR] Invalid listingId", {
+          listingId,
+          userId,
+        });
+        res.status(400).json({
+          success: false,
+          error: "Invalid listing ID",
+        });
+        return;
+      }
+
+      logger.info("[LATEST_VIDEOS] Fetching videos", {
+        listingId,
+        userId,
+      });
+
+      const videos = await prisma.videoJob.findMany({
+        where: {
+          listingId,
+          userId,
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+        select: {
+          id: true,
+          status: true,
+          outputFile: true,
+          thumbnailUrl: true,
+          createdAt: true,
+          metadata: true,
+        },
+      });
+
+      // Calculate processing status
+      const processingCount = videos.filter(
+        (v) => v.status === "PROCESSING" || v.status === "QUEUED"
+      ).length;
+      const failedCount = videos.filter((v) => v.status === "FAILED").length;
+      const completedCount = videos.filter(
+        (v) => v.status === "COMPLETED"
+      ).length;
+
+      // Determine if polling should end (no processing jobs and at least one video)
+      const shouldEndPolling = processingCount === 0 && videos.length > 0;
+
+      logger.info("[LATEST_VIDEOS] Found videos", {
+        listingId,
+        count: videos.length,
+        processing: processingCount,
+        failed: failedCount,
+        completed: completedCount,
+        shouldEndPolling,
+      });
+
+      res.json({
+        success: true,
+        videos,
+        status: {
+          isProcessing: processingCount > 0,
+          processingCount,
+          failedCount,
+          completedCount,
+          totalCount: videos.length,
+          shouldEndPolling,
+        },
+      });
+    } catch (error) {
+      logger.error("[LATEST_VIDEOS_ERROR]", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      res.status(500).json({
+        success: false,
+        error: "Failed to fetch latest videos",
       });
     }
   }
