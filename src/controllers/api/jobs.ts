@@ -2,7 +2,7 @@ import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { z } from "zod";
 import { ProductionPipeline } from "../../services/imageProcessing/productionPipeline";
-
+import { TemplateKey } from "../../services/imageProcessing/templates/types";
 const prisma = new PrismaClient();
 
 // Validation schemas
@@ -48,7 +48,7 @@ export async function submitJob(
       .execute({
         jobId: job.id,
         inputFiles: validatedData.images,
-        template: validatedData.template,
+        template: validatedData.template as TemplateKey,
       })
       .catch(console.error);
 

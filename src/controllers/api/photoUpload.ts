@@ -86,6 +86,7 @@ export async function handlePhotoUpload(
         userId: validatedData.userId,
         listingId: validatedData.listingId,
         filePath: `s3://${process.env.PHOTOS_BUCKET_NAME}/${key}`,
+        s3Key: key,
       },
     });
 

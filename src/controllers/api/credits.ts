@@ -29,12 +29,11 @@ export const getBalance = async (
       where: {
         userId,
         creditsRemaining: { gt: 0 },
-        expiryDate: { gt: new Date() },
       },
     });
 
     const totalCredits = listingCredits.reduce(
-      (sum: number, credit: ListingCredit) => sum + credit.creditsRemaining,
+      (sum, credit) => sum + credit.creditsRemaining,
       0
     );
 
@@ -59,7 +58,7 @@ export const getBalance = async (
         total,
         available,
         used,
-      }
+      },
     });
   } catch (error) {
     console.error("[GET_BALANCE_ERROR]", error);
@@ -82,12 +81,11 @@ export const checkCredits = async (
       where: {
         userId,
         creditsRemaining: { gt: 0 },
-        expiryDate: { gt: new Date() },
       },
     });
 
     const totalCredits = listingCredits.reduce(
-      (sum: number, credit: ListingCredit) => sum + credit.creditsRemaining,
+      (sum, credit) => sum + credit.creditsRemaining,
       0
     );
 
@@ -118,14 +116,13 @@ export const deductCredits = async (
         where: {
           userId,
           creditsRemaining: { gt: 0 },
-          expiryDate: { gt: new Date() },
         },
-        orderBy: { expiryDate: "asc" }, // Use credits expiring soonest first
+        orderBy: { createdAt: "asc" }, // Use oldest credits first
       });
 
       // Calculate total available credits
       const totalCredits = listingCredits.reduce(
-        (sum: number, credit: ListingCredit) => sum + credit.creditsRemaining,
+        (sum, credit) => sum + credit.creditsRemaining,
         0
       );
 
@@ -185,10 +182,12 @@ export const getCreditHistory = async (
     }
 
     const { userId } = req.params;
-    
+
     // Only allow users to view their own credit history
     if (userId !== authUserId) {
-      res.status(403).json({ error: "Not authorized to view this credit history" });
+      res
+        .status(403)
+        .json({ error: "Not authorized to view this credit history" });
       return;
     }
 
@@ -198,9 +197,9 @@ export const getCreditHistory = async (
       take: 50, // Limit to last 50 transactions
     });
 
-    res.json({ 
+    res.json({
       success: true,
-      data: creditLogs
+      data: creditLogs,
     });
   } catch (error) {
     console.error("[CREDIT_HISTORY_ERROR]", error);

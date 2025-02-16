@@ -1,5 +1,5 @@
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { PrismaClient } from "@prisma/client";
+import { Request, Response } from "express";
 import Stripe from "stripe";
 import { z } from "zod";
 
@@ -9,34 +9,35 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
 });
 
 const paymentIntentSchema = z.object({
-  userId: z.string().uuid(),
+  userId: z.string(),
   subscriptionPlan: z.string(),
 });
 
 // Schema for subscription tier sync
 const tierSyncSchema = z.object({
-  tierId: z.string().uuid(),
+  tierId: z.string(),
 });
 
 // Schema for checkout session
 const checkoutSessionSchema = z.object({
-  userId: z.string().uuid(),
-  tierId: z.string().uuid(),
+  userId: z.string(),
+  tierId: z.string(),
 });
 
-export async function createPaymentIntent(
-  event: APIGatewayProxyEvent
-): Promise<APIGatewayProxyResult> {
-  try {
-    if (!event.body) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Request body is required" }),
-      };
-    }
+// Define metadata type for subscription tiers
+interface TierMetadata {
+  maxListings: number;
+  maxPhotosPerListing: number;
+  maxVideosPerMonth: number;
+  features: string[];
+}
 
-    const body = JSON.parse(event.body);
-    const validatedData = paymentIntentSchema.parse(body);
+export async function createPaymentIntent(
+  req: Request,
+  res: Response
+): Promise<void> {
+  try {
+    const validatedData = paymentIntentSchema.parse(req.body);
 
     // Get subscription tier details
     const tier = await prisma.subscriptionTier.findUnique({
@@ -44,26 +45,20 @@ export async function createPaymentIntent(
     });
 
     if (!tier) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Invalid subscription plan" }),
-      };
+      res.status(400).json({ error: "Invalid subscription plan" });
+      return;
     }
 
     if (!tier.monthlyPrice || tier.monthlyPrice < 0) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Invalid subscription price" }),
-      };
+      res.status(400).json({ error: "Invalid subscription price" });
+      return;
     }
 
     // Create PaymentIntent with safe price conversion
     const amount = Math.round(tier.monthlyPrice * 100);
     if (!Number.isFinite(amount) || amount <= 0) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Invalid price calculation" }),
-      };
+      res.status(400).json({ error: "Invalid price calculation" });
+      return;
     }
 
     const paymentIntent = await stripe.paymentIntents.create({
@@ -75,64 +70,45 @@ export async function createPaymentIntent(
       },
     });
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        clientSecret: paymentIntent.client_secret,
-        paymentIntentId: paymentIntent.id,
-      }),
-    };
+    res.status(200).json({
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id,
+    });
   } catch (error) {
     if (error instanceof z.ZodError) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({
-          error: "Validation error",
-          details: error.errors,
-        }),
-      };
+      res.status(400).json({
+        error: "Validation error",
+        details: error.errors,
+      });
+      return;
     }
 
     if (error instanceof Stripe.errors.StripeError) {
-      return {
-        statusCode: error.statusCode || 500,
-        body: JSON.stringify({
-          error: error.message,
-        }),
-      };
+      res.status(error.statusCode || 500).json({
+        error: error.message,
+      });
+      return;
     }
 
     console.error("Error creating payment intent:", error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: "Internal server error" }),
-    };
+    res.status(500).json({ error: "Internal server error" });
   }
 }
 
 export async function syncSubscriptionTier(
-  event: APIGatewayProxyEvent
-): Promise<APIGatewayProxyResult> {
+  req: Request,
+  res: Response
+): Promise<void> {
   try {
-    if (!event.body) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Request body is required" }),
-      };
-    }
-
-    const body = JSON.parse(event.body);
-    const { tierId } = tierSyncSchema.parse(body);
+    const { tierId } = tierSyncSchema.parse(req.body);
 
     const tier = await prisma.subscriptionTier.findUnique({
       where: { id: tierId },
     });
 
     if (!tier) {
-      return {
-        statusCode: 404,
-        body: JSON.stringify({ error: "Subscription tier not found" }),
-      };
+      res.status(404).json({ error: "Subscription tier not found" });
+      return;
     }
 
     // Create or update Stripe product
@@ -182,62 +158,53 @@ export async function syncSubscriptionTier(
       },
     });
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ product, price }),
-    };
+    res.status(200).json({ product, price });
   } catch (error) {
     console.error("Error syncing with Stripe:", error);
     if (error instanceof z.ZodError) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({
-          error: "Validation error",
-          details: error.errors,
-        }),
-      };
+      res.status(400).json({
+        error: "Validation error",
+        details: error.errors,
+      });
+      return;
     }
 
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: "Failed to sync with Stripe" }),
-    };
+    res.status(500).json({ error: "Failed to sync with Stripe" });
   }
 }
 
 export async function createCheckoutSession(
-  event: APIGatewayProxyEvent
-): Promise<APIGatewayProxyResult> {
+  req: Request,
+  res: Response
+): Promise<void> {
   try {
-    if (!event.body) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Request body is required" }),
-      };
-    }
-
-    const body = JSON.parse(event.body);
-    const { userId, tierId } = checkoutSessionSchema.parse(body);
+    const { userId, tierId } = checkoutSessionSchema.parse(req.body);
 
     // Get user and tier details
     const [user, tier] = await Promise.all([
       prisma.user.findUnique({ where: { id: userId } }),
-      prisma.subscriptionTier.findUnique({ where: { id: tierId } }),
+      prisma.subscriptionTier.findUnique({
+        where: { id: tierId },
+      }),
     ]);
 
     if (!user || !tier) {
-      return {
-        statusCode: 404,
-        body: JSON.stringify({ error: "User or tier not found" }),
-      };
+      res.status(404).json({ error: "User or tier not found" });
+      return;
     }
 
     if (!tier.stripePriceId) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "Tier not synced with Stripe" }),
-      };
+      res.status(400).json({ error: "Tier not synced with Stripe" });
+      return;
     }
+
+    // Parse tier metadata
+    const metadata: TierMetadata = {
+      maxListings: tier.maxActiveListings,
+      maxPhotosPerListing: tier.maxPhotosPerListing,
+      maxVideosPerMonth: tier.maxReelDownloads || 0,
+      features: tier.features,
+    };
 
     // Create or get Stripe customer
     let customerId = user.stripeCustomerId;
@@ -253,7 +220,7 @@ export async function createCheckoutSession(
       });
     }
 
-    // Create checkout session
+    // Create checkout session with metadata
     const session = await stripe.checkout.sessions.create({
       customer: customerId,
       mode: "subscription",
@@ -264,33 +231,32 @@ export async function createCheckoutSession(
           quantity: 1,
         },
       ],
-      success_url: `${process.env.FRONTEND_URL}/settings/billing?session_id={CHECKOUT_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL}/settings/billing`,
-      metadata: {
-        userId,
-        tierId,
+      subscription_data: {
+        metadata: {
+          userId,
+          tierId,
+          tierName: tier.name,
+          maxListings: metadata.maxListings,
+          maxPhotosPerListing: metadata.maxPhotosPerListing,
+          maxVideosPerMonth: metadata.maxVideosPerMonth,
+          features: JSON.stringify(metadata.features),
+        },
       },
+      success_url: `${process.env.FRONTEND_URL}/settings/billing?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/settings/billing`,
     });
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ sessionId: session.id, sessionUrl: session.url }),
-    };
+    res.status(200).json({ sessionId: session.id, sessionUrl: session.url });
   } catch (error) {
     console.error("Error creating checkout session:", error);
     if (error instanceof z.ZodError) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({
-          error: "Validation error",
-          details: error.errors,
-        }),
-      };
+      res.status(400).json({
+        error: "Validation error",
+        details: error.errors,
+      });
+      return;
     }
 
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: "Failed to create checkout session" }),
-    };
+    res.status(500).json({ error: "Failed to create checkout session" });
   }
 }
