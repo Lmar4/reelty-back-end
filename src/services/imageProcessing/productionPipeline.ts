@@ -13,6 +13,7 @@ import { runwayService } from "../video/runway.service";
 import { s3VideoService } from "../video/s3-video.service";
 import { videoTemplateService } from "../video/video-template.service";
 import { reelTemplates, TemplateKey } from "./templates/types";
+import { s3Service } from "../storage/s3.service";
 
 function isPhotoWithProcessedFile(photo: {
   processedFilePath: string | null;
@@ -475,19 +476,44 @@ export class ProductionPipeline {
       }
     }
 
-    // Convert input paths to WebP paths and verify they exist
+    // Log input files for debugging
+    logger.info(`[${jobId}] Input files for Runway processing:`, {
+      files: inputFiles,
+    });
+
+    // Convert input paths to WebP paths using s3VideoService
     const webpFiles = await Promise.all(
       inputFiles.map(async (filePath) => {
-        const webpPath = filePath
-          .replace("/images/original/", "/images/webp/")
-          .replace(/\.[^/.]+$/, ".webp");
-
         try {
-          await fs.access(webpPath);
-          return webpPath;
-        } catch {
+          // Use s3Key from database instead of parsing URL
+          const photo = await this.prisma.photo.findFirst({
+            where: {
+              filePath,
+            },
+          });
+
+          if (!photo) {
+            throw new Error(`Photo not found for path: ${filePath}`);
+          }
+
+          // Use s3Key to construct proper URL
+          const webpUrl = s3Service.getPublicUrl(
+            photo.s3Key
+              .replace("/original/", "/webp/")
+              .replace(/\.[^/.]+$/, ".webp")
+          );
+
+          logger.info(`[${jobId}] WebP conversion:`, {
+            original: filePath,
+            webp: webpUrl,
+            photoId: photo.id,
+          });
+
+          return webpUrl;
+        } catch (error) {
           logger.warn(
-            `[${jobId}] WebP version not found for ${filePath}, using original`
+            `[${jobId}] Error processing WebP path for ${filePath}:`,
+            error
           );
           return filePath;
         }
