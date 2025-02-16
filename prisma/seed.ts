@@ -1,5 +1,5 @@
 /// <reference types="node" />
-import { PrismaClient, AssetType } from "@prisma/client";
+import { PrismaClient, AssetType, PlanType } from "@prisma/client";
 import { SUBSCRIPTION_TIERS } from "../src/constants/subscription-tiers";
 
 const prisma = new PrismaClient();
@@ -74,6 +74,14 @@ async function main() {
       stripeProductId: "prod_basic",
       features: ["5 listings", "Basic templates", "Email support"],
       monthlyPrice: 0,
+      planType: PlanType.PAY_AS_YOU_GO,
+      creditsPerInterval: 5,
+      hasWatermark: true,
+      maxPhotosPerListing: 10,
+      maxReelDownloads: 5,
+      maxActiveListings: 5,
+      premiumTemplatesEnabled: false,
+      metadata: {},
     },
     {
       id: SUBSCRIPTION_TIERS.PRO,
@@ -88,6 +96,14 @@ async function main() {
         "Analytics",
       ],
       monthlyPrice: 29.99,
+      planType: PlanType.MONTHLY,
+      creditsPerInterval: 20,
+      hasWatermark: false,
+      maxPhotosPerListing: 20,
+      maxReelDownloads: 20,
+      maxActiveListings: 20,
+      premiumTemplatesEnabled: true,
+      metadata: {},
     },
     {
       id: SUBSCRIPTION_TIERS.ENTERPRISE,
@@ -102,6 +118,14 @@ async function main() {
         "API access",
       ],
       monthlyPrice: 99.99,
+      planType: PlanType.MONTHLY,
+      creditsPerInterval: 100,
+      hasWatermark: false,
+      maxPhotosPerListing: 50,
+      maxReelDownloads: null,
+      maxActiveListings: 100,
+      premiumTemplatesEnabled: true,
+      metadata: {},
     },
     {
       id: SUBSCRIPTION_TIERS.ADMIN,
@@ -111,6 +135,14 @@ async function main() {
       stripeProductId: "prod_admin",
       features: ["Full administrative access", "All features"],
       monthlyPrice: 0,
+      planType: PlanType.MONTHLY,
+      creditsPerInterval: -1,
+      hasWatermark: false,
+      maxPhotosPerListing: -1,
+      maxReelDownloads: null,
+      maxActiveListings: -1,
+      premiumTemplatesEnabled: true,
+      metadata: {},
     },
   ];
 
@@ -128,7 +160,7 @@ async function main() {
   const existingAdmin = await prisma.user.findFirst({
     where: {
       OR: [
-        { id: "user_2siThAOP4AfhLAITRyB9lsy9hw5" },
+        { id: "user_2slqwO8UeouJwKF3oOqyZQSxOuZ" },
         { email: "admin@reelty.app" },
       ],
     },

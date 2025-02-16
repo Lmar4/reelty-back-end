@@ -42,6 +42,11 @@ enum VideoGenerationStatus {
   CANCELLED
 }
 
+enum PlanType {
+  PAY_AS_YOU_GO
+  MONTHLY
+}
+
 model User {
   id                    String      @id // Clerk ID
   email                 String      @unique
@@ -103,12 +108,14 @@ model SubscriptionTier {
   stripeProductId      String   @unique
   features             String[]
   monthlyPrice         Float
-  creditExpirationDays Int      @default(30)     @map("credit_expiration_days")
-  creditRolloverMonths Int      @default(0)      @map("credit_rollover_months")
+  planType             PlanType @default(PAY_AS_YOU_GO) @map("plan_type")
+  creditsPerInterval   Int      @default(0)     @map("credits_per_interval")
   hasWatermark         Boolean  @default(true)   @map("has_watermark")
   maxPhotosPerListing  Int      @default(10)     @map("max_photos_per_listing")
   maxReelDownloads     Int?                      @map("max_reel_downloads")  // null means unlimited
   maxActiveListings    Int      @default(5)      @map("max_active_listings")
+  premiumTemplatesEnabled Boolean @default(false) @map("premium_templates_enabled")
+  metadata             Json?     @default("{}")
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
@@ -188,7 +195,6 @@ model ListingCredit {
   id               String   @id @default(uuid()) @db.Uuid
   userId           String   @map("user_id")
   creditsRemaining Int      @map("credits_remaining")
-  expiryDate       DateTime @map("expiry_date")
   createdAt        DateTime @default(now()) @map("created_at")
   updatedAt        DateTime @updatedAt @map("updated_at")
 
@@ -218,14 +224,16 @@ model Listing {
 }
 
 model Photo {
-  id          String   @id @default(uuid()) @db.Uuid
+  id          String   @id @default(cuid())
   userId      String   @map("user_id")
   listingId   String   @map("listing_id") @db.Uuid
-  filePath    String   @map("file_path")
-  processedFilePath String? @map("processed_file_path")
+  filePath    String   @map("file_path")      // Full URL for public access
+  s3Key       String   @map("s3_key")        // S3 key for internal operations
+  processedFilePath String? @map("processed_file_path") // URL for processed version
   order       Int      @default(0)
-  status      String   @default("pending") // pending, processing, completed, error
+  status      String   @default("pending")    // pending, processing, completed, error
   error       String?
+  metadata    Json?    @default("{}")       // Additional metadata
   runwayVideoPath String? @map("runway_video_path") // Store the individual video segment
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
