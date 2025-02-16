@@ -100,7 +100,7 @@ async function testWebPProcessing() {
       const { bucket, key } = s3VideoService.parseS3Path(
         `s3://${process.env.AWS_BUCKET}/${s3Key}`
       );
-      const publicUrl = s3VideoService.getPublicUrl(bucket, key);
+      const publicUrl = s3VideoService.getPublicUrl(key, bucket);
 
       results.push({
         originalImage: path.basename(image.path),

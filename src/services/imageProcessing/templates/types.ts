@@ -21,7 +21,9 @@ export type TemplateKey =
   | "crescendo"
   | "wave"
   | "storyteller"
-  | "googlezoomintro";
+  | "googlezoomintro"
+  | "wesanderson"
+  | "hyperpop";
 
 /**
  * Base configuration for all templates
@@ -47,6 +49,8 @@ export interface ReelTemplate {
   sequence: (number | string)[];
   /** Duration of each clip in seconds */
   durations: number[] | Record<string | number, number>;
+  /** Whether individual clips should be played in reverse */
+  reverseClips?: boolean;
   /** Music configuration for the template */
   music?: {
     /** Path to the music file */
@@ -65,6 +69,11 @@ export interface ReelTemplate {
     /** Duration of the transition in seconds */
     duration: number;
   }[];
+  /** Optional color correction settings */
+  colorCorrection?: {
+    /** FFmpeg filter string for color grading */
+    ffmpegFilter: string;
+  };
 }
 
 export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
@@ -72,21 +81,14 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
     name: "Crescendo",
     description:
       "A dynamic template that builds momentum with progressively longer clips",
-    sequence: [0, 5, 9, 4, 7, 1, 3, 6, 8, 2], // Custom sequence
+    sequence: [
+      4, 12, 7, 15, 2, 18, 9, 1, 16, 5, 13, 8, 19, 3, 11, 6, 14, 0, 17, 10,
+    ],
     durations: [
-      2.0833,
-      2.5,
-      2.5417,
-      2.9583,
-      0.3333,
-      0.3333,
-      1.9167,
-      2.5,
-      2.5417,
-      2.8333, // Original 24fps timings
+      1.8, 1.8333, 2.7833, 1.4833, 1.9333, 2.3333, 2.2667, 2.75, 3.1167, 3.1,
     ],
     music: {
-      path: "assets/music/upbeat.mp3",
+      path: "assets/music/crescendo.mp3",
       volume: 0.85,
     },
   },
@@ -94,10 +96,15 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
     name: "Wave",
     description:
       "An engaging rhythm that alternates between quick glimpses and lingering views",
-    sequence: [6, 2, 8, 1, 4, 9, 0, 3, 5, 7],
-    durations: [3.0, 0.4, 0.33, 2.63, 0.73, 1.3, 1.3, 0.73, 3.57, 3.57],
+    sequence: [
+      7, 15, 3, 11, 8, 16, 4, 12, 1, 19, 6, 14, 2, 10, 17, 5, 13, 9, 0, 18,
+    ],
+    durations: [
+      0.6667, 1.3333, 1.35, 1.3333, 1.3333, 1.3333, 0.7, 1.15, 1.4833, 0.6667,
+    ],
+    reverseClips: true,
     music: {
-      path: "assets/music/smooth.mp3",
+      path: "assets/music/wave.mp3",
       volume: 0.8,
     },
   },
@@ -105,12 +112,14 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
     name: "Storyteller",
     description:
       "A narrative-driven template that guides viewers through the property story",
-    sequence: [3, 7, 1, 9, 0, 5, 2, 8, 4, 6],
+    sequence: [
+      2, 10, 15, 7, 12, 4, 18, 1, 9, 16, 5, 13, 3, 11, 8, 19, 6, 14, 0, 17,
+    ],
     durations: [
-      3.75, 3.6667, 3.625, 3.625, 3.625, 3.625, 3.625, 3.625, 3.625, 3.625,
+      2.1167, 1.6, 1.2, 1.6333, 1.2, 1.6167, 2.8667, 2.8167, 2.7833, 2.8667,
     ],
     music: {
-      path: "assets/music/minimal.mp3",
+      path: "assets/music/storyteller.mp3",
       volume: 0.75,
     },
   },
@@ -118,23 +127,85 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
     name: "Google Zoom Intro",
     description:
       "Start with a dramatic Google Maps zoom into the property location, followed by property highlights",
-    sequence: ["map", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+    sequence: [
+      "map",
+      "0",
+      "8",
+      "15",
+      "3",
+      "11",
+      "6",
+      "17",
+      "4",
+      "12",
+      "9",
+      "1",
+      "14",
+      "7",
+      "19",
+      "5",
+      "13",
+      "2",
+      "10",
+      "16",
+      "18",
+    ],
     durations: {
-      map: 3.0, // Map zoom video (3 seconds)
-      0: 1.25,
-      1: 0.9583,
-      2: 0.9583,
-      3: 0.625,
-      4: 1.625,
-      5: 1.875,
-      6: 0.9167,
-      7: 1.125,
-      8: 1.0833,
-      9: 1.9583,
+      map: 3.0,
+      0: 1.6,
+      1: 1.2,
+      2: 1.6333,
+      3: 1.2,
+      4: 1.6167,
+      5: 2.8667,
+      6: 2.8167,
+      7: 2.7833,
+      8: 2.8667,
+      9: 1.05,
     },
     music: {
-      path: "assets/music/zoom.mp3",
+      path: "assets/music/googlezoomintro.mp3",
       volume: 0.8,
     },
   },
+  wesanderson: {
+    name: "Wes Anderson",
+    description:
+      "Symmetrical compositions with nostalgic color grading inspired by Wes Anderson's distinctive style",
+    sequence: [
+      5, 13, 8, 16, 2, 10, 15, 3, 11, 7, 19, 4, 12, 0, 17, 6, 14, 1, 9, 18,
+    ],
+    durations: [1.75, 1.7667, 1.65, 1.65, 1.65, 2.25, 1.1, 1.7, 1.65, 1.6333],
+    music: {
+      path: "assets/music/wesanderson.mp3",
+      volume: 0.75,
+    },
+    colorCorrection: {
+      ffmpegFilter: `eq=brightness=0.05:contrast=1.1:saturation=1.2:gamma=0.95,hue=h=2:s=1.1,colorbalance=rm=0.05:gm=-0.05:bm=-0.05,curves=master='0/0 0.5/0.55 1/1'`,
+    },
+  },
+  hyperpop: {
+    name: "Hyperpop",
+    description:
+      "Fast-paced, energetic cuts with rapid transitions and dynamic movement",
+    sequence: [
+      9, 17, 4, 12, 7, 15, 2, 10, 18, 5, 13, 1, 8, 16, 3, 11, 6, 14, 0, 19,
+    ],
+    durations: [
+      2.4167, 0.35, 2.7333, 2.4333, 2.7333, 0.7, 0.6667, 0.7667, 1.3667, 0.6833,
+    ],
+    reverseClips: true,
+    music: {
+      path: "assets/music/hyperpop.mp3",
+      volume: 0.9,
+    },
+  },
 } as const;
+
+type ValidateTemplates = keyof typeof reelTemplates extends TemplateKey
+  ? TemplateKey extends keyof typeof reelTemplates
+    ? true
+    : false
+  : false;
+type Assert<T extends true> = T;
+type _TypeCheck = Assert<ValidateTemplates>;

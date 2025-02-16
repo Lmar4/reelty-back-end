@@ -619,18 +619,16 @@ export class ImageToVideoConverter {
 
       // Handle map video for googlezoomintro template
       let mapVideo: string | undefined;
-      if (template === "googlezoomintro") {
+      if (reelTemplates[template].sequence.includes("map")) {
         const job = await prisma.videoJob.findUnique({
           where: { id: jobId },
           include: { listing: true },
         });
-
         if (job?.listing?.coordinates) {
           const coordinates =
             typeof job.listing.coordinates === "string"
               ? JSON.parse(job.listing.coordinates)
               : job.listing.coordinates;
-
           console.log(
             `[TEMPLATE_PROCESSING] Generating map video for coordinates:`,
             {
@@ -638,12 +636,10 @@ export class ImageToVideoConverter {
               template,
             }
           );
-
           mapVideo = await MapCaptureService.getInstance().generateMapVideo(
             coordinates,
             jobId
           );
-
           console.log(`[TEMPLATE_PROCESSING] Map video generated:`, {
             mapVideoPath: mapVideo,
             template,
@@ -817,7 +813,7 @@ export class ImageToVideoConverter {
       const runwayVideos = await Promise.all(
         processedImages.map(async (s3WebpPath, index) => {
           const { bucket, key } = s3VideoService.parseS3Path(s3WebpPath);
-          const publicUrl = s3VideoService.getPublicUrl(bucket, key);
+          const publicUrl = s3VideoService.getPublicUrl(key, bucket);
 
           console.log("Using public URL for Runway:", publicUrl);
 

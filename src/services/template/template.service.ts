@@ -9,10 +9,32 @@ import {
   videoProcessingService,
 } from "../video/video-processing.service";
 import { videoTemplateService } from "../video/video-template.service";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Prisma } from "@prisma/client";
 import * as fs from "fs";
 
 const prisma = new PrismaClient();
+
+// Define the extended SubscriptionTier type that includes our new fields
+type SubscriptionTierWithPremium = Prisma.SubscriptionTierGetPayload<{
+  select: {
+    id: true;
+    name: true;
+    description: true;
+    stripePriceId: true;
+    stripeProductId: true;
+    features: true;
+    monthlyPrice: true;
+    planType: true;
+    creditsPerInterval: true;
+    hasWatermark: true;
+    maxPhotosPerListing: true;
+    maxReelDownloads: true;
+    maxActiveListings: true;
+    premiumTemplatesEnabled: true;
+    createdAt: true;
+    updatedAt: true;
+  };
+}>;
 
 export interface ProcessingResult {
   success: boolean;
@@ -23,8 +45,11 @@ export interface ProcessingResult {
 
 export class TemplateService {
   private static instance: TemplateService;
+  private prisma: PrismaClient;
 
-  private constructor() {}
+  private constructor() {
+    this.prisma = new PrismaClient();
+  }
 
   public static getInstance(): TemplateService {
     if (!TemplateService.instance) {
@@ -33,22 +58,87 @@ export class TemplateService {
     return TemplateService.instance;
   }
 
+  public async checkTemplateAccess(
+    userId: string,
+    template: TemplateKey
+  ): Promise<boolean> {
+    try {
+      // Get user's subscription tier
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          currentTierId: true,
+          currentTier: {
+            select: {
+              premiumTemplatesEnabled: true,
+            },
+          },
+        },
+      });
+
+      if (!user?.currentTierId || !user.currentTier) {
+        logger.warn(`No subscription tier found for user ${userId}`);
+        return false;
+      }
+
+      // Check if the template is premium and if the user has access
+      const isPremiumTemplate = this.isPremiumTemplate(template);
+      if (isPremiumTemplate && !user.currentTier.premiumTemplatesEnabled) {
+        logger.info(
+          `User ${userId} does not have access to premium template ${template}`
+        );
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      logger.error("Error checking template access", {
+        userId,
+        template,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      return false;
+    }
+  }
+
+  private isPremiumTemplate(template: TemplateKey): boolean {
+    // Define which templates are premium
+    const premiumTemplates: TemplateKey[] = ["googlezoomintro", "crescendo"];
+    return premiumTemplates.includes(template);
+  }
+
   public async processTemplate(
     template: TemplateKey,
     videos: string[],
     options: {
       jobId: string;
+      userId: string;
       coordinates?: { lat: number; lng: number };
     }
   ): Promise<ProcessingResult> {
     logger.info(`[${options.jobId}] Processing template ${template}`, {
       videoCount: videos.length,
       hasCoordinates: !!options.coordinates,
+      userId: options.userId,
     });
 
+    // Check template access
+    const hasAccess = await this.checkTemplateAccess(options.userId, template);
+    if (!hasAccess) {
+      logger.error(`[${options.jobId}] Template access denied`, {
+        template,
+        userId: options.userId,
+      });
+      return {
+        success: false,
+        template,
+        error: `Access to template ${template} denied`,
+      };
+    }
+
     // Validate template exists
-    const config = reelTemplates[template];
-    if (!config) {
+    const templateConfig = reelTemplates[template];
+    if (!templateConfig) {
       logger.error(`[${options.jobId}] Template not found`, { template });
       return {
         success: false,
@@ -58,42 +148,89 @@ export class TemplateService {
     }
 
     try {
-      // Handle map video requirement for googlezoomintro
-      let mapVideo: string | undefined;
-      if (template === "googlezoomintro") {
-        if (!options.coordinates) {
-          logger.error(
-            `[${options.jobId}] Coordinates required for googlezoomintro`
-          );
-          return {
-            success: false,
-            template,
-            error: "Coordinates required for googlezoomintro template",
-          };
-        }
+      // Handle map video requirement for any template with "map" in sequence
+      let coordinates: { lat: number; lng: number } | undefined;
 
-        mapVideo = await this.ensureMapVideo(
-          options.coordinates,
-          options.jobId
-        );
-        if (!mapVideo) {
-          logger.error(`[${options.jobId}] Failed to generate map video`);
-          return {
-            success: false,
-            template,
-            error: "Failed to generate map video",
-          };
+      if (templateConfig.sequence.includes("map")) {
+        // Try to get coordinates from options first
+        coordinates = options.coordinates;
+
+        // If no coordinates in options, try to get from job
+        if (!coordinates) {
+          const job = await this.prisma.videoJob.findUnique({
+            where: { id: options.jobId },
+            include: { listing: true },
+          });
+
+          if (job?.listing?.coordinates) {
+            try {
+              coordinates =
+                typeof job.listing.coordinates === "string"
+                  ? JSON.parse(job.listing.coordinates)
+                  : job.listing.coordinates;
+
+              logger.info(`[${options.jobId}] Found coordinates for map:`, {
+                coordinates,
+                template,
+              });
+            } catch (err) {
+              logger.warn(`[${options.jobId}] Failed to parse coordinates`, {
+                error: err,
+                template,
+              });
+            }
+          }
         }
       }
 
+      // If still no coordinates, return error
+      if (!coordinates) {
+        logger.error(
+          `[${options.jobId}] Coordinates required for template with map`,
+          {
+            template,
+          }
+        );
+        return {
+          success: false,
+          template,
+          error: "Coordinates required for template with map sequence",
+        };
+      }
+
+      // Generate map video
+      logger.info(`[${options.jobId}] Generating map video for coordinates:`, {
+        coordinates: coordinates,
+        template,
+      });
+
+      const mapVideo = await this.ensureMapVideo(coordinates, options.jobId);
+
+      if (!mapVideo) {
+        logger.error(`[${options.jobId}] Failed to generate map video`, {
+          template,
+        });
+        return {
+          success: false,
+          template,
+          error: "Failed to generate map video",
+        };
+      }
+
+      logger.info(`[${options.jobId}] Map video generated successfully:`, {
+        mapVideoPath: mapVideo,
+        template,
+      });
+
       // Validate video count
-      const requiredVideos = config.sequence.filter(
+      const requiredVideos = templateConfig.sequence.filter(
         (s) => typeof s === "number"
       ).length;
       if (videos.length < requiredVideos) {
         logger.error(`[${options.jobId}] Not enough videos`, {
           required: requiredVideos,
           provided: videos.length,
+          template,
         });
         return {
           success: false,
@@ -212,16 +349,29 @@ export class TemplateService {
 
   public async processWithFallbacks(
     jobId: string,
+    userId: string,
     videos: string[],
     coordinates?: { lat: number; lng: number }
   ): Promise<ProcessingResult> {
-    // Try templates in priority order
-    const templatePriority: TemplateKey[] = [
-      "googlezoomintro",
-      "wave",
-      "crescendo",
-      "storyteller",
-    ];
+    // Get user's subscription tier to determine available templates
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        currentTierId: true,
+        currentTier: {
+          select: {
+            premiumTemplatesEnabled: true,
+          },
+        },
+      },
+    });
+
+    // Filter templates based on user's access
+    let templatePriority: TemplateKey[] = ["wave", "storyteller"];
+
+    if (user?.currentTier?.premiumTemplatesEnabled) {
+      templatePriority = ["googlezoomintro", "crescendo", ...templatePriority];
+    }
 
     for (const template of templatePriority) {
       // Skip googlezoomintro if no coordinates
@@ -234,6 +384,7 @@ export class TemplateService {
 
       const result = await this.processTemplate(template, videos, {
         jobId,
+        userId,
         coordinates,
       });
 
@@ -250,246 +401,6 @@ export class TemplateService {
       success: false,
       error: "All templates failed or were skipped",
     };
-  }
-
-  public async testTemplateWithExistingVideos(
-    listingId: string,
-    template: TemplateKey
-  ): Promise<ProcessingResult> {
-    const jobId = `test_${Date.now()}`;
-    logger.info(
-      `[${jobId}] Testing template ${template} with existing videos for listing ${listingId}`
-    );
-
-    try {
-      // Get photos with runway videos for this listing
-      const photos = await prisma.photo.findMany({
-        where: {
-          listingId,
-          runwayVideoPath: { not: null },
-        },
-        orderBy: { order: "asc" },
-      });
-
-      if (photos.length === 0) {
-        logger.error(
-          `[${jobId}] No runway videos found for listing ${listingId}`
-        );
-        return {
-          success: false,
-          template,
-          error: "No runway videos found for this listing",
-        };
-      }
-
-      // Extract video paths
-      const videos = photos
-        .map((photo) => photo.runwayVideoPath)
-        .filter((path): path is string => path !== null);
-
-      logger.info(`[${jobId}] Found ${videos.length} runway videos`, {
-        listingId,
-        videoCount: videos.length,
-      });
-
-      // Get listing coordinates for map video if needed
-      const listing = await prisma.listing.findUnique({
-        where: { id: listingId },
-      });
-
-      const coordinates = listing?.coordinates
-        ? JSON.parse(listing.coordinates as string)
-        : undefined;
-
-      // Process the template
-      return await this.processTemplate(template, videos, {
-        jobId,
-        coordinates,
-      });
-    } catch (error) {
-      logger.error(`[${jobId}] Test failed`, {
-        error: error instanceof Error ? error.message : "Unknown error",
-      });
-      return {
-        success: false,
-        template,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    }
-  }
-
-  public async testTemplateWithProcessedAssets(
-    template: TemplateKey,
-    count: number = 10,
-    coordinates?: { lat: number; lng: number },
-    existingMapVideoPath?: string
-  ): Promise<ProcessingResult> {
-    const jobId = `test_${Date.now()}`;
-    logger.info(
-      `[${jobId}] Testing template ${template} with processed assets`,
-      {
-        template,
-        requestedCount: count,
-        hasCoordinates: !!coordinates,
-        coordinates,
-        hasExistingMapVideo: !!existingMapVideoPath,
-      }
-    );
-
-    try {
-      // Get runway videos from ProcessedAsset table
-      const assets = await prisma.processedAsset.findMany({
-        where: {
-          type: "runway",
-          path: { contains: "segment" },
-        },
-        take: count,
-        orderBy: {
-          createdAt: "desc",
-        },
-      });
-
-      logger.info(`[${jobId}] Found ProcessedAsset records`, {
-        count: assets.length,
-        firstAsset: assets[0],
-        lastAsset: assets[assets.length - 1],
-      });
-
-      if (assets.length === 0) {
-        logger.error(
-          `[${jobId}] No runway videos found in ProcessedAsset table`
-        );
-        return {
-          success: false,
-          template,
-          error: "No runway videos found",
-        };
-      }
-
-      // Extract video paths and verify they exist
-      const videos = assets.map((asset) => asset.path);
-      for (const video of videos) {
-        try {
-          await fs.promises.access(video);
-        } catch (error) {
-          logger.error(`[${jobId}] Video file not found`, {
-            path: video,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
-          return {
-            success: false,
-            template,
-            error: `Video file not found: ${video}`,
-          };
-        }
-      }
-
-      logger.info(`[${jobId}] Found ${videos.length} runway videos`, {
-        videoCount: videos.length,
-        paths: videos,
-      });
-
-      // For googlezoomintro, ensure we have map video
-      let mapVideo: string | undefined;
-      if (template === "googlezoomintro") {
-        if (existingMapVideoPath) {
-          try {
-            await fs.promises.access(existingMapVideoPath);
-            mapVideo = existingMapVideoPath;
-            logger.info(`[${jobId}] Using existing map video`, {
-              path: existingMapVideoPath,
-            });
-          } catch (error) {
-            logger.error(`[${jobId}] Existing map video not found`, {
-              path: existingMapVideoPath,
-              error: error instanceof Error ? error.message : "Unknown error",
-            });
-            return {
-              success: false,
-              template,
-              error: `Existing map video not found: ${existingMapVideoPath}`,
-            };
-          }
-        } else if (coordinates) {
-          logger.info(
-            `[${jobId}] Generating map video for coordinates`,
-            coordinates
-          );
-          mapVideo = await this.ensureMapVideo(coordinates, jobId);
-
-          if (!mapVideo) {
-            return {
-              success: false,
-              template,
-              error: "Failed to generate map video",
-            };
-          }
-
-          logger.info(`[${jobId}] Map video generated`, {
-            path: mapVideo,
-          });
-        }
-      }
-
-      // Get template configuration for music
-      const templateConfig = reelTemplates[template];
-      if (!templateConfig) {
-        return {
-          success: false,
-          template,
-          error: `Template ${template} not found`,
-        };
-      }
-
-      logger.info(`[${jobId}] Using template configuration`, {
-        template,
-        config: templateConfig,
-      });
-
-      // Process the template with music configuration
-      const clips = await videoTemplateService.createTemplate(
-        template,
-        videos,
-        mapVideo
-      );
-
-      logger.info(`[${jobId}] Template clips created`, {
-        template,
-        clipCount: clips.length,
-        hasMapVideo: !!mapVideo,
-        hasMusicConfig: !!templateConfig.music,
-        clips: clips.map((c) => ({ path: c.path, duration: c.duration })),
-      });
-
-      const outputPath = await this.stitchClipsWithMusic(
-        clips,
-        jobId,
-        templateConfig.music
-      );
-
-      logger.info(`[${jobId}] Template processing complete`, {
-        template,
-        outputPath,
-        hasMapVideo: !!mapVideo,
-        hasMusicConfig: !!templateConfig.music,
-      });
-
-      return {
-        success: true,
-        template,
-        outputPath,
-      };
-    } catch (error) {
-      logger.error(`[${jobId}] Test failed`, {
-        error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-      return {
-        success: false,
-        template,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-    }
   }
 
   private async stitchClipsWithMusic(
@@ -587,7 +498,15 @@ export class TemplateService {
           clips.map((clip) => clip.path),
           clips.map((clip) => clip.duration),
           outputPath,
-          musicConfig ? { music: musicConfig } : undefined
+          musicConfig
+            ? {
+                name: "Music Template",
+                description: "Template for music-only processing",
+                sequence: clips.map((_, i) => i),
+                durations: clips.map((clip) => clip.duration),
+                music: musicConfig,
+              }
+            : undefined
         );
 
         return outputPath;

@@ -152,12 +152,15 @@ export class S3Service {
     return `${key}`; // Just store the key, not the full s3:// URL
   }
 
-  public getPublicUrl(key: string): string {
-    const bucket = process.env.AWS_BUCKET;
-    if (!bucket) {
-      throw new Error("AWS_BUCKET environment variable is not set");
+  public getPublicUrl(key: string, bucket?: string): string {
+    const bucketName =
+      bucket || process.env.AWS_BUCKET || "reelty-prod-storage";
+    if (!bucketName) {
+      throw new Error(
+        "AWS_BUCKET environment variable is not set and no bucket name provided"
+      );
     }
-    return `https://${bucket}.s3.${
+    return `https://${bucketName}.s3.${
       process.env.AWS_REGION || "us-east-2"
     }.amazonaws.com/${key}`;
   }
