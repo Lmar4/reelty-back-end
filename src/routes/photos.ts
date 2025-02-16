@@ -87,7 +87,7 @@ router.post(
           listingId: photo.listingId,
           userId,
           status: VideoGenerationStatus.PROCESSING,
-          template: "default",
+          template: "googlezoomintro",
         },
       });
 
@@ -108,7 +108,7 @@ router.post(
         .execute({
           jobId: job.id,
           inputFiles: photoUrls,
-          template: "default",
+          template: "googlezoomintro",
           coordinates: photo.listing.coordinates as any,
         })
         .catch((error) => {
@@ -247,7 +247,7 @@ router.post(
               listingId: listing.id,
               userId,
               status: VideoGenerationStatus.PROCESSING,
-              template: "default",
+              template: "googlezoomintro",
             },
           });
 
@@ -267,7 +267,7 @@ router.post(
             .execute({
               jobId: job.id,
               inputFiles: photoUrls,
-              template: "default",
+              template: "googlezoomintro",
               coordinates: listing.coordinates as any,
             })
             .catch((error) => {
@@ -304,6 +304,134 @@ router.post(
       });
     } catch (error) {
       logger.error("[PHOTOS_BATCH_REGENERATE_ERROR] Request failed", {
+        userId: req.user?.id,
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      res.status(500).json({
+        success: false,
+        message:
+          error instanceof Error ? error.message : "Unknown error occurred",
+      });
+    }
+  }
+);
+
+// Update photo status after S3 upload
+router.post(
+  "/:photoId/status",
+  isAuthenticated,
+  async (req: Request, res: Response): Promise<void> => {
+    logger.info("[PHOTO_STATUS_UPDATE] Received request", {
+      photoId: req.params.photoId,
+      userId: req.user?.id,
+      body: req.body,
+    });
+
+    try {
+      const { photoId } = req.params;
+      const { s3Key, status, error } = req.body;
+      const userId = req.user!.id;
+
+      // Find the photo and check ownership
+      const photo = await prisma.photo.findUnique({
+        where: {
+          id: photoId,
+          userId,
+        },
+        include: {
+          listing: {
+            include: {
+              photos: {
+                orderBy: {
+                  order: "asc",
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!photo || !photo.listing) {
+        logger.error("[PHOTO_STATUS_UPDATE] Photo not found or access denied", {
+          photoId,
+          userId,
+          photoExists: !!photo,
+          listingExists: !!photo?.listing,
+        });
+        res.status(404).json({
+          success: false,
+          message: "Photo not found or access denied",
+        });
+        return;
+      }
+
+      // Update photo status
+      await prisma.photo.update({
+        where: { id: photoId },
+        data: {
+          status,
+          error: error || null,
+          processedFilePath: s3Key, // Store the S3 key for the uploaded photo
+        },
+      });
+
+      // Check if all photos in the listing are uploaded
+      const allPhotos = photo.listing.photos;
+      const allUploaded = allPhotos.every((p) => p.processedFilePath);
+
+      if (allUploaded) {
+        // Create a new video job
+        const job = await prisma.videoJob.create({
+          data: {
+            listingId: photo.listingId,
+            userId,
+            status: VideoGenerationStatus.PROCESSING,
+            template: "googlezoomintro",
+            inputFiles: allPhotos.map(
+              (p) =>
+                `s3://${process.env.AWS_BUCKET || "reelty-prod-storage"}/${
+                  p.processedFilePath
+                }`
+            ),
+          },
+        });
+
+        // Start the video generation pipeline
+        productionPipeline
+          .execute({
+            jobId: job.id,
+            inputFiles: allPhotos.map(
+              (p) =>
+                `s3://${process.env.AWS_BUCKET || "reelty-prod-storage"}/${
+                  p.processedFilePath
+                }`
+            ),
+            template: "googlezoomintro",
+            coordinates: photo.listing.coordinates as any,
+          })
+          .catch((error) => {
+            logger.error("[PHOTO_STATUS_UPDATE] Pipeline execution failed", {
+              jobId: job.id,
+              error: error instanceof Error ? error.message : "Unknown error",
+              stack: error instanceof Error ? error.stack : undefined,
+            });
+          });
+
+        res.status(200).json({
+          success: true,
+          message: "Photo status updated and video generation started",
+          jobId: job.id,
+        });
+      } else {
+        res.status(200).json({
+          success: true,
+          message: "Photo status updated",
+        });
+      }
+    } catch (error) {
+      logger.error("[PHOTO_STATUS_UPDATE] Request failed", {
+        photoId: req.params.photoId,
         userId: req.user?.id,
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,

@@ -46,8 +46,8 @@ const listUsers: RequestHandler = async (req, res) => {
         const availableCredits = await prisma.listingCredit.count({
           where: {
             userId: user.id,
-            creditsRemaining: { gt: 0 }
-          }
+            creditsRemaining: { gt: 0 },
+          },
         });
         return { ...user, credits: availableCredits };
       })
@@ -73,18 +73,13 @@ const adjustUserCredits: RequestHandler = async (req, res) => {
 
     if (amount > 0) {
       // Add new listing credits
-      const expiryDate = new Date();
-      expiryDate.setDate(expiryDate.getDate() + 30); // Credits expire in 30 days
-
-      // Create multiple listing credits
       await prisma.$transaction(
-        Array.from({ length: amount }, () => 
+        Array.from({ length: amount }, () =>
           prisma.listingCredit.create({
             data: {
               userId,
-              expiryDate,
-              creditsRemaining: amount
-            }
+              creditsRemaining: 1,
+            },
           })
         )
       );
@@ -95,22 +90,21 @@ const adjustUserCredits: RequestHandler = async (req, res) => {
         where: {
           userId,
           creditsRemaining: { gt: 0 },
-          expiryDate: { gt: new Date() }
         },
         orderBy: {
-          expiryDate: 'asc'
+          createdAt: "asc",
         },
-        take: creditsToRemove
+        take: creditsToRemove,
       });
 
       if (unusedCredits.length < creditsToRemove) {
-        throw new Error('Not enough unused credits to remove');
+        throw new Error("Not enough unused credits to remove");
       }
 
       await prisma.listingCredit.deleteMany({
         where: {
-          id: { in: unusedCredits.map(c => c.id) }
-        }
+          id: { in: unusedCredits.map((c) => c.id) },
+        },
       });
     }
 
@@ -129,13 +123,12 @@ const adjustUserCredits: RequestHandler = async (req, res) => {
       where: {
         userId,
         creditsRemaining: { gt: 0 },
-        expiryDate: { gt: new Date() }
-      }
+      },
     });
 
     res.json({
       success: true,
-      data: { credits: availableCredits }
+      data: { credits: availableCredits },
     });
   } catch (error) {
     console.error("Adjust credits error:", error);

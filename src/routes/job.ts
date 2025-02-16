@@ -4,6 +4,7 @@ import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
 import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
+import { TemplateKey } from "../services/imageProcessing/templates/types";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -67,7 +68,7 @@ async function recoverPendingJobs() {
             inputFiles: Array.isArray(job.inputFiles)
               ? job.inputFiles.map(String)
               : [],
-            template: job.template || "googlezoomintro",
+            template: (job.template as TemplateKey) || "googlezoomintro",
             coordinates: job.listing?.coordinates as
               | { lat: number; lng: number }
               | undefined,
@@ -228,7 +229,7 @@ const createJob: RequestHandler = async (req, res) => {
         inputFiles: Array.isArray(job.inputFiles)
           ? job.inputFiles.map(String)
           : [],
-        template: job.template || "googlezoomintro",
+        template: (job.template as TemplateKey) || "googlezoomintro",
         coordinates: (
           await prisma.listing.findUnique({ where: { id: job.listingId } })
         )?.coordinates as { lat: number; lng: number } | undefined,
@@ -415,7 +416,7 @@ const regenerateJob: RequestHandler = async (req, res) => {
         inputFiles: Array.isArray(newJob.inputFiles)
           ? newJob.inputFiles.map(String)
           : [],
-        template: newJob.template || "googlezoomintro",
+        template: (newJob.template as TemplateKey) || "googlezoomintro",
         coordinates: existingJob.listing?.coordinates as
           | { lat: number; lng: number }
           | undefined,

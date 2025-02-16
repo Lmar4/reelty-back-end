@@ -1,17 +1,21 @@
+import { Prisma, PrismaClient } from "@prisma/client";
 import express, { Request, Response } from "express";
-import { PrismaClient, Prisma } from "@prisma/client";
-import { z } from "zod";
-import { validateRequest } from "../middleware/validate";
-import { logger } from "../utils/logger";
-import { StorageService } from "../services/storage";
 import multer from "multer";
+import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
+import { validateRequest } from "../middleware/validate";
 import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
+import { StorageService } from "../services/storage";
+import { logger } from "../utils/logger";
+import { VideoGenerationStatus } from "@prisma/client";
+import path from "path";
+import { s3VideoService } from "../services/video/s3-video.service";
 
 const router = express.Router();
 const prisma = new PrismaClient();
 const storageService = StorageService.getInstance();
 const upload = multer();
+const productionPipeline = new ProductionPipeline();
 
 // Validation schemas
 const createListingSchema = z.object({
@@ -222,26 +226,29 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
 // Upload photo to listing
 const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
   try {
-    console.log("[LISTINGS] Starting photo upload:", {
-      hasFile: !!req.file,
-      contentType: req.file?.mimetype,
-      listingId: req.params.listingId,
-      awsBucket: process.env.AWS_BUCKET,
-      awsRegion: process.env.AWS_REGION,
-    });
-
     const { listingId } = req.params;
     const userId = req.user!.id;
-    const file = req.file;
-    const order = parseInt(req.body.order || "0", 10);
+    const { s3Key, order: orderStr } = req.body;
+    const order = parseInt(orderStr || "0", 10);
 
-    if (!file) {
+    // Validate required field
+    if (!s3Key) {
       res.status(400).json({
         success: false,
-        error: "No file provided",
+        error: "s3Key is required",
       });
       return;
     }
+
+    // Construct the full S3 URL in the backend
+    const s3Url = `https://${process.env.AWS_BUCKET}.s3.amazonaws.com/${s3Key}`;
+
+    logger.info("[LISTINGS] Processing photo upload:", {
+      listingId,
+      userId,
+      s3Key,
+      order,
+    });
 
     logger.info("[Listings] Uploading photo", {
       listingId,
@@ -272,47 +279,57 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const validMimeTypes = ["image/jpeg", "image/png", "image/webp"] as const;
+    // Note: File type validation is now done in the frontend before S3 upload
 
-    if (!validMimeTypes.includes(file.mimetype as any)) {
-      res.status(400).json({
-        success: false,
-        error: "Invalid file type. Only JPEG, PNG and WebP are allowed.",
-      });
-      return;
-    }
-
-    // Upload file to S3 using StorageService
-    const uploadResult = await storageService.uploadPropertyMedia(listingId, {
-      name: file.originalname,
-      type: "image",
-      contentType: file.mimetype as (typeof validMimeTypes)[number],
-      buffer: file.buffer,
-    });
-
-    // Create photo record with the S3 URL
+    // Create photo record with the backend-constructed S3 URL
     const photo = await prisma.photo.create({
       data: {
         userId,
         listingId,
-        filePath: uploadResult.uploadUrl,
+        filePath: s3Url, // Store the full URL for Runway access
+        s3Key, // Store S3 key for internal operations
         order,
+        status: "completed", // Image is already processed and uploaded
       },
     });
 
-    logger.info("[Listings] Photo uploaded successfully", {
+    logger.info("[Listings] Photo record created", {
       photoId: photo.id,
       listingId,
-      url: uploadResult.uploadUrl,
+      url: s3Url,
+      s3Key,
+      order,
     });
 
-    // Check if this is the last photo and trigger video generation
+    logger.info("[Listings] Photo record created", {
+      photoId: photo.id,
+      listingId,
+      s3Key,
+      filePath: s3Url,
+    });
+
+    // Check if we should start video generation
     const updatedListing = await prisma.listing.findUnique({
       where: { id: listingId },
       include: { photos: true },
     });
 
-    if (updatedListing && updatedListing.photos.length > 0) {
+    if (!updatedListing) {
+      logger.error("[Listings] Failed to fetch updated listing", {
+        listingId,
+        userId,
+      });
+      throw new Error("Failed to fetch updated listing");
+    }
+
+    // Only start video generation if we have photos
+    if (updatedListing.photos.length > 0) {
+      logger.info("[Listings] Starting video generation process", {
+        listingId,
+        photoCount: updatedListing.photos.length,
+        photoUrls: updatedListing.photos.map((p) => p.filePath),
+      });
+
       // Create a new video generation job
       const job = await prisma.videoJob.create({
         data: {
@@ -329,7 +346,6 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
       });
 
       // Start the production pipeline
-      const productionPipeline = new ProductionPipeline();
       const photoUrls = updatedListing.photos.map((p) => p.filePath);
 
       // Parse coordinates if they exist
@@ -354,7 +370,7 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
         .execute({
           jobId: job.id,
           inputFiles: photoUrls,
-          template: "default",
+          template: "googlezoomintro",
           coordinates,
         })
         .catch((error: unknown) => {
@@ -462,6 +478,130 @@ const deleteListing = async (req: Request, res: Response): Promise<void> => {
   }
 };
 
+// Batch process photos for a listing
+router.post(
+  "/:listingId/process-photos",
+  isAuthenticated,
+  async (req: Request, res: Response) => {
+    const { listingId } = req.params;
+    const { photos } = req.body;
+    const userId = req.user!.id;
+
+    try {
+      // Process each photo
+      for (const photo of photos) {
+        const { id, s3Key: tempKey } = photo;
+
+        // Move from temp to permanent storage
+        const permanentKey = `properties/${listingId}/images/${id}-${path.basename(
+          tempKey
+        )}`;
+
+        await s3VideoService.moveFromTempToListing(
+          tempKey,
+          permanentKey,
+          process.env.AWS_BUCKET || "reelty-prod-storage"
+        );
+
+        // Update photo record
+        await prisma.photo.create({
+          data: {
+            id,
+            userId,
+            listingId,
+            s3Key: permanentKey,
+            filePath: s3VideoService.getPublicUrl(permanentKey),
+            status: "completed",
+          },
+        });
+      }
+
+      res.json({ success: true });
+    } catch (error) {
+      logger.error("Failed to process photos:", error);
+      res.status(500).json({
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+// Add this new endpoint to get photo processing status
+router.get(
+  "/:listingId/photos/status",
+  isAuthenticated,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { listingId } = req.params;
+      const userId = req.user!.id;
+
+      const photos = await prisma.photo.findMany({
+        where: {
+          listingId,
+          userId,
+        },
+        select: {
+          id: true,
+          status: true,
+          error: true,
+          s3Key: true,
+          filePath: true,
+          processedFilePath: true,
+          order: true,
+        },
+        orderBy: {
+          order: "asc",
+        },
+      });
+
+      const bucketName = process.env.AWS_BUCKET;
+      const region = process.env.AWS_REGION;
+
+      const processingCount = photos.filter(
+        (p) => p.status === "processing"
+      ).length;
+      const failedCount = photos.filter(
+        (p) => p.status === "error" || !!p.error
+      ).length;
+      const totalCount = photos.length;
+
+      // Transform photos to include correct URLs
+      const transformedPhotos = photos.map((photo) => {
+        // Construct the full S3 URL with proper bucket name
+        const s3Url = `https://${bucketName}.s3.${region}.amazonaws.com/${photo.s3Key}`;
+
+        return {
+          id: photo.id,
+          url: s3Url,
+          status: photo.status,
+          hasError: !!photo.error,
+          order: photo.order,
+        };
+      });
+
+      res.json({
+        success: true,
+        data: {
+          processingCount,
+          failedCount,
+          totalCount,
+          photos: transformedPhotos,
+        },
+      });
+    } catch (error) {
+      logger.error("[PHOTOS_STATUS_ERROR]", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      res.status(500).json({
+        success: false,
+        error: "Failed to fetch photo status",
+      });
+    }
+  }
+);
+
 // Route handlers
 router.get("/", isAuthenticated, getListings);
 router.get("/:listingId", isAuthenticated, getListing);
@@ -471,12 +611,7 @@ router.post(
   validateRequest(createListingSchema),
   createListing
 );
-router.post(
-  "/:listingId/photos",
-  isAuthenticated,
-  upload.single("file"), // Handle single file upload
-  uploadPhoto
-);
+router.post("/:listingId/photos", isAuthenticated, uploadPhoto);
 router.delete("/:listingId", isAuthenticated, deleteListing);
 
 export default router;
