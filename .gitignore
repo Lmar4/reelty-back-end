@@ -60,3 +60,5 @@ coverage/
 !.elasticbeanstalk/*.global.yml
 .windsurfrules
 .cursor/*
+
+default_output
