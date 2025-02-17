@@ -111,9 +111,9 @@ model SubscriptionTier {
   planType             PlanType @default(PAY_AS_YOU_GO) @map("plan_type")
   creditsPerInterval   Int      @default(0)     @map("credits_per_interval")
   hasWatermark         Boolean  @default(true)   @map("has_watermark")
-  maxPhotosPerListing  Int      @default(10)     @map("max_photos_per_listing")
+  maxPhotosPerListing  Int      @default(20)     @map("max_photos_per_listing")
   maxReelDownloads     Int?                      @map("max_reel_downloads")  // null means unlimited
-  maxActiveListings    Int      @default(5)      @map("max_active_listings")
+  maxActiveListings    Int      @default(15)      @map("max_active_listings")
   premiumTemplatesEnabled Boolean @default(false) @map("premium_templates_enabled")
   metadata             Json?     @default("{}")
   createdAt            DateTime @default(now())
@@ -212,6 +212,7 @@ model Listing {
   coordinates Json?    @default("{}")
   status      String
   photoLimit  Int      @default(10) @map("photo_limit")
+  metadata    Json?    @default("{}")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
 

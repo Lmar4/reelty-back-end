@@ -206,43 +206,76 @@ export class S3VideoService {
     if (!bucketName)
       throw new Error("AWS_BUCKET environment variable is not set");
 
-    const filename = path.basename(tempKey);
-    const originalKey = `properties/${listingId}/images/original/${photoId}-${filename}`;
-    const webpKey = `properties/${listingId}/images/webp/${photoId}-${filename}.webp`;
+    try {
+      // Extract just the filename without the path
+      const filename = path.basename(tempKey);
 
-    // Move original file
-    await this.s3Client.send(
-      new CopyObjectCommand({
-        Bucket: bucketName,
-        CopySource: `${bucketName}/${tempKey}`,
-        Key: originalKey,
-      })
-    );
+      // If the file is already in a user's listings directory, just return the URLs
+      if (tempKey.includes("/users/") && tempKey.includes("/listings/")) {
+        const url = this.getPublicUrl(tempKey, bucketName);
+        return {
+          originalUrl: url,
+          webpUrl: url,
+        };
+      }
 
-    // Move WebP version (assuming it exists in temp with .webp extension)
-    const tempWebpKey = tempKey.replace(/\.[^/.]+$/, ".webp");
-    await this.s3Client.send(
-      new CopyObjectCommand({
-        Bucket: bucketName,
-        CopySource: `${bucketName}/${tempWebpKey}`,
-        Key: webpKey,
-      })
-    );
+      // For temp files, move them to the permanent location
+      const originalKey = `properties/${listingId}/images/${photoId}/${filename}`;
+      const webpKey = `properties/${listingId}/images/${photoId}/${filename}`;
 
-    // Delete temp files
-    await Promise.all([
-      this.s3Client.send(
-        new DeleteObjectCommand({ Bucket: bucketName, Key: tempKey })
-      ),
-      this.s3Client.send(
-        new DeleteObjectCommand({ Bucket: bucketName, Key: tempWebpKey })
-      ),
-    ]);
+      logger.info("[S3] Starting file move operation", {
+        from: tempKey,
+        to: originalKey,
+        bucket: bucketName,
+        paths: {
+          tempKey,
+          originalKey,
+          webpKey,
+        },
+      });
 
-    return {
-      originalUrl: this.getPublicUrl(originalKey),
-      webpUrl: this.getPublicUrl(webpKey),
-    };
+      // Check if source file exists
+      const exists = await this.checkFileExists(bucketName, tempKey);
+      if (!exists) {
+        logger.error("[S3] Source file not found", {
+          tempKey,
+          bucketName,
+        });
+        throw new Error(`Source file not found: ${tempKey}`);
+      }
+
+      // Move original file
+      await this.s3Client.send(
+        new CopyObjectCommand({
+          Bucket: bucketName,
+          CopySource: `/${bucketName}/${tempKey}`,
+          Key: originalKey,
+        })
+      );
+
+      // Delete source file after successful copy
+      await this.s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: bucketName,
+          Key: tempKey,
+        })
+      );
+
+      return {
+        originalUrl: this.getPublicUrl(originalKey, bucketName),
+        webpUrl: this.getPublicUrl(webpKey, bucketName),
+      };
+    } catch (error) {
+      logger.error("[S3] Error moving files:", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+        bucketName,
+        tempKey,
+        listingId,
+        photoId,
+      });
+      throw error;
+    }
   }
 }
 

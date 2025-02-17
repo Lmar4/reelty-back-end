@@ -30,13 +30,20 @@ import { ReelTemplate } from "../imageProcessing/templates/types";
 export interface VideoClip {
   path: string;
   duration: number;
+  transition?: {
+    type: "crossfade" | "fade" | "slide";
+    duration: number;
+  };
+  colorCorrection?: {
+    ffmpegFilter: string;
+  };
 }
 
 export interface VideoProcessingOptions {
   music?: ReelTemplate;
   reverse?: boolean;
   transitions?: {
-    type: 'crossfade' | 'fade' | 'slide';
+    type: "crossfade" | "fade" | "slide";
     duration: number;
   }[];
   colorCorrection?: {
@@ -362,6 +369,18 @@ export class VideoProcessingService {
     template?: ReelTemplate
   ): Promise<void> {
     return this.createVideoFromClips(clips, outputPath, template);
+  }
+
+  async extractFrame(
+    inputPath: string,
+    outputPath: string,
+    timestamp: number
+  ): Promise<void> {
+    await ffmpeg(inputPath).screenshots({
+      timestamps: [timestamp],
+      filename: path.basename(outputPath),
+      folder: path.dirname(outputPath),
+    });
   }
 }
 

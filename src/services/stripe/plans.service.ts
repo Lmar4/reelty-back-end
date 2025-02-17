@@ -46,8 +46,23 @@ export class PlansService {
   // Create or update a subscription plan
   async syncPlan(tier: TierData, metadata: PlanMetadata) {
     try {
+      if (!tier.name || !tier.description) {
+        throw new Error("Name and description are required");
+      }
+
+      // First, check if a tier with these Stripe IDs already exists
+      const existingTier = await prisma.subscriptionTier.findFirst({
+        where: {
+          OR: [
+            { name: tier.name },
+            { stripeProductId: tier.stripeProductId },
+            { stripePriceId: tier.stripePriceId },
+          ],
+        },
+      });
+
       const stripeMetadata: Stripe.MetadataParam = {
-        tierId: tier.id || "",
+        tierId: existingTier?.id || "",
         features: JSON.stringify(metadata.features),
         maxListings: metadata.maxListings.toString(),
         maxPhotosPerListing: metadata.maxPhotosPerListing.toString(),
@@ -59,49 +74,72 @@ export class PlansService {
           metadata.premiumTemplatesEnabled?.toString() || "false",
       };
 
-      if (!tier.name || !tier.description) {
-        throw new Error("Name and description are required");
-      }
-
-      const productData: Stripe.ProductCreateParams = {
-        name: tier.name,
-        description: tier.description,
-        metadata: stripeMetadata,
-      };
-
+      // Create or update Stripe product
       let product: Stripe.Product;
-
-      if (tier.stripeProductId) {
-        product = await stripe.products.update(
-          tier.stripeProductId,
-          productData
-        );
+      if (existingTier?.stripeProductId) {
+        product = await stripe.products.update(existingTier.stripeProductId, {
+          name: tier.name,
+          description: tier.description,
+          metadata: stripeMetadata,
+        });
       } else {
-        product = await stripe.products.create(productData);
+        product = await stripe.products.create({
+          name: tier.name,
+          description: tier.description,
+          metadata: stripeMetadata,
+        });
       }
 
+      // Create new price (Stripe best practice is to create new price and archive old)
       const price = await stripe.prices.create({
         product: product.id,
         unit_amount: Math.round(tier.monthlyPrice! * 100),
         currency: "usd",
         recurring:
           tier.planType === "MONTHLY" ? { interval: "month" } : undefined,
-        metadata: { tierId: tier.id || "" },
+        metadata: { tierId: existingTier?.id || "" },
       });
 
-      if (tier.stripePriceId) {
-        await stripe.prices.update(tier.stripePriceId, { active: false });
+      // Archive old price if it exists
+      if (existingTier?.stripePriceId) {
+        await stripe.prices.update(existingTier.stripePriceId, {
+          active: false,
+        });
       }
 
-      const updateData: Prisma.SubscriptionTierUpdateInput = {
+      // Update product with default price
+      await stripe.products.update(product.id, {
+        default_price: price.id,
+      });
+
+      // Prepare subscription tier data
+      const subscriptionTierData = {
+        name: tier.name,
+        description: tier.description,
+        monthlyPrice: tier.monthlyPrice!,
+        planType: tier.planType || "PAY_AS_YOU_GO",
+        creditsPerInterval: tier.creditsPerInterval || 0,
+        features: metadata.features,
+        maxPhotosPerListing: tier.maxPhotosPerListing || 20,
+        hasWatermark: tier.hasWatermark ?? true,
+        maxReelDownloads: tier.maxReelDownloads,
+        maxActiveListings: tier.maxActiveListings || 15,
+        premiumTemplatesEnabled: tier.premiumTemplatesEnabled ?? false,
         stripeProductId: product.id,
         stripePriceId: price.id,
       };
 
-      await prisma.subscriptionTier.update({
-        where: { id: tier.id },
-        data: updateData,
-      });
+      // Update or create subscription tier in database
+      if (existingTier) {
+        await prisma.subscriptionTier.update({
+          where: { id: existingTier.id },
+          data: subscriptionTierData,
+        });
+      } else {
+        await prisma.subscriptionTier.create({
+          data: subscriptionTierData,
+        });
+      }
 
       return { product, price };
     } catch (error) {
@@ -160,7 +198,7 @@ export class PlansService {
       {
         name: "1 Credit",
         type: "PAY_AS_YOU_GO" as PlanType,
-        price: 49,
+        price: 59,
         credits: 1,
         features: {
           maxPhotosPerListing: 20,
@@ -171,10 +209,10 @@ export class PlansService {
         },
       },
       {
-        name: "2 Credits",
+        name: "4 Credits",
         type: "PAY_AS_YOU_GO" as PlanType,
-        price: 79,
-        credits: 2,
+        price: 236,
+        credits: 4,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -184,10 +222,10 @@ export class PlansService {
         },
       },
       {
-        name: "5 Credits",
+        name: "10 Credits",
         type: "PAY_AS_YOU_GO" as PlanType,
-        price: 189,
-        credits: 5,
+        price: 590,
+        credits: 10,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -208,35 +246,35 @@ export class PlansService {
           noWatermark: true,
           premiumTemplates: true,
           prioritySupport: true,
-          savePercentage: 20,
+          savePercentage: 34,
         },
       },
       {
         name: "Reelty Pro",
         type: "MONTHLY" as PlanType,
-        price: 149,
-        creditsPerInterval: 5,
+        price: 129,
+        creditsPerInterval: 4,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
           noWatermark: true,
           premiumTemplates: true,
           prioritySupport: true,
-          savePercentage: 20,
+          savePercentage: 34,
         },
       },
       {
         name: "Reelty Pro+",
         type: "MONTHLY" as PlanType,
-        price: 299,
-        creditsPerInterval: 12,
+        price: 249,
+        creditsPerInterval: 10,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
           noWatermark: true,
           premiumTemplates: true,
           prioritySupport: true,
-          savePercentage: 20,
+          savePercentage: 34,
         },
       },
     ];

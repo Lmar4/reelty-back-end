@@ -37,7 +37,10 @@ export async function handleStripeWebhook(
   request: WebhookRequest
 ): Promise<WebhookResponse> {
   try {
+    console.log("[STRIPE_WEBHOOK] Received webhook request");
+
     if (!request.body) {
+      console.log("[STRIPE_WEBHOOK] No request body");
       return {
         statusCode: 400,
         body: JSON.stringify({ error: "Request body is required" }),
@@ -46,6 +49,7 @@ export async function handleStripeWebhook(
 
     const sig = request.headers["stripe-signature"];
     if (!sig || !webhookSecret || Array.isArray(sig)) {
+      console.log("[STRIPE_WEBHOOK] Invalid signature", { sig, webhookSecret });
       return {
         statusCode: 400,
         body: JSON.stringify({ error: "Invalid stripe signature" }),
@@ -60,7 +64,11 @@ export async function handleStripeWebhook(
         sig,
         webhookSecret
       );
+      console.log("[STRIPE_WEBHOOK] Event verified", {
+        type: stripeEvent.type,
+      });
     } catch (err) {
+      console.error("[STRIPE_WEBHOOK] Signature verification failed:", err);
       return {
         statusCode: 400,
         body: JSON.stringify({ error: "Invalid signature" }),

@@ -9,8 +9,10 @@ import {
   videoProcessingService,
 } from "../video/video-processing.service";
 import { videoTemplateService } from "../video/video-template.service";
-import { PrismaClient, Prisma } from "@prisma/client";
+import { PrismaClient, Prisma, Template } from "@prisma/client";
 import * as fs from "fs";
+import { S3Client } from "@aws-sdk/client-s3";
+import { uploadToS3 } from "../storage/s3.service";
 
 const prisma = new PrismaClient();
 
@@ -46,9 +48,13 @@ export interface ProcessingResult {
 export class TemplateService {
   private static instance: TemplateService;
   private prisma: PrismaClient;
+  private s3Client: S3Client;
 
   private constructor() {
     this.prisma = new PrismaClient();
+    this.s3Client = new S3Client({
+      region: process.env.AWS_REGION || "us-east-1",
+    });
   }
 
   public static getInstance(): TemplateService {
@@ -600,6 +606,117 @@ export class TemplateService {
     });
 
     return orderedVideos;
+  }
+
+  async syncTemplatesWithDB() {
+    try {
+      logger.info("Starting template synchronization with database");
+
+      // Get all template keys from reelTemplates
+      const templateKeys = Object.keys(reelTemplates) as TemplateKey[];
+
+      for (const key of templateKeys) {
+        const template = reelTemplates[key];
+
+        // Check if template exists in DB
+        const existingTemplate = await prisma.template.findFirst({
+          where: { name: template.name },
+        });
+
+        if (!existingTemplate) {
+          // Create new template
+          await prisma.template.create({
+            data: {
+              name: template.name,
+              description: template.description,
+              tiers: ["free"], // Default to free tier
+              order: 0,
+              // Thumbnail will be updated later
+            },
+          });
+          logger.info(`Created new template: ${template.name}`);
+        }
+      }
+
+      logger.info("Template synchronization completed");
+    } catch (error) {
+      logger.error("Error syncing templates:", error);
+      throw error;
+    }
+  }
+
+  async generateAndUploadThumbnail(
+    templateKey: TemplateKey
+  ): Promise<string | null> {
+    try {
+      // Generate a sample video for the template
+      const sampleClips = await videoTemplateService.createTemplate(
+        templateKey,
+        [], // Empty array as we're just generating a thumbnail
+        undefined
+      );
+
+      if (!sampleClips || sampleClips.length === 0) {
+        throw new Error("Failed to generate sample clips for thumbnail");
+      }
+
+      // Extract thumbnail from the first clip
+      const thumbnailPath = await videoTemplateService.extractThumbnail(
+        sampleClips[0].path
+      );
+
+      // Upload thumbnail to S3
+      const s3Key = `templates/thumbnails/${templateKey}_${Date.now()}.jpg`;
+      const s3Url = await uploadToS3(thumbnailPath, s3Key);
+
+      return s3Url;
+    } catch (error) {
+      logger.error(
+        `Error generating thumbnail for template ${templateKey}:`,
+        error
+      );
+      return null;
+    }
+  }
+
+  async updateTemplateThumbnails() {
+    try {
+      const templates = await prisma.template.findMany();
+
+      for (const template of templates) {
+        const templateKey = template.name.toLowerCase() as TemplateKey;
+        const thumbnailUrl = await this.generateAndUploadThumbnail(templateKey);
+
+        if (thumbnailUrl) {
+          await prisma.template.update({
+            where: { id: template.id },
+            data: { thumbnailUrl },
+          });
+          logger.info(`Updated thumbnail for template: ${template.name}`);
+        }
+      }
+    } catch (error) {
+      logger.error("Error updating template thumbnails:", error);
+      throw error;
+    }
+  }
+
+  async getAvailableTemplatesForTier(tierId: string): Promise<Template[]> {
+    try {
+      const tier = await prisma.subscriptionTier.findUnique({
+        where: { id: tierId },
+        include: { templates: true },
+      });
+
+      if (!tier) {
+        throw new Error("Subscription tier not found");
+      }
+
+      return tier.templates;
+    } catch (error) {
+      logger.error("Error getting available templates:", error);
+      throw error;
+    }
   }
 }
 

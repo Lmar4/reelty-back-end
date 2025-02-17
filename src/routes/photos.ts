@@ -4,9 +4,11 @@ import { prisma } from "../lib/prisma";
 import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
 import { VideoGenerationStatus } from "@prisma/client";
 import { logger } from "../utils/logger";
+import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 
 const router = Router();
 const productionPipeline = new ProductionPipeline();
+const s3Client = new S3Client({ region: process.env.AWS_REGION });
 
 interface RegeneratePhotoRequest extends Request {
   params: {
@@ -44,15 +46,7 @@ router.post(
           userId,
         },
         include: {
-          listing: {
-            include: {
-              photos: {
-                orderBy: {
-                  order: "asc",
-                },
-              },
-            },
-          },
+          listing: true,
         },
       });
 
@@ -75,19 +69,13 @@ router.post(
         listingId: photo.listingId,
       });
 
-      // Start regeneration process
-      await prisma.photo.update({
-        where: { id: photoId },
-        data: { status: "processing", error: null },
-      });
-
       // Create a new job for regeneration
       const job = await prisma.videoJob.create({
         data: {
           listingId: photo.listingId,
           userId,
           status: VideoGenerationStatus.PROCESSING,
-          template: "googlezoomintro",
+          template: "crescendo",
         },
       });
 
@@ -95,29 +83,16 @@ router.post(
         photoId,
         jobId: job.id,
         listingId: photo.listingId,
-        photoCount: photo.listing.photos.length,
       });
 
-      // Get all photo URLs in order
-      const photoUrls = photo.listing.photos.map(
-        (p: { filePath: string }) => p.filePath
-      );
-
-      // Start the regeneration process in the background
-      productionPipeline
-        .execute({
+      // Start the regeneration process using regeneratePhotos
+      productionPipeline.regeneratePhotos(job.id, [photoId]).catch((error) => {
+        logger.error("[PHOTO_REGENERATE_ERROR] Pipeline execution failed", {
           jobId: job.id,
-          inputFiles: photoUrls,
-          template: "googlezoomintro",
-          coordinates: photo.listing.coordinates as any,
-        })
-        .catch((error) => {
-          logger.error("[PHOTO_REGENERATE_ERROR] Pipeline execution failed", {
-            jobId: job.id,
-            error: error instanceof Error ? error.message : "Unknown error",
-            stack: error instanceof Error ? error.stack : undefined,
-          });
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
         });
+      });
 
       logger.info("[PHOTO_REGENERATE] Sending success response", {
         photoId,
@@ -247,7 +222,7 @@ router.post(
               listingId: listing.id,
               userId,
               status: VideoGenerationStatus.PROCESSING,
-              template: "googlezoomintro",
+              template: "crescendo",
             },
           });
 
@@ -267,7 +242,7 @@ router.post(
             .execute({
               jobId: job.id,
               inputFiles: photoUrls,
-              template: "googlezoomintro",
+              template: "crescendo",
               coordinates: listing.coordinates as any,
             })
             .catch((error) => {
@@ -381,19 +356,13 @@ router.post(
       const allUploaded = allPhotos.every((p) => p.processedFilePath);
 
       if (allUploaded) {
-        // Create a new video job
+        // Create a new job for regeneration
         const job = await prisma.videoJob.create({
           data: {
             listingId: photo.listingId,
             userId,
             status: VideoGenerationStatus.PROCESSING,
-            template: "googlezoomintro",
-            inputFiles: allPhotos.map(
-              (p) =>
-                `s3://${process.env.AWS_BUCKET || "reelty-prod-storage"}/${
-                  p.processedFilePath
-                }`
-            ),
+            template: "crescendo",
           },
         });
 
@@ -407,7 +376,7 @@ router.post(
                   p.processedFilePath
                 }`
             ),
-            template: "googlezoomintro",
+            template: "crescendo",
             coordinates: photo.listing.coordinates as any,
           })
           .catch((error) => {
@@ -444,5 +413,68 @@ router.post(
     }
   }
 );
+
+router.post("/verify", async (req: Request, res: Response) => {
+  const { photos } = req.body;
+
+  if (!Array.isArray(photos)) {
+    res.status(400).json({
+      success: false,
+      error: "Invalid photos array",
+    });
+    return;
+  }
+
+  try {
+    const bucketName = process.env.AWS_BUCKET;
+    if (!bucketName) {
+      throw new Error("AWS_BUCKET environment variable is not set");
+    }
+
+    logger.info("[Photos] Starting verification", {
+      photoCount: photos.length,
+      photos: photos.map((p) => ({ id: p.id, s3Key: p.s3Key })),
+    });
+
+    // Check each photo exists in S3
+    await Promise.all(
+      photos.map(async (photo) => {
+        const command = new HeadObjectCommand({
+          Bucket: bucketName,
+          Key: photo.s3Key,
+        });
+
+        try {
+          await s3Client.send(command);
+          logger.info("[Photos] Verified photo exists", {
+            photoId: photo.id,
+            s3Key: photo.s3Key,
+          });
+        } catch (error) {
+          logger.error("[Photos] Failed to verify photo", {
+            photoId: photo.id,
+            s3Key: photo.s3Key,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          throw new Error(
+            `Photo ${photo.id} not found in S3 (key: ${photo.s3Key})`
+          );
+        }
+      })
+    );
+
+    res.json({ success: true });
+  } catch (error) {
+    logger.error("[Photos] Verification failed", {
+      error: error instanceof Error ? error.message : "Unknown error",
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
+    res.status(400).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Failed to verify photos",
+    });
+  }
+});
 
 export default router;

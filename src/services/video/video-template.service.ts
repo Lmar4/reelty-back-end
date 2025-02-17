@@ -16,8 +16,12 @@
 import * as fs from "fs";
 import * as path from "path";
 import { logger } from "../../utils/logger";
-import { reelTemplates, TemplateKey, ReelTemplate } from "../imageProcessing/templates/types";
-import { VideoClip } from "./video-processing.service";
+import {
+  reelTemplates,
+  TemplateKey,
+  ReelTemplate,
+} from "../imageProcessing/templates/types";
+import { VideoClip, videoProcessingService } from "./video-processing.service";
 
 interface MusicConfig {
   path: string;
@@ -88,14 +92,14 @@ export class VideoTemplateService {
   private validateTransitions(template: ReelTemplate): void {
     if (template.transitions) {
       if (!Array.isArray(template.transitions)) {
-        throw new Error('Template transitions must be an array');
+        throw new Error("Template transitions must be an array");
       }
-      
+
       template.transitions.forEach((transition, index) => {
         if (!transition.type || !transition.duration) {
           throw new Error(`Invalid transition at index ${index}`);
         }
-        if (!['crossfade', 'fade', 'slide'].includes(transition.type)) {
+        if (!["crossfade", "fade", "slide"].includes(transition.type)) {
           throw new Error(`Invalid transition type at index ${index}`);
         }
         if (transition.duration <= 0) {
@@ -111,7 +115,7 @@ export class VideoTemplateService {
   private validateColorCorrection(template: ReelTemplate): void {
     if (template.colorCorrection) {
       if (!template.colorCorrection.ffmpegFilter) {
-        throw new Error('Color correction must include ffmpeg filter string');
+        throw new Error("Color correction must include ffmpeg filter string");
       }
     }
   }
@@ -134,7 +138,7 @@ export class VideoTemplateService {
       throw new Error(`Template ${templateKey} not found`);
     }
 
-    // Resolve music path if present and update template
+    // Resolve music path if present
     if (template.music?.path) {
       const resolvedMusicPath = await this.resolveMusicPath(
         template.music.path
@@ -156,32 +160,34 @@ export class VideoTemplateService {
       }
     }
 
-    // Count how many actual image slots we need (excluding map)
-    const imageSlots = template.sequence.filter((s) => s !== "map").length;
-    const availableImages = inputVideos.length;
+    // Count how many actual video slots we need (excluding map)
+    const videoSlots = template.sequence.filter((s) => s !== "map").length;
+    const availableVideos = inputVideos.length;
 
     logger.info("Template analysis", {
       totalSlots: template.sequence.length,
-      imageSlots,
-      availableImages,
+      videoSlots,
+      availableVideos,
       hasMapVideo: !!mapVideoPath,
+      hasTransitions: !!template.transitions?.length,
+      hasMusic: !!template.music?.isValid,
     });
 
-    // If we have fewer images than slots, adapt the sequence
+    // If we have fewer videos than slots, adapt the sequence
     let adaptedSequence = [...template.sequence];
-    if (availableImages < imageSlots) {
-      // Keep the map and reuse available images in a round-robin fashion
+    if (availableVideos < videoSlots) {
+      // Keep the map and reuse available videos in a round-robin fashion
       adaptedSequence = template.sequence.map((item) => {
         if (item === "map") return item;
         const index = typeof item === "number" ? item : parseInt(item);
-        return index % availableImages; // Use modulo to wrap around available images
+        return index % availableVideos; // Use modulo to wrap around available videos
       });
 
-      logger.info("Adapted sequence for fewer images", {
+      logger.info("Adapted sequence for fewer videos", {
         originalLength: template.sequence.length,
         adaptedLength: adaptedSequence.length,
         sequence: adaptedSequence,
-        availableImages,
+        availableVideos,
       });
     }
 
@@ -205,8 +211,8 @@ export class VideoTemplateService {
           typeof sequenceItem === "number"
             ? sequenceItem
             : parseInt(sequenceItem);
-        // Normalize the index to fit within available images
-        const normalizedIndex = index % availableImages;
+        // Normalize the index to fit within available videos
+        const normalizedIndex = index % availableVideos;
         const duration =
           typeof template.durations === "object"
             ? (template.durations as Record<string, number>)[String(index)]
@@ -224,6 +230,8 @@ export class VideoTemplateService {
         clips.push({
           path: inputVideos[normalizedIndex],
           duration,
+          transition: template.transitions?.[clips.length - 1],
+          colorCorrection: template.colorCorrection,
         });
       }
     }
@@ -238,6 +246,17 @@ export class VideoTemplateService {
     }
 
     return clips;
+  }
+
+  async extractThumbnail(videoPath: string): Promise<string> {
+    const outputPath = path.join(
+      process.env.TEMP_DIR || "./temp",
+      `thumbnail-${Date.now()}.webp`
+    );
+
+    // Extract frame and convert to WebP format
+    await videoProcessingService.extractFrame(videoPath, outputPath, 1); // Extract frame at 1 second
+    return outputPath;
   }
 }
 

@@ -19,7 +19,8 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "test:templates": "ts-node scripts/test-template-creation.ts"
+    "test:templates": "ts-node src/scripts/test-templates.ts",
+    "sync-stripe": "ts-node src/scripts/sync-stripe-plans.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.744.0",

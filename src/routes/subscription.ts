@@ -1,12 +1,25 @@
 import { PrismaClient } from "@prisma/client";
 import express, { RequestHandler } from "express";
+import Stripe from "stripe";
 import { z } from "zod";
-import { isValidTierId, getTierNameFromId, SubscriptionTierId } from "../constants/subscription-tiers";
+import {
+  getTierNameFromId,
+  isValidTierId,
+  SubscriptionTierId,
+} from "../constants/subscription-tiers";
 import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
 
 const router = express.Router();
 const prisma = new PrismaClient();
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error("STRIPE_SECRET_KEY is required");
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2025-01-27.acacia",
+});
 
 // Validation schemas
 const updateTierSchema = z.object({
@@ -31,6 +44,24 @@ const updateSubscriptionSchema = z.object({
   }),
 });
 
+// Validation schema for create checkout
+const createCheckoutSchema = z.object({
+  body: z.object({
+    plan: z.string().min(1),
+    billingType: z.enum(["credits", "monthly"]),
+    returnUrl: z.string().url(),
+  }),
+});
+
+interface ListingWithCounts {
+  id: string;
+  status: string;
+  _count: {
+    photos: number;
+    videoJobs: number;
+  };
+}
+
 // Get available subscription tiers
 const getTiers: RequestHandler = async (_req, res) => {
   try {
@@ -42,7 +73,7 @@ const getTiers: RequestHandler = async (_req, res) => {
       ],
     });
 
-    const tiersWithNames = tiers.map(tier => ({
+    const tiersWithNames = tiers.map((tier) => ({
       ...tier,
       name: getTierNameFromId(tier.id as SubscriptionTierId),
     }));
@@ -147,23 +178,104 @@ const updateTier: RequestHandler = async (req, res) => {
   }
 };
 
-// Initiate checkout process
-const initiateCheckout: RequestHandler = async (req, res) => {
+// Create checkout session
+const createCheckout: RequestHandler = async (req, res) => {
   try {
-    const userId = req.user!.id;
+    // Get user ID from the request body since it's passed from the frontend
+    const { userId, plan, billingType, returnUrl } = req.body;
 
-    // TODO: Implement your payment provider integration here
-    // This is a placeholder that returns a mock checkout session
+    if (!userId) {
+      res.status(400).json({
+        success: false,
+        error: "User ID is required",
+      });
+      return;
+    }
+
+    // Get the user to check if they have a Stripe customer ID
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        email: true,
+        stripeCustomerId: true,
+      },
+    });
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+      return;
+    }
+
+    // Get the subscription tier for the selected plan
+    const tier = await prisma.subscriptionTier.findFirst({
+      where: {
+        AND: [
+          { name: plan }, // Exact match since we're now sending the correct plan name
+          { planType: billingType === "monthly" ? "MONTHLY" : "PAY_AS_YOU_GO" },
+        ],
+      },
+    });
+
+    if (!tier) {
+      console.error("Plan not found:", { plan, billingType });
+      res.status(404).json({
+        success: false,
+        error: "Plan not found",
+      });
+      return;
+    }
+
+    // Create or retrieve Stripe customer
+    let stripeCustomerId = user.stripeCustomerId;
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({
+        email: user.email,
+        metadata: {
+          userId: user.id,
+        },
+      });
+      stripeCustomerId = customer.id;
+
+      // Update user with Stripe customer ID
+      await prisma.user.update({
+        where: { id: userId },
+        data: { stripeCustomerId },
+      });
+    }
+
+    // Create checkout session
+    const session = await stripe.checkout.sessions.create({
+      customer: stripeCustomerId,
+      line_items: [
+        {
+          price: tier.stripePriceId,
+          quantity: 1,
+        },
+      ],
+      mode: "subscription",
+      success_url: `${returnUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: returnUrl,
+      subscription_data: {
+        metadata: {
+          userId,
+          tierId: tier.id,
+        },
+      },
+    });
+
     res.json({
       success: true,
       data: {
-        userId,
-        checkoutUrl: "https://your-payment-provider.com/checkout/session-id",
-        sessionId: "mock-session-id",
+        sessionId: session.id,
+        url: session.url,
       },
     });
   } catch (error) {
-    console.error("Checkout error:", error);
+    console.error("Create checkout error:", error);
     res.status(500).json({
       success: false,
       error: error instanceof Error ? error.message : "Unknown error occurred",
@@ -305,21 +417,167 @@ const getCurrentSubscription: RequestHandler = async (req, res) => {
   }
 };
 
+// Get user's invoices
+const getInvoices: RequestHandler = async (req, res) => {
+  try {
+    const userId = req.user!.id;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const starting_after = req.query.starting_after as string;
+
+    // Get user's Stripe customer ID
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        stripeCustomerId: true,
+      },
+    });
+
+    if (!user?.stripeCustomerId) {
+      res.status(404).json({
+        success: false,
+        error: "User not found or no Stripe customer ID",
+      });
+      return;
+    }
+
+    // Fetch invoices from Stripe with pagination
+    const invoices = await stripe.invoices.list({
+      customer: user.stripeCustomerId,
+      limit: Math.min(limit, 100), // Cap at 100 to prevent abuse
+      starting_after,
+    });
+
+    const formattedInvoices = invoices.data.map((invoice) => ({
+      id: invoice.id,
+      created: invoice.created,
+      amount_paid: invoice.amount_paid,
+      status: invoice.status,
+      invoice_pdf: invoice.invoice_pdf,
+    }));
+
+    res.json({
+      success: true,
+      data: {
+        invoices: formattedInvoices,
+        has_more: invoices.has_more,
+      },
+    });
+  } catch (error) {
+    console.error("Get invoices error:", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+  }
+};
+
+// Get user's usage statistics
+const getUsageStats: RequestHandler = async (req, res) => {
+  try {
+    const userId = req.user!.id;
+
+    // Get user's current subscription and usage data
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        currentTier: true,
+        listings: {
+          select: {
+            id: true,
+            status: true,
+            _count: {
+              select: {
+                photos: true,
+                videoJobs: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      res.status(404).json({
+        success: false,
+        error: "User not found",
+      });
+      return;
+    }
+
+    // Calculate usage statistics
+    const activeListings = user.listings.filter(
+      (listing: ListingWithCounts) => listing.status === "ACTIVE"
+    ).length;
+
+    const totalListings = user.listings.length;
+    const totalVideosGenerated = user.listings.reduce(
+      (sum: number, listing: ListingWithCounts) =>
+        sum + listing._count.videoJobs,
+      0
+    );
+    const totalPhotos = user.listings.reduce(
+      (sum: number, listing: ListingWithCounts) => sum + listing._count.photos,
+      0
+    );
+
+    // Calculate storage used (assuming each photo is ~2MB and each video is ~10MB)
+    const storageUsed = totalPhotos * 2 + totalVideosGenerated * 10;
+
+    // Get credits used from the credit logs table
+    const creditsUsed = await prisma.creditLog.aggregate({
+      where: {
+        userId,
+        amount: { lt: 0 }, // Only count negative amounts (used credits)
+        createdAt: {
+          gte: new Date(new Date().setDate(1)), // Start of current month
+        },
+      },
+      _sum: {
+        amount: true,
+      },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        creditsUsed: Math.abs(creditsUsed._sum.amount || 0),
+        activeListings,
+        totalListings,
+        totalVideosGenerated,
+        storageUsed,
+      },
+    });
+  } catch (error) {
+    console.error("Get usage stats error:", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error occurred",
+    });
+  }
+};
+
 // Route handlers
-router.get("/tiers", getTiers); // Public endpoint
+router.get("/tiers", getTiers);
 router.patch(
   "/tier",
   isAuthenticated,
   validateRequest(updateTierSchema),
   updateTier
 );
-router.post("/checkout", isAuthenticated, initiateCheckout);
+router.post(
+  "/create-checkout",
+  isAuthenticated,
+  validateRequest(createCheckoutSchema),
+  createCheckout
+);
 router.post(
   "/update",
   validateRequest(updateSubscriptionSchema),
   updateSubscriptionFromStripe
-); // Stripe webhook endpoint
+);
 router.post("/cancel", isAuthenticated, cancelSubscription);
 router.get("/current", isAuthenticated, getCurrentSubscription);
+router.get("/invoices", isAuthenticated, getInvoices);
+router.get("/usage", isAuthenticated, getUsageStats);
 
 export default router;

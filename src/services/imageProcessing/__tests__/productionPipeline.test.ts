@@ -7,7 +7,7 @@ import {
   it,
   jest,
 } from "@jest/globals";
-import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus, Prisma } from "@prisma/client";
 import "@testing-library/jest-dom";
 import fs from "fs/promises";
 import path from "path";
@@ -406,6 +406,313 @@ describe("ProductionPipeline Template Processing", () => {
 
       // Restore original unlink
       (fs.unlink as unknown) = originalUnlink;
+    });
+  });
+
+  describe("Single Photo Processing", () => {
+    const SINGLE_PHOTO_ID = "b8fcb635-5442-4ac8-ae8d-b5e5444e3ddd";
+    const SINGLE_PHOTO_PATH = path.join(TEST_CONFIG.TEMP_DIR, "test_photo.jpg");
+
+    beforeEach(async () => {
+      // Clear previous test data
+      await prisma.$transaction(async (tx) => {
+        await tx.photo.deleteMany({
+          where: { id: SINGLE_PHOTO_ID },
+        });
+        await tx.processedAsset.deleteMany({
+          where: { type: "runway" },
+        });
+      });
+
+      // Create a test photo
+      await prisma.photo.create({
+        data: {
+          id: SINGLE_PHOTO_ID,
+          userId: TEST_CONFIG.TEST_USER_ID,
+          listingId: TEST_CONFIG.TEST_LISTING_ID,
+          status: "COMPLETED",
+          processedFilePath: SINGLE_PHOTO_PATH,
+          filePath: SINGLE_PHOTO_PATH,
+          s3Key: `test/${SINGLE_PHOTO_ID}.jpg`,
+          order: 1,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      });
+
+      // Reset mocks
+      jest.clearAllMocks();
+    });
+
+    it("should process a single photo regeneration", async () => {
+      // Mock runway video generation
+      const mockRunwayVideo = path.join(
+        TEST_CONFIG.TEMP_DIR,
+        `runway_${Date.now()}.mp4`
+      );
+      jest
+        .mocked(runwayService.generateVideo)
+        .mockResolvedValue(mockRunwayVideo);
+
+      // Mock template generation
+      const mockTemplateVideo = path.join(
+        TEST_CONFIG.TEMP_DIR,
+        `template_${Date.now()}.mp4`
+      );
+      jest.mocked(videoTemplateService.createTemplate).mockResolvedValue([
+        {
+          path: mockTemplateVideo,
+          duration: 30,
+        },
+      ]);
+
+      // Execute regeneration
+      await pipeline.regeneratePhotos(TEST_CONFIG.TEST_JOB_ID, [
+        SINGLE_PHOTO_ID,
+      ]);
+
+      // Verify the photo status was updated correctly
+      const updatedPhoto = await prisma.photo.findUnique({
+        where: { id: SINGLE_PHOTO_ID },
+      });
+      expect(updatedPhoto?.status).toBe("COMPLETED");
+      expect(updatedPhoto?.error).toBeNull();
+
+      // Verify the job was updated with the regeneration results
+      const job = await prisma.videoJob.findUnique({
+        where: { id: TEST_CONFIG.TEST_JOB_ID },
+        select: { status: true, metadata: true, outputFile: true },
+      });
+
+      expect(job?.status).toBe(VideoGenerationStatus.COMPLETED);
+      expect(job?.outputFile).toBeTruthy();
+
+      const metadata = job?.metadata as any;
+      expect(metadata.regeneration).toBeDefined();
+      expect(metadata.regeneration.regeneratedPhotoIds).toContain(
+        SINGLE_PHOTO_ID
+      );
+      expect(metadata.regeneration.totalPhotos).toBe(1);
+    });
+
+    it("should handle errors during single photo regeneration", async () => {
+      // Mock runway service to fail
+      jest
+        .mocked(runwayService.generateVideo)
+        .mockRejectedValue(new Error("Runway processing failed"));
+
+      // Execute regeneration and expect it to fail
+      await expect(
+        pipeline.regeneratePhotos(TEST_CONFIG.TEST_JOB_ID, [SINGLE_PHOTO_ID])
+      ).rejects.toThrow("Runway processing failed");
+
+      // Verify the photo status was updated to failed
+      const updatedPhoto = await prisma.photo.findUnique({
+        where: { id: SINGLE_PHOTO_ID },
+      });
+      expect(updatedPhoto?.status).toBe("FAILED");
+      expect(updatedPhoto?.error).toBe("Runway processing failed");
+
+      // Verify the job status
+      const job = await prisma.videoJob.findUnique({
+        where: { id: TEST_CONFIG.TEST_JOB_ID },
+      });
+      expect(job?.status).toBe(VideoGenerationStatus.FAILED);
+    });
+
+    it("should reuse existing runway videos when available", async () => {
+      // Create a mock processed asset for the photo
+      const existingVideoPath = path.join(
+        TEST_CONFIG.TEMP_DIR,
+        "existing_runway.mp4"
+      );
+      const cacheKey = require("crypto")
+        .createHash("md5")
+        .update(
+          JSON.stringify({
+            type: "runway",
+            inputFiles: [SINGLE_PHOTO_PATH],
+          })
+        )
+        .digest("hex");
+
+      await prisma.processedAsset.create({
+        data: {
+          type: "runway",
+          path: existingVideoPath,
+          cacheKey: `runway_${cacheKey}`,
+          hash: cacheKey,
+          metadata: {
+            sourceFile: SINGLE_PHOTO_PATH,
+            timestamp: Date.now(),
+          },
+        },
+      });
+
+      // Mock template generation
+      const mockTemplateVideo = path.join(
+        TEST_CONFIG.TEMP_DIR,
+        `template_${Date.now()}.mp4`
+      );
+      jest.mocked(videoTemplateService.createTemplate).mockResolvedValue([
+        {
+          path: mockTemplateVideo,
+          duration: 30,
+        },
+      ]);
+
+      // Execute regeneration
+      await pipeline.regeneratePhotos(TEST_CONFIG.TEST_JOB_ID, [
+        SINGLE_PHOTO_ID,
+      ]);
+
+      // Verify runway service was not called
+      expect(runwayService.generateVideo).not.toHaveBeenCalled();
+
+      // Verify the job completed successfully
+      const job = await prisma.videoJob.findUnique({
+        where: { id: TEST_CONFIG.TEST_JOB_ID },
+      });
+      expect(job?.status).toBe(VideoGenerationStatus.COMPLETED);
+    });
+
+    it("should maintain correct progress tracking during single photo processing", async () => {
+      const progressUpdates: Array<{
+        progress: number;
+        stage?: string;
+        status: VideoGenerationStatus;
+      }> = [];
+
+      // Mock prisma update to capture progress updates
+      const originalUpdate = prisma.videoJob.update;
+      prisma.videoJob.update = jest.fn(
+        async (params: Prisma.VideoJobUpdateArgs) => {
+          if (params.data.progress !== undefined) {
+            progressUpdates.push({
+              progress: params.data.progress as number,
+              stage: (params.data.metadata as any)?.currentStage,
+              status: params.data.status as VideoGenerationStatus,
+            });
+          }
+          return originalUpdate(params);
+        }
+      ) as any;
+
+      // Mock successful processing
+      const mockRunwayVideo = path.join(
+        TEST_CONFIG.TEMP_DIR,
+        `runway_${Date.now()}.mp4`
+      );
+      jest
+        .mocked(runwayService.generateVideo)
+        .mockResolvedValue(mockRunwayVideo);
+
+      const mockTemplateVideo = path.join(
+        TEST_CONFIG.TEMP_DIR,
+        `template_${Date.now()}.mp4`
+      );
+      jest.mocked(videoTemplateService.createTemplate).mockResolvedValue([
+        {
+          path: mockTemplateVideo,
+          duration: 30,
+        },
+      ]);
+
+      // Execute regeneration
+      await pipeline.regeneratePhotos(TEST_CONFIG.TEST_JOB_ID, [
+        SINGLE_PHOTO_ID,
+      ]);
+
+      // Verify progress tracking
+      expect(progressUpdates.length).toBeGreaterThan(0);
+      expect(progressUpdates[0].progress).toBe(0); // Initial progress
+      expect(progressUpdates[progressUpdates.length - 1].progress).toBe(100); // Final progress
+
+      // Verify stage transitions
+      const stages = progressUpdates.map((update) => update.stage);
+      expect(stages).toContain("runway");
+      expect(stages).toContain("template");
+      expect(stages).toContain("upload");
+
+      // Restore original prisma update
+      prisma.videoJob.update = originalUpdate;
+    });
+
+    it("should create all required templates during single photo regeneration", async () => {
+      // Mock runway video generation
+      const mockRunwayVideo = path.join(
+        TEST_CONFIG.TEMP_DIR,
+        `runway_${Date.now()}.mp4`
+      );
+      jest
+        .mocked(runwayService.generateVideo)
+        .mockResolvedValue(mockRunwayVideo);
+
+      // Track template creation calls
+      const createdTemplates: Record<string, string> = {};
+      jest
+        .mocked(videoTemplateService.createTemplate)
+        .mockImplementation(async (template: TemplateKey, videos: string[]) => {
+          const templatePath = path.join(
+            TEST_CONFIG.TEMP_DIR,
+            `${template}_${Date.now()}.mp4`
+          );
+          createdTemplates[template] = templatePath;
+          return [
+            {
+              path: templatePath,
+              duration: 30,
+            },
+          ];
+        });
+
+      // Execute regeneration
+      await pipeline.regeneratePhotos(TEST_CONFIG.TEST_JOB_ID, [
+        SINGLE_PHOTO_ID,
+      ]);
+
+      // Verify all templates were created
+      const expectedTemplates = [
+        "crescendo",
+        "wave",
+        "storyteller",
+        "googlezoomintro",
+        "wesanderson",
+        "hyperpop",
+      ];
+
+      // Check each template was created
+      for (const template of expectedTemplates) {
+        expect(createdTemplates[template]).toBeDefined();
+        expect(createdTemplates[template]).toContain(template);
+      }
+
+      // Verify the job metadata contains all template results
+      const job = await prisma.videoJob.findUnique({
+        where: { id: TEST_CONFIG.TEST_JOB_ID },
+        select: {
+          metadata: true,
+          outputFile: true,
+        },
+      });
+
+      const metadata = job?.metadata as any;
+      expect(metadata.templates).toBeDefined();
+      expect(metadata.templates).toHaveLength(expectedTemplates.length);
+
+      // Verify each template has a valid path and no errors
+      for (const templateResult of metadata.templates) {
+        expect(templateResult.key).toBeDefined();
+        expect(templateResult.path).toBeTruthy();
+        expect(templateResult.error).toBeNull();
+      }
+
+      // Verify the primary template (storyteller) was set as the output
+      const primaryTemplate = metadata.templates.find(
+        (t: any) => t.key === "storyteller"
+      );
+      expect(primaryTemplate).toBeDefined();
+      expect(job?.outputFile).toBe(primaryTemplate.path);
     });
   });
 });

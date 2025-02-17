@@ -5,6 +5,8 @@ import {
 } from "@aws-sdk/client-s3";
 import { Readable } from "stream";
 import { rateLimiter } from "./rate-limiter";
+import { createReadStream } from "fs";
+import { logger } from "../../utils/logger";
 
 const MAX_RETRIES = 5;
 const BASE_DELAY = 1000; // 1 second
@@ -200,3 +202,32 @@ export class S3Service {
 
 // Export singleton instance
 export const s3Service = new S3Service();
+
+export async function uploadToS3(
+  filePath: string,
+  s3Key: string,
+  contentType?: string
+): Promise<string> {
+  try {
+    const fileStream = createReadStream(filePath);
+    const buffer = await streamToBuffer(fileStream);
+    await s3Service.uploadFile(buffer, s3Key, contentType);
+
+    // Return the S3 URL
+    return `https://${process.env.AWS_BUCKET}.s3.${
+      process.env.AWS_REGION || "us-east-1"
+    }.amazonaws.com/${s3Key}`;
+  } catch (error) {
+    logger.error("Error uploading to S3:", error);
+    throw error;
+  }
+}
+
+// Helper function to convert stream to buffer
+async function streamToBuffer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
