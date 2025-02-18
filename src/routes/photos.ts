@@ -152,11 +152,6 @@ router.post(
         return;
       }
 
-      logger.info("[PHOTOS_BATCH_REGENERATE] Finding photos", {
-        photoIds,
-        userId,
-      });
-
       // Find all photos and check ownership
       const photos = await prisma.photo.findMany({
         where: {
@@ -164,15 +159,7 @@ router.post(
           userId,
         },
         include: {
-          listing: {
-            include: {
-              photos: {
-                orderBy: {
-                  order: "asc",
-                },
-              },
-            },
-          },
+          listing: true,
         },
       });
 
@@ -213,52 +200,47 @@ router.post(
         return acc;
       }, {} as Record<string, { listing: any; photos: typeof photos }>);
 
-      // Create jobs for each listing
+      // Create jobs for each listing and use regeneratePhotos
       const jobs = await Promise.all(
-        Object.values(photosByListing).map(async ({ listing }) => {
-          // Create a new job for regeneration
-          const job = await prisma.videoJob.create({
-            data: {
-              listingId: listing.id,
-              userId,
-              status: VideoGenerationStatus.PROCESSING,
-              template: "crescendo",
-            },
-          });
-
-          logger.info("[PHOTOS_BATCH_REGENERATE] Created video job", {
-            jobId: job.id,
-            listingId: listing.id,
-            photoCount: listing.photos.length,
-          });
-
-          // Get all photo URLs in order
-          const photoUrls = listing.photos.map(
-            (p: { filePath: string }) => p.filePath
-          );
-
-          // Start the regeneration process in the background
-          productionPipeline
-            .execute({
-              jobId: job.id,
-              inputFiles: photoUrls,
-              template: "crescendo",
-              coordinates: listing.coordinates as any,
-            })
-            .catch((error) => {
-              logger.error(
-                "[PHOTOS_BATCH_REGENERATE_ERROR] Pipeline execution failed",
-                {
-                  jobId: job.id,
-                  error:
-                    error instanceof Error ? error.message : "Unknown error",
-                  stack: error instanceof Error ? error.stack : undefined,
-                }
-              );
+        Object.entries(photosByListing).map(
+          async ([listingId, { listing, photos }]) => {
+            // Create a new job for regeneration
+            const job = await prisma.videoJob.create({
+              data: {
+                listingId,
+                userId,
+                status: VideoGenerationStatus.PROCESSING,
+                template: "crescendo",
+              },
             });
 
-          return job;
-        })
+            logger.info("[PHOTOS_BATCH_REGENERATE] Created video job", {
+              jobId: job.id,
+              listingId,
+              photosToRegenerate: photos.map((p) => p.id),
+            });
+
+            // Use regeneratePhotos instead of execute
+            productionPipeline
+              .regeneratePhotos(
+                job.id,
+                photos.map((p) => p.id)
+              )
+              .catch((error) => {
+                logger.error(
+                  "[PHOTOS_BATCH_REGENERATE_ERROR] Pipeline execution failed",
+                  {
+                    jobId: job.id,
+                    error:
+                      error instanceof Error ? error.message : "Unknown error",
+                    stack: error instanceof Error ? error.stack : undefined,
+                  }
+                );
+              });
+
+            return job;
+          }
+        )
       );
 
       logger.info("[PHOTOS_BATCH_REGENERATE] Sending success response", {

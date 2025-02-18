@@ -459,33 +459,18 @@ export class ProductionPipeline {
   ): Promise<{ runwayVideos: string[]; mapVideo: string | null }> {
     this.monitorMemoryUsage(jobId);
 
-    // Start map video generation in parallel if coordinates are provided
     const mapVideoPromise = coordinates
       ? this.generateMapVideoForTemplate(coordinates, jobId)
       : Promise.resolve(null);
 
-    // Check if any files are marked for regeneration
-    const hasRegenerationMarkers = inputFiles.some((file) =>
-      file.includes("regenerate=true")
-    );
-
-    logger.info(`[${jobId}] Processing runway videos`, {
-      inputFiles,
-      isRegeneration: _isRegeneration,
-      hasRegenerationMarkers,
-      hasRegenerationContext: !!_regenerationContext,
-    });
-
-    if (_isRegeneration && _regenerationContext && hasRegenerationMarkers) {
+    // Check if we're in regeneration mode
+    if (_isRegeneration && _regenerationContext) {
       logger.info(`[${jobId}] Processing regeneration with context`, {
         toRegenerate: _regenerationContext.photosToRegenerate.length,
         existing: _regenerationContext.existingPhotos.length,
-        filePaths: _regenerationContext.photosToRegenerate.map(
-          (p) => p.processedFilePath
-        ),
       });
 
-      // Process ONLY the photos that need regeneration through Runway
+      // Process ONLY the photos marked for regeneration
       const regeneratedVideos = await Promise.all(
         _regenerationContext.photosToRegenerate.map(async (photo) => {
           logger.info(`[${jobId}] Processing regeneration for photo`, {
@@ -493,16 +478,10 @@ export class ProductionPipeline {
             path: photo.processedFilePath,
           });
 
-          // Remove regeneration marker properly handling both ? and & cases
-          const originalPath = photo.processedFilePath.replace(
-            /(\?|\&)regenerate=true/,
-            ""
-          );
-
           // Process single photo with Runway
           const processedVideo = await this.processImageWithRunway(
-            originalPath,
-            0,
+            photo.processedFilePath,
+            photo.order,
             jobId
           );
 
@@ -518,32 +497,18 @@ export class ProductionPipeline {
         })
       );
 
-      // Filter out failed regenerations
-      const successfulRegenerations = regeneratedVideos.filter(
-        (video): video is typeof video & { processedFilePath: string } =>
-          video !== null
-      );
-
-      // Combine regenerated and existing videos in correct order
+      // Combine regenerated and existing videos
       const allVideos = [
-        ...successfulRegenerations,
+        ...regeneratedVideos.filter(
+          (v): v is NonNullable<typeof v> => v !== null
+        ),
         ..._regenerationContext.existingPhotos,
       ].sort((a, b) => (a.order || 0) - (b.order || 0));
 
-      // Wait for map video generation to complete
       const mapVideo = await mapVideoPromise;
 
-      // Ensure all videos have valid paths
-      const finalVideos = allVideos
-        .map((p) => p.processedFilePath)
-        .filter((path): path is string => typeof path === "string");
-
-      if (finalVideos.length !== allVideos.length) {
-        throw new Error("Some videos have invalid paths");
-      }
-
       return {
-        runwayVideos: finalVideos,
+        runwayVideos: allVideos.map((v) => v.processedFilePath),
         mapVideo,
       };
     }
