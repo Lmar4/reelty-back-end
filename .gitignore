@@ -70,6 +70,7 @@ default_output
 /temp/*
 /temp/**/*
 /assets
+*.mp4
 
 # Build artifacts
 /dist
