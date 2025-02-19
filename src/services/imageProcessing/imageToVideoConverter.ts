@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import * as fs from "fs";
 import * as path from "path";
 import { RunwayClient } from "../runway";
@@ -286,7 +286,7 @@ export class ImageToVideoConverter {
           data: {
             userId: photos[0].userId,
             listingId: listing.id,
-            status: "PROCESSING",
+            status: VideoGenerationStatus.PROCESSING,
             template: "default",
             inputFiles: photos.map((p) => p.processedFilePath),
           },
@@ -297,7 +297,7 @@ export class ImageToVideoConverter {
         // Update photos status to processing
         await prisma.photo.updateMany({
           where: { id: { in: photos.map((p) => p.id) } },
-          data: { status: "processing", error: null },
+          data: { status: VideoGenerationStatus.PROCESSING, error: null },
         });
 
         // Use ProductionPipeline to regenerate the specific photos
@@ -747,7 +747,7 @@ export class ImageToVideoConverter {
       await prisma.videoJob.update({
         where: { id: jobId },
         data: {
-          status: "COMPLETED",
+          status: VideoGenerationStatus.COMPLETED,
           progress: 100,
           outputFile: successfulTemplates[0],
           completedAt: new Date(),
@@ -764,7 +764,7 @@ export class ImageToVideoConverter {
       await prisma.videoJob.update({
         where: { id: jobId },
         data: {
-          status: "FAILED",
+          status: VideoGenerationStatus.FAILED,
           error: error instanceof Error ? error.message : "Unknown error",
           completedAt: new Date(),
         },

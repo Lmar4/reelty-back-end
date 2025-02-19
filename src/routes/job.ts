@@ -50,7 +50,7 @@ async function recoverPendingJobs() {
         const existingProcessingJob = await prisma.videoJob.findFirst({
           where: {
             listingId: job.listingId,
-            status: "PROCESSING",
+            status: VideoGenerationStatus.PROCESSING,
           },
         });
 
@@ -108,7 +108,7 @@ const createJobSchema = z.object({
 
 const updateJobSchema = z.object({
   body: z.object({
-    status: z.enum(["QUEUED", "PROCESSING", "COMPLETED", "FAILED"]).optional(),
+    status: z.nativeEnum(VideoGenerationStatus).optional(),
     progress: z.number().min(0).max(100).optional(),
     template: z.string().optional(),
     inputFiles: z.array(z.string()).optional(),
