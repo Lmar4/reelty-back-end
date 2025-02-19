@@ -67,6 +67,8 @@ default_output
 
 /output
 /temp
+/temp/*
+/temp/**/*
 /assets
 
 # Build artifacts
