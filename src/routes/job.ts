@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import express, { RequestHandler } from "express";
 import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
@@ -23,7 +23,7 @@ async function recoverPendingJobs() {
     console.log("[RECOVERY] Looking for pending jobs...");
     const pendingJobs = await prisma.videoJob.findMany({
       where: {
-        status: "QUEUED",
+        status: VideoGenerationStatus.PENDING,
         createdAt: {
           // Only recover jobs from the last 24 hours
           gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
@@ -205,7 +205,7 @@ const createJob: RequestHandler = async (req, res) => {
       data: {
         userId: req.user!.id,
         listingId,
-        status: "QUEUED",
+        status: VideoGenerationStatus.PENDING,
         progress: 0,
         template: templateId || "googlezoomintro",
         inputFiles: validInputFiles,
@@ -373,7 +373,7 @@ const regenerateJob: RequestHandler = async (req, res) => {
         createdAt: {
           gte: new Date(Date.now() - 1000 * 60 * 60),
         },
-        status: "QUEUED",
+        status: VideoGenerationStatus.PENDING,
       },
     });
 
@@ -403,7 +403,7 @@ const regenerateJob: RequestHandler = async (req, res) => {
       data: {
         userId,
         listingId: existingJob.listingId,
-        status: "QUEUED",
+        status: VideoGenerationStatus.PENDING,
         template: existingJob.template,
         inputFiles: existingJob.inputFiles as any,
         priority: existingJob.priority,

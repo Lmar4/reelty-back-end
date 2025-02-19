@@ -1,4 +1,4 @@
-import { Prisma, PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import express, { Request, Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -745,11 +745,13 @@ router.get(
 
       // Calculate processing status
       const processingCount = videos.filter(
-        (v) => v.status === "PROCESSING" || v.status === "QUEUED"
+        (v) => v.status === VideoGenerationStatus.PROCESSING
       ).length;
-      const failedCount = videos.filter((v) => v.status === "FAILED").length;
+      const failedCount = videos.filter(
+        (v) => v.status === VideoGenerationStatus.FAILED
+      ).length;
       const completedCount = videos.filter(
-        (v) => v.status === "COMPLETED"
+        (v) => v.status === VideoGenerationStatus.COMPLETED
       ).length;
 
       // Determine if polling should end (no processing jobs and at least one video)

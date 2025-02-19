@@ -31,7 +31,7 @@ export class VideoProcessor {
         id: jobId,
         userId,
         listingId,
-        status: VideoGenerationStatus.QUEUED,
+        status: VideoGenerationStatus.PENDING,
         progress: 0,
         template: templateId,
       },
@@ -42,7 +42,7 @@ export class VideoProcessor {
 
     return {
       jobId,
-      status: VideoGenerationStatus.QUEUED,
+      status: VideoGenerationStatus.PENDING,
       progress: 0,
       assets: [],
     };
@@ -51,42 +51,60 @@ export class VideoProcessor {
   /**
    * Updates job progress with proper weighting for new features
    */
-  private async updateJobProgress(jobId: string, stage: string, progress: number): Promise<void> {
+  private async updateJobProgress(
+    jobId: string,
+    stage: string,
+    progress: number
+  ): Promise<void> {
     // Stages and their weights
     const stageWeights = {
       imageProcessing: 0.3,
       videoSegments: 0.3,
       transitions: 0.2,
       colorCorrection: 0.1,
-      finalComposition: 0.1
+      finalComposition: 0.1,
     };
 
     const stageProgress = progress / 100;
     let totalProgress = 0;
 
-    switch(stage) {
-      case 'imageProcessing':
+    switch (stage) {
+      case "imageProcessing":
         totalProgress = stageProgress * stageWeights.imageProcessing;
         break;
-      case 'videoSegments':
-        totalProgress = stageWeights.imageProcessing + (stageProgress * stageWeights.videoSegments);
+      case "videoSegments":
+        totalProgress =
+          stageWeights.imageProcessing +
+          stageProgress * stageWeights.videoSegments;
         break;
-      case 'transitions':
-        totalProgress = stageWeights.imageProcessing + stageWeights.videoSegments + 
-                       (stageProgress * stageWeights.transitions);
+      case "transitions":
+        totalProgress =
+          stageWeights.imageProcessing +
+          stageWeights.videoSegments +
+          stageProgress * stageWeights.transitions;
         break;
-      case 'colorCorrection':
-        totalProgress = stageWeights.imageProcessing + stageWeights.videoSegments + 
-                       stageWeights.transitions + (stageProgress * stageWeights.colorCorrection);
+      case "colorCorrection":
+        totalProgress =
+          stageWeights.imageProcessing +
+          stageWeights.videoSegments +
+          stageWeights.transitions +
+          stageProgress * stageWeights.colorCorrection;
         break;
-      case 'finalComposition':
-        totalProgress = stageWeights.imageProcessing + stageWeights.videoSegments + 
-                       stageWeights.transitions + stageWeights.colorCorrection +
-                       (stageProgress * stageWeights.finalComposition);
+      case "finalComposition":
+        totalProgress =
+          stageWeights.imageProcessing +
+          stageWeights.videoSegments +
+          stageWeights.transitions +
+          stageWeights.colorCorrection +
+          stageProgress * stageWeights.finalComposition;
         break;
     }
 
-    await this.updateJobStatus(jobId, VideoGenerationStatus.PROCESSING, Math.round(totalProgress * 100));
+    await this.updateJobStatus(
+      jobId,
+      VideoGenerationStatus.PROCESSING,
+      Math.round(totalProgress * 100)
+    );
   }
 
   private async processInBackground(

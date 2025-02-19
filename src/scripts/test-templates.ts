@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import * as path from "path";
 import { config } from "dotenv";
 import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
@@ -126,7 +126,7 @@ async function createTestJob() {
     data: {
       userId: user.id,
       listingId: listing.id,
-      status: "QUEUED",
+      status: VideoGenerationStatus.PENDING,
       template: "storyteller",
       priority: 1,
     },

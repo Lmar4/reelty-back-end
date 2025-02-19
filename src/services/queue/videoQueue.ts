@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import { SUBSCRIPTION_TIERS } from "../../constants/subscription-tiers";
 import { JobMetadata, JobProgress } from "../../types/job-types";
 import { logger } from "../../utils/logger";
@@ -140,7 +140,7 @@ export class VideoQueueService {
     const pendingJobs = await this.prisma.videoJob.findMany({
       where: {
         listingId,
-        status: { in: ["QUEUED", "PROCESSING"] },
+        status: { in: ["PENDING", "PROCESSING"] },
       },
       orderBy: { createdAt: "asc" },
     });
@@ -171,7 +171,7 @@ export class VideoQueueService {
         inputFiles: Array.from(allFiles),
         template,
         priority: maxPriority,
-        status: "QUEUED",
+        status: VideoGenerationStatus.PENDING,
         metadata: {
           consolidatedFrom: pendingJobs.map((j) => j.id),
           originalCount: pendingJobs.length,
@@ -183,7 +183,7 @@ export class VideoQueueService {
     await this.prisma.videoJob.updateMany({
       where: { id: { in: pendingJobs.map((j) => j.id) } },
       data: {
-        status: "CANCELLED",
+        status: VideoGenerationStatus.FAILED,
         metadata: {
           consolidatedInto: consolidatedJob.id,
         },
@@ -202,7 +202,7 @@ export class VideoQueueService {
   private async processNextInQueue(): Promise<void> {
     const nextJob = await this.prisma.videoJob.findFirst({
       where: {
-        status: "QUEUED",
+        status: VideoGenerationStatus.PENDING,
       },
       orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
     });
@@ -323,7 +323,9 @@ export class VideoQueueService {
     const existingJob = await this.prisma.videoJob.findFirst({
       where: {
         listingId,
-        status: { in: ["QUEUED", "PROCESSING"] },
+        status: {
+          in: [VideoGenerationStatus.PENDING, VideoGenerationStatus.PROCESSING],
+        },
       },
     });
 
@@ -353,7 +355,7 @@ export class VideoQueueService {
         listingId,
         inputFiles,
         template,
-        status: "QUEUED",
+        status: VideoGenerationStatus.PENDING,
         progress: 0,
         priority: adjustedPriority,
         metadata: {
@@ -497,7 +499,7 @@ export class VideoQueueService {
       where: {
         userId,
         status: {
-          in: ["QUEUED", "PROCESSING"],
+          in: [VideoGenerationStatus.PENDING, VideoGenerationStatus.PROCESSING],
         },
       },
       orderBy: { createdAt: "asc" },
