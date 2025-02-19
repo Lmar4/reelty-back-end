@@ -188,6 +188,27 @@ async function main() {
 
   console.log("Created/updated admin user:", adminUser);
 
+  // Create test user with specific ID
+  const testUser = await prisma.user.upsert({
+    where: { id: "user_2slqwO8UeouJwKF3oOqyZQSxOuZ" },
+    update: {
+      currentTierId: SUBSCRIPTION_TIERS.PRO,
+      subscriptionStatus: "ACTIVE",
+    },
+    create: {
+      id: "user_2slqwO8UeouJwKF3oOqyZQSxOuZ",
+      email: "test@reelty.app",
+      password: "test123", // In production, this should be properly hashed
+      firstName: "Test",
+      lastName: "User",
+      currentTierId: SUBSCRIPTION_TIERS.PRO,
+      subscriptionStatus: "ACTIVE",
+      role: "USER",
+    },
+  });
+
+  console.log("Created/updated test user:", testUser);
+
   // Create templates
   await seedTemplates();
 

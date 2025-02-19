@@ -793,11 +793,10 @@ export class ProductionPipeline {
         throw new Error(`Template configuration not found for ${template}`);
       }
 
-      // Add minimum videos validation
-      const minVideos = 10; // All templates require minimum 10 videos
-      if (runwayVideos.length < minVideos) {
+      // Add minimum videos validation only for non-regeneration cases
+      if (!options.isRegeneration && runwayVideos.length < 10) {
         throw new Error(
-          `Template ${template} requires at least ${minVideos} videos. Got ${runwayVideos.length}`
+          `Template ${template} requires at least 10 videos. Got ${runwayVideos.length}`
         );
       }
 
@@ -1048,8 +1047,8 @@ export class ProductionPipeline {
       templates: templateKeys,
     });
 
-    // Add validation for minimum videos
-    if (runwayVideos.length < 10) {
+    // Add validation for minimum videos only for non-regeneration cases
+    if (!isRegeneration && runwayVideos.length < 10) {
       throw new Error(
         `At least 10 videos are required for template generation. Got ${runwayVideos.length}`
       );
@@ -1193,7 +1192,7 @@ export class ProductionPipeline {
                 coordinates,
                 cacheEnabled: !isRegeneration,
                 preGeneratedMapVideo: templateMapVideo,
-                isRegeneration,
+                isRegeneration: isRegeneration || false,
               }
             );
 
@@ -1442,7 +1441,7 @@ export class ProductionPipeline {
             data: {
               userId: originalJob.userId,
               listingId: originalJob.listingId,
-              status: "COMPLETED",
+              status: VideoGenerationStatus.COMPLETED,
               progress: 100,
               template: templateKey,
               outputFile: outputPath,
@@ -1474,7 +1473,7 @@ export class ProductionPipeline {
       await this.prisma.videoJob.update({
         where: { id: jobId },
         data: {
-          status: "COMPLETED",
+          status: VideoGenerationStatus.COMPLETED,
           progress: 100,
           outputFile: successfulTemplates[0],
           completedAt: new Date(),
@@ -1509,7 +1508,7 @@ export class ProductionPipeline {
 
       await this.updateJobStatus(
         jobId,
-        "FAILED",
+        VideoGenerationStatus.FAILED,
         0,
         error instanceof Error ? error.message : "Unknown error"
       );
@@ -1528,6 +1527,24 @@ export class ProductionPipeline {
   async regeneratePhotos(jobId: string, photoIds: string[]): Promise<void> {
     try {
       logger.info(`[${jobId}] Starting photo regeneration`, { photoIds });
+
+      // Check for concurrent regeneration
+      const existingJob = await this.prisma.videoJob.findFirst({
+        where: {
+          id: { not: jobId },
+          status: VideoGenerationStatus.PROCESSING,
+          metadata: {
+            path: ["regeneration", "regeneratedPhotoIds"],
+            array_contains: photoIds[0], // Check if any of the photos is being processed
+          },
+        },
+      });
+
+      if (existingJob) {
+        throw new Error(
+          `Some photos are already being regenerated in job ${existingJob.id}`
+        );
+      }
 
       // 1. Get ONLY the photos that need regeneration with their order
       const photosToRegenerate = await this.prisma.photo.findMany({
@@ -1549,58 +1566,116 @@ export class ProductionPipeline {
         throw new Error("No valid photos found for regeneration");
       }
 
+      if (photosToRegenerate.length !== photoIds.length) {
+        const foundIds = photosToRegenerate.map((p) => p.id);
+        const missingIds = photoIds.filter((id) => !foundIds.includes(id));
+        throw new Error(`Some photos were not found: ${missingIds.join(", ")}`);
+      }
+
       const listingId = photosToRegenerate[0].listingId;
 
-      // 2. Get existing photos that are NOT being regenerated
-      const existingPhotos = await this.prisma.photo.findMany({
+      // Verify all photos belong to the same listing
+      const differentListings = photosToRegenerate.filter(
+        (p) => p.listingId !== listingId
+      );
+      if (differentListings.length > 0) {
+        throw new Error(
+          `Photos must belong to the same listing. Found photos from different listings: ${differentListings
+            .map((p) => p.id)
+            .join(", ")}`
+        );
+      }
+
+      // 2. Get ALL photos for this listing, including those not being regenerated
+      const allListingPhotos = await this.prisma.photo.findMany({
         where: {
           listingId: listingId,
           processedFilePath: { not: null },
-          status: "COMPLETED",
-          id: { notIn: photoIds },
+          // Don't filter by status for regeneration to be more flexible
         },
         select: {
           id: true,
+          filePath: true,
           processedFilePath: true,
           status: true,
           order: true,
+          createdAt: true,
         },
+        orderBy: [{ order: "asc" }, { createdAt: "asc" }],
+      });
+
+      // Validate processed file paths only for non-regenerating photos
+      const invalidPhotos = allListingPhotos
+        .filter((p) => !photoIds.includes(p.id)) // Only check non-regenerating photos
+        .filter((p) => !p.processedFilePath?.startsWith("http"));
+      if (invalidPhotos.length > 0) {
+        throw new Error(
+          `Invalid processed file paths found for photos: ${invalidPhotos
+            .map((p) => p.id)
+            .join(", ")}`
+        );
+      }
+
+      // Store original status for rollback
+      const originalStatuses = await this.prisma.photo.findMany({
+        where: { id: { in: photoIds } },
+        select: { id: true, status: true },
       });
 
       // 3. Update status to processing for selected photos only
-      await this.prisma.photo.updateMany({
-        where: { id: { in: photoIds } },
-        data: { status: "PROCESSING", error: null },
-      });
+      try {
+        await this.prisma.photo.updateMany({
+          where: { id: { in: photoIds } },
+          data: { status: "processing", error: null },
+        });
+      } catch (error) {
+        logger.error(`[${jobId}] Failed to update photo statuses`, { error });
+        throw error;
+      }
+
+      // Normalize photo orders to ensure no gaps
+      const normalizedPhotos = [...allListingPhotos]
+        .sort((a, b) => {
+          if (a.order === null && b.order === null) return 0;
+          if (a.order === null) return 1;
+          if (b.order === null) return -1;
+          if (a.order === b.order) {
+            return a.createdAt.getTime() - b.createdAt.getTime();
+          }
+          return a.order - b.order;
+        })
+        .map((photo, index) => ({
+          ...photo,
+          order: index,
+        }));
 
       // 4. Create regeneration context with regeneration marker in file paths
       const regenerationContext: RegenerationContext = {
         photosToRegenerate: photosToRegenerate.map((p) => ({
           id: p.id,
-          // Add regeneration marker properly handling existing query parameters
-          processedFilePath: p.filePath.includes("?")
-            ? p.filePath + "&regenerate=true"
-            : p.filePath + "?regenerate=true",
-          order: p.order || 0,
+          processedFilePath: p.processedFilePath?.includes("?")
+            ? p.processedFilePath + "&regenerate=true"
+            : (p.processedFilePath || p.filePath) + "?regenerate=true",
+          order: normalizedPhotos.find((np) => np.id === p.id)?.order || 0,
         })),
-        existingPhotos: existingPhotos.map((p) => ({
-          id: p.id,
-          processedFilePath: p.processedFilePath!,
-          order: p.order || 0,
-        })),
+        existingPhotos: normalizedPhotos
+          .filter((p) => !photoIds.includes(p.id))
+          .map((p) => ({
+            id: p.id,
+            processedFilePath: p.processedFilePath!,
+            order: p.order,
+          })),
         regeneratedPhotoIds: photoIds,
-        totalPhotos: photosToRegenerate.length + existingPhotos.length,
+        totalPhotos: allListingPhotos.length,
       };
 
       logger.info(`[${jobId}] Created regeneration context`, {
-        toRegenerate: regenerationContext.photosToRegenerate.map((p) => ({
-          id: p.id,
-          path: p.processedFilePath,
-        })),
+        toRegenerate: regenerationContext.photosToRegenerate.length,
         existing: regenerationContext.existingPhotos.length,
+        total: regenerationContext.totalPhotos,
       });
 
-      // 5. Get job and listing details for coordinates
+      // Get job and listing details for coordinates
       const job = await this.prisma.videoJob.findUnique({
         where: { id: jobId },
         include: {
@@ -1612,7 +1687,7 @@ export class ProductionPipeline {
         throw new Error("Job or listing not found");
       }
 
-      // 6. Parse coordinates if available
+      // Parse coordinates if available
       let coordinates: { lat: number; lng: number } | undefined;
       if (job.listing.coordinates) {
         try {
@@ -1625,78 +1700,84 @@ export class ProductionPipeline {
             lat: Number(coordsData.lat),
             lng: Number(coordsData.lng),
           };
-          logger.info(`[${jobId}] Found coordinates for map:`, coordinates);
         } catch (err) {
-          logger.warn(`[${jobId}] Failed to parse coordinates`, {
-            error: err,
-          });
+          logger.warn(`[${jobId}] Failed to parse coordinates`, { error: err });
         }
       }
 
-      // Get the current template from the job metadata
       const jobMetadata = job.metadata as {
         defaultTemplate?: TemplateKey;
       } | null;
       const currentTemplate: TemplateKey =
         jobMetadata?.defaultTemplate || "storyteller";
 
-      // 7. Process all templates with regeneration context
-      // Pass ALL files to execute, but mark only the ones that need regeneration
+      // Prepare all files in correct order
       const allFiles = [
         ...regenerationContext.photosToRegenerate,
         ...regenerationContext.existingPhotos,
       ]
-        .sort((a, b) => (a.order || 0) - (b.order || 0))
+        .sort((a, b) => a.order - b.order)
         .map((p) => p.processedFilePath);
 
-      logger.info(`[${jobId}] Executing pipeline with files:`, {
-        totalFiles: allFiles.length,
-        regeneratingFiles: regenerationContext.photosToRegenerate.length,
-        existingFiles: regenerationContext.existingPhotos.length,
-        template: currentTemplate,
-        allTemplates: ALL_TEMPLATES,
-      });
+      let outputPath: string;
 
-      const outputPath = await this.execute({
-        jobId,
-        inputFiles: allFiles,
-        template: currentTemplate, // This is just the default template
-        coordinates,
-        _isRegeneration: true,
-        _regenerationContext: regenerationContext,
-        _skipRunway: false,
-      });
+      try {
+        outputPath = await this.execute({
+          jobId,
+          inputFiles: allFiles,
+          template: currentTemplate,
+          coordinates,
+          _isRegeneration: true,
+          _regenerationContext: regenerationContext,
+          _skipRunway: false,
+        });
 
-      // 8. Update job with results
-      await this.prisma.videoJob.update({
-        where: { id: jobId },
-        data: {
-          outputFile: outputPath,
-          status: VideoGenerationStatus.COMPLETED,
-          completedAt: new Date(),
-          error: null,
-          metadata: {
-            regeneration: {
-              timestamp: new Date().toISOString(),
-              regeneratedPhotoIds: photoIds,
-              totalPhotos: regenerationContext.totalPhotos,
-            },
-          } satisfies Prisma.InputJsonValue,
-        },
-      });
+        // 8. Update job with results
+        await this.prisma.videoJob.update({
+          where: { id: jobId },
+          data: {
+            outputFile: outputPath,
+            status: VideoGenerationStatus.COMPLETED,
+            completedAt: new Date(),
+            error: null,
+            metadata: {
+              regeneration: {
+                timestamp: new Date().toISOString(),
+                regeneratedPhotoIds: photoIds,
+                totalPhotos: regenerationContext.totalPhotos,
+                originalOrders: photosToRegenerate.map((p) => ({
+                  id: p.id,
+                  order: p.order,
+                })),
+              },
+            } satisfies Prisma.InputJsonValue,
+          },
+        });
 
-      // 9. Update regenerated photos status
-      await this.prisma.photo.updateMany({
-        where: { id: { in: photoIds } },
-        data: {
-          status: "COMPLETED",
-          error: null,
-        },
-      });
+        // 9. Update regenerated photos status
+        await this.prisma.photo.updateMany({
+          where: { id: { in: photoIds } },
+          data: {
+            status: "completed",
+            error: null,
+          },
+        });
+      } catch (error) {
+        // Rollback to original statuses if execution fails
+        await Promise.all(
+          originalStatuses.map(({ id, status }) =>
+            this.prisma.photo.update({
+              where: { id },
+              data: { status },
+            })
+          )
+        );
+        throw error;
+      }
 
       logger.info(`[${jobId}] Photo regeneration completed`, {
         photoIds,
-        outputPath,
+        outputPath: outputPath || "No output path generated",
         totalPhotos: regenerationContext.totalPhotos,
       });
     } catch (error) {
@@ -1704,7 +1785,7 @@ export class ProductionPipeline {
       await this.prisma.photo.updateMany({
         where: { id: { in: photoIds } },
         data: {
-          status: "FAILED",
+          status: "error",
           error: error instanceof Error ? error.message : "Unknown error",
         },
       });
