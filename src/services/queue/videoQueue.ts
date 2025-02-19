@@ -140,7 +140,9 @@ export class VideoQueueService {
     const pendingJobs = await this.prisma.videoJob.findMany({
       where: {
         listingId,
-        status: { in: ["PENDING", "PROCESSING"] },
+        status: {
+          in: [VideoGenerationStatus.PENDING, VideoGenerationStatus.PROCESSING],
+        },
       },
       orderBy: { createdAt: "asc" },
     });
@@ -291,7 +293,7 @@ export class VideoQueueService {
       await this.prisma.videoJob.update({
         where: { id: jobId },
         data: {
-          status: "PROCESSING",
+          status: VideoGenerationStatus.PROCESSING,
           progress: progress.progress,
           metadata: metadata as any, // Prisma will handle JSON serialization
         },
@@ -396,7 +398,7 @@ export class VideoQueueService {
       await this.prisma.videoJob.update({
         where: { id: job.id },
         data: {
-          status: "PROCESSING",
+          status: VideoGenerationStatus.PROCESSING,
           startedAt: new Date(),
         },
       });
@@ -464,7 +466,7 @@ export class VideoQueueService {
       await this.prisma.videoJob.update({
         where: { id: job.id },
         data: {
-          status: "COMPLETED",
+          status: VideoGenerationStatus.COMPLETED,
           progress: 100,
           outputFile: result,
           completedAt: new Date(),
@@ -486,7 +488,7 @@ export class VideoQueueService {
       await this.prisma.videoJob.update({
         where: { id: job.id },
         data: {
-          status: "FAILED",
+          status: VideoGenerationStatus.FAILED,
           error: error instanceof Error ? error.message : "Unknown error",
           completedAt: new Date(),
         },
