@@ -5,7 +5,6 @@
     "moduleResolution": "node", // You can also use 'classic' here
     "lib": ["ES2020"], // Include the necessary library features
     "outDir": "./build", // Output directory for compiled files
-    "rootDir": ".", // Root directory of the source files
     "strict": true, // Enable all strict type-checking options
     "esModuleInterop": true, // Enable interoperability between CommonJS and ES modules
     "allowSyntheticDefaultImports": true,
@@ -14,6 +13,6 @@
     "resolveJsonModule": true, // Allow importing JSON files
     "types": ["node", "puppeteer"] // Include type definitions for Node.js, Puppeteer, and Jest
   },
-  "include": ["src/**/*", "scripts/**/*"],
+  "include": ["src/**/*", "scripts/**/*", "prisma/**/*"],
   "exclude": ["node_modules", "build"]
 }
