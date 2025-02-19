@@ -35,11 +35,10 @@ enum SubscriptionStatus {
 }
 
 enum VideoGenerationStatus {
-  QUEUED
+  PENDING
   PROCESSING
   COMPLETED
   FAILED
-  CANCELLED
 }
 
 enum PlanType {
@@ -181,6 +180,7 @@ model Asset {
   type            AssetType
   subscriptionTier String  @map("subscription_tier") @db.Uuid
   isActive        Boolean  @default(true) @map("is_active")
+  isDefault       Boolean  @default(false) @map("is_default")
   createdAt       DateTime @default(now()) @map("created_at")
   updatedAt       DateTime @updatedAt @map("updated_at")
 
@@ -250,7 +250,7 @@ model VideoJob {
   id          String   @id @default(uuid()) @db.Uuid
   userId      String   @map("user_id")
   listingId   String   @map("listing_id") @db.Uuid
-  status      VideoGenerationStatus @default(QUEUED)
+  status      VideoGenerationStatus @default(PENDING)
   progress    Float    @default(0) @map("progress")
   template    String?
   inputFiles  Json?    @map("input_files")
@@ -387,7 +387,7 @@ model VideoGenerationJob {
   agencyId    String?
   inputFiles  Json                 // Array of file paths
   template    String
-  status      VideoGenerationStatus @default(QUEUED)
+  status      VideoGenerationStatus @default(PENDING)
   position    Int
   priority    Int                  @default(1)
   error       String?

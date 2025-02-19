@@ -19,6 +19,23 @@ interface RegeneratePhotoRequest extends Request {
   };
 }
 
+interface Photo {
+  id: string;
+  listingId: string;
+  listing?: Listing;
+  processedFilePath?: string | null;
+}
+
+interface Listing {
+  id: string;
+  photos?: Photo[];
+}
+
+interface VideoJob {
+  id: string;
+  listingId: string;
+}
+
 // Regenerate photo and its associated video
 router.post(
   "/:photoId/regenerate",
@@ -188,7 +205,9 @@ router.post(
       }
 
       // Group photos by listing
-      const photosByListing = photos.reduce((acc, photo) => {
+      const photosByListing = photos.reduce<
+        Record<string, { listing: Listing; photos: Photo[] }>
+      >((acc, photo) => {
         if (!photo.listing) return acc;
         if (!acc[photo.listingId]) {
           acc[photo.listingId] = {
@@ -198,12 +217,15 @@ router.post(
         }
         acc[photo.listingId].photos.push(photo);
         return acc;
-      }, {} as Record<string, { listing: any; photos: typeof photos }>);
+      }, {});
 
       // Create jobs for each listing and use regeneratePhotos
       const jobs = await Promise.all(
         Object.entries(photosByListing).map(
-          async ([listingId, { listing, photos }]) => {
+          async ([listingId, { listing, photos }]: [
+            string,
+            { listing: Listing; photos: Photo[] }
+          ]) => {
             // Create a new job for regeneration
             const job = await prisma.videoJob.create({
               data: {
@@ -217,14 +239,14 @@ router.post(
             logger.info("[PHOTOS_BATCH_REGENERATE] Created video job", {
               jobId: job.id,
               listingId,
-              photosToRegenerate: photos.map((p) => p.id),
+              photosToRegenerate: photos.map((p: Photo) => p.id),
             });
 
             // Use regeneratePhotos instead of execute
             productionPipeline
               .regeneratePhotos(
                 job.id,
-                photos.map((p) => p.id)
+                photos.map((p: Photo) => p.id)
               )
               .catch((error) => {
                 logger.error(
@@ -244,7 +266,7 @@ router.post(
       );
 
       logger.info("[PHOTOS_BATCH_REGENERATE] Sending success response", {
-        jobIds: jobs.map((job) => job.id),
+        jobIds: jobs.map((job: VideoJob) => job.id),
         inaccessiblePhotoIds,
       });
 
@@ -252,7 +274,7 @@ router.post(
         success: true,
         message: "Photo regeneration started",
         data: {
-          jobs: jobs.map((job) => ({
+          jobs: jobs.map((job: VideoJob) => ({
             id: job.id,
             listingId: job.listingId,
           })),

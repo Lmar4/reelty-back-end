@@ -793,6 +793,37 @@ export class ProductionPipeline {
         throw new Error(`Template configuration not found for ${template}`);
       }
 
+      // Add minimum videos validation
+      const minVideos = 10; // All templates require minimum 10 videos
+      if (runwayVideos.length < minVideos) {
+        throw new Error(
+          `Template ${template} requires at least ${minVideos} videos. Got ${runwayVideos.length}`
+        );
+      }
+
+      // Modify sequence adaptation to respect available videos
+      const sequence = templateConfig.sequence.filter((index) => {
+        // Keep string indices (like 'map') and numbers within available range
+        return typeof index === "string" || index < runwayVideos.length;
+      });
+
+      logger.info(`[${options.jobId}] Template sequence`, {
+        template,
+        originalSequence: templateConfig.sequence,
+        filteredSequence: sequence,
+        availableVideos: runwayVideos.length,
+      });
+
+      // Validate we have enough indices after filtering
+      if (sequence.length < 5) {
+        // Minimum sequence length for a coherent video
+        throw new Error(
+          `Template ${template} requires more valid sequence indices. ` +
+            `After filtering for ${runwayVideos.length} available videos, ` +
+            `only ${sequence.length} valid indices remain.`
+        );
+      }
+
       // Validate that all input videos exist
       await this.updateJobProgress(options.jobId, {
         stage: "template",
@@ -1016,6 +1047,13 @@ export class ProductionPipeline {
       isRegeneration,
       templates: templateKeys,
     });
+
+    // Add validation for minimum videos
+    if (runwayVideos.length < 10) {
+      throw new Error(
+        `At least 10 videos are required for template generation. Got ${runwayVideos.length}`
+      );
+    }
 
     // Generate map video once if needed by any template
     let templateMapVideo = preGeneratedMapVideo;
@@ -1883,17 +1921,21 @@ export class ProductionPipeline {
   }
 
   private async cleanupClipFiles(clipPaths: string[]) {
-    // Add logging and error handling
     try {
       const uniqueClips = [...new Set(clipPaths)];
       logger.info(`Cleaning up ${uniqueClips.length} unique clip files`);
 
       for (const clipPath of uniqueClips) {
         try {
+          // Check if file exists before attempting deletion
+          await fs.access(clipPath);
           await fs.unlink(clipPath);
-        } catch (error) {
-          // Log but don't throw - we want to try cleaning up all files
-          logger.warn(`Failed to delete clip file: ${clipPath}`, { error });
+          logger.debug(`Successfully cleaned up clip: ${clipPath}`);
+        } catch (error: any) {
+          // Only warn if error is not "file not found"
+          if (error.code !== "ENOENT") {
+            logger.warn(`Failed to cleanup clip ${clipPath}:`, { error });
+          }
         }
       }
     } catch (error) {
