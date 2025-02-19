@@ -24,6 +24,7 @@ logs/
 tmp/
 temp/
 *.tmp
+*.temp
 
 # IDE and editor specific files
 .vscode/
@@ -46,6 +47,7 @@ coverage/
 
 # TypeScript cache
 *.tsbuildinfo
+.tscache/
 
 # Miscellaneous
 *.tgz
@@ -66,3 +68,47 @@ default_output
 /output
 /temp
 /assets
+
+# Build artifacts
+/dist
+/build
+/.build
+
+# Dependencies
+/node_modules
+/.pnpm-store
+
+# Environment files
+.env.*
+!.env.example
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated Prisma files
+/prisma/generated/
+/prisma/client/
+
+# AWS credentials
+.aws/
+
+# Debug files
+*.debug
+debug/
+
+# Test coverage
+/coverage
+
+# Sharp cache
+.sharp.cache/
+
+# Puppeteer cache
+.cache/puppeteer/
+
+# Output files
+default_output/
+default_output/**/*.mp4
+*.mp4
