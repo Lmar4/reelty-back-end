@@ -195,11 +195,17 @@ interface TemplateOutput {
 }
 
 export class ProductionPipeline {
-  private prisma: PrismaClient;
-  private resourceManager: ResourceManager;
-  private s3Client: S3Client;
+  private readonly MEMORY_WARNING_THRESHOLD = 0.8;
   private readonly MAX_RETRIES = 3;
-  private readonly MEMORY_WARNING_THRESHOLD = 0.8; // 80% heap usage
+  private readonly BATCH_SIZE = 3; // Number of templates to process in parallel
+  private readonly TEMP_DIRS = {
+    MAP_CACHE: "temp/map-cache",
+    OUTPUT: "temp/output",
+    RUNWAY: "temp/runway",
+  };
+  private readonly PROGRESS_BATCH_SIZE = 5;
+
+  private s3Client: S3Client;
   private batchedUpdates: BatchProgressUpdate = {
     stepsCompleted: [],
     overallProgress: 0,
@@ -207,11 +213,12 @@ export class ProductionPipeline {
   };
   private runwayCache: Map<string, RunwayProcessingResult> = new Map();
   private progressUpdateQueue: Map<string, JobProgress[]> = new Map();
-  private readonly PROGRESS_BATCH_SIZE = 5;
 
-  constructor() {
-    this.prisma = new PrismaClient();
-    this.resourceManager = new ResourceManager();
+  constructor(
+    private readonly prisma: PrismaClient = new PrismaClient(),
+    private readonly resourceManager = new ResourceManager()
+  ) {
+    this.initializeTempDirectories();
 
     // Check for required AWS environment variables
     const region = process.env.AWS_REGION;
@@ -231,6 +238,29 @@ export class ProductionPipeline {
         secretAccessKey,
       },
     });
+  }
+
+  private async initializeTempDirectories() {
+    try {
+      // Ensure all temp directories exist
+      await Promise.all(
+        Object.values(this.TEMP_DIRS).map(async (dir) => {
+          const fullPath = path.join(process.cwd(), dir);
+          await fs.mkdir(fullPath, { recursive: true });
+          logger.info(`Initialized temp directory: ${fullPath}`);
+        })
+      );
+    } catch (error) {
+      logger.error("Failed to initialize temp directories:", error);
+      throw error;
+    }
+  }
+
+  private getTempPath(
+    type: keyof typeof this.TEMP_DIRS,
+    filename: string
+  ): string {
+    return path.join(process.cwd(), this.TEMP_DIRS[type], filename);
   }
 
   private monitorMemoryUsage(jobId: string): void {
@@ -757,6 +787,12 @@ export class ProductionPipeline {
       // Validate template requirements
       this.validateTemplateRequirements(template, options.coordinates);
 
+      // Get template configuration
+      const templateConfig = reelTemplates[template];
+      if (!templateConfig) {
+        throw new Error(`Template configuration not found for ${template}`);
+      }
+
       // Validate that all input videos exist
       await this.updateJobProgress(options.jobId, {
         stage: "template",
@@ -784,13 +820,24 @@ export class ProductionPipeline {
         throw new Error("Some input videos are missing");
       }
 
-      // Set hasMapVideo based on preGeneratedMapVideo
-      const hasMapVideo = !!options.preGeneratedMapVideo;
+      // Check if this template requires map video
+      const requiresMap = templateConfig.sequence.includes("map");
+      const hasMapVideo = requiresMap && !!options.preGeneratedMapVideo;
+
+      // If template requires map but we don't have it, fail early
+      if (requiresMap && !hasMapVideo) {
+        throw new Error(
+          `Template ${template} requires map video but none was provided`
+        );
+      }
+
       logger.info(`[${options.jobId}] Template analysis`, {
         template,
         hasMapVideo,
+        requiresMap,
         availableVideos: runwayVideos.length,
         isRegeneration: options.isRegeneration,
+        musicConfig: templateConfig.music,
       });
 
       // Determine output directory based on environment variable
@@ -814,25 +861,31 @@ export class ProductionPipeline {
       });
 
       const clips = await this.withRetry(async () => {
-        const inputVideos = options.preGeneratedMapVideo
-          ? [...runwayVideos, options.preGeneratedMapVideo]
-          : runwayVideos;
+        // Only include map video if the template requires it
+        const inputVideos =
+          requiresMap && options.preGeneratedMapVideo
+            ? [...runwayVideos, options.preGeneratedMapVideo]
+            : runwayVideos;
 
         logger.info(`Creating template with inputs:`, {
           template,
           inputVideoCount: inputVideos.length,
-          hasMapVideo: !!options.preGeneratedMapVideo,
+          hasMapVideo: requiresMap && !!options.preGeneratedMapVideo,
+          musicConfig: templateConfig.music,
         });
 
         const result = await videoTemplateService.createTemplate(
           template,
           inputVideos,
-          options.preGeneratedMapVideo || undefined
+          requiresMap && options.preGeneratedMapVideo
+            ? options.preGeneratedMapVideo
+            : undefined
         );
 
         logger.info(`Template creation result:`, {
           clipCount: result?.length || 0,
           clips: result?.map((c) => c.path),
+          musicConfig: templateConfig.music,
         });
 
         return result;
@@ -846,7 +899,8 @@ export class ProductionPipeline {
       await videoProcessingService.stitchVideos(
         clips.map((clip) => clip.path),
         clips.map((clip) => clip.duration),
-        outputPath
+        outputPath,
+        templateConfig // Pass the full template configuration for music
       );
 
       // Upload the stitched video to S3
@@ -971,13 +1025,68 @@ export class ProductionPipeline {
       );
       if (needsMap) {
         logger.info(`[${jobId}] Generating map video for templates`);
-        templateMapVideo = await this.generateMapVideoForTemplate(
-          coordinates,
-          jobId
-        );
-        logger.info(`[${jobId}] Map video generated successfully`, {
-          mapVideoPath: templateMapVideo,
-        });
+
+        // Try to generate map video with retries
+        let retryCount = 0;
+        const maxRetries = 3;
+        let lastError: Error | null = null;
+
+        while (retryCount < maxRetries) {
+          try {
+            templateMapVideo = await this.generateMapVideoForTemplate(
+              coordinates,
+              jobId
+            );
+
+            if (templateMapVideo) {
+              logger.info(`[${jobId}] Map video generated successfully`, {
+                mapVideoPath: templateMapVideo,
+                attempt: retryCount + 1,
+              });
+              break;
+            }
+
+            throw new Error("Map video generation returned null");
+          } catch (error) {
+            lastError =
+              error instanceof Error ? error : new Error(String(error));
+            retryCount++;
+
+            if (retryCount < maxRetries) {
+              logger.warn(
+                `[${jobId}] Map video generation failed, retrying...`,
+                {
+                  attempt: retryCount,
+                  maxRetries,
+                  error: lastError.message,
+                }
+              );
+              // Wait before retrying (exponential backoff)
+              await new Promise((resolve) =>
+                setTimeout(resolve, Math.pow(2, retryCount) * 1000)
+              );
+            }
+          }
+        }
+
+        if (!templateMapVideo) {
+          logger.error(
+            `[${jobId}] Map video generation failed after ${maxRetries} attempts`,
+            {
+              error: lastError,
+            }
+          );
+          // Continue without map video, but log the templates that will be affected
+          const affectedTemplates = templateKeys.filter((key) =>
+            reelTemplates[key].sequence.includes("map")
+          );
+          logger.warn(
+            `[${jobId}] Proceeding without map video, affected templates:`,
+            {
+              templates: affectedTemplates,
+            }
+          );
+        }
       }
     }
 
@@ -992,99 +1101,129 @@ export class ProductionPipeline {
       return [];
     }
 
-    logger.info(`[${jobId}] Processing templates`, {
-      availableTemplates,
-      totalTemplates: availableTemplates.length,
+    // Filter out templates that require map video if it's not available
+    const finalTemplates = !templateMapVideo
+      ? availableTemplates.filter(
+          (key) => !reelTemplates[key].sequence.includes("map")
+        )
+      : availableTemplates;
+
+    if (finalTemplates.length === 0) {
+      throw new Error(
+        "No templates available after filtering map-dependent templates"
+      );
+    }
+
+    logger.info(`[${jobId}] Processing templates in batches`, {
+      availableTemplates: finalTemplates,
+      totalTemplates: finalTemplates.length,
+      batchSize: this.BATCH_SIZE,
+      totalBatches: Math.ceil(finalTemplates.length / this.BATCH_SIZE),
     });
 
-    // Process each template and get results
-    const templateResults = await Promise.all(
-      availableTemplates.map(async (templateKey, index) => {
-        try {
-          logger.info(
-            `[${jobId}] Starting template ${templateKey} (${index + 1}/${
-              availableTemplates.length
-            })`
-          );
+    const allResults: (string | null)[] = [];
 
-          const result = await this.processTemplate(templateKey, runwayVideos, {
-            jobId,
-            coordinates,
-            cacheEnabled: !isRegeneration,
-            preGeneratedMapVideo: templateMapVideo,
-            isRegeneration,
-          });
+    // Process templates in batches
+    for (let i = 0; i < finalTemplates.length; i += this.BATCH_SIZE) {
+      const batch = finalTemplates.slice(i, i + this.BATCH_SIZE);
+      const batchNumber = Math.floor(i / this.BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(finalTemplates.length / this.BATCH_SIZE);
 
-          logger.info(
-            `[${jobId}] Template ${templateKey} processing completed`,
-            {
-              status: result.status,
-              processingTime: result.processingTime,
-              hasOutput: !!result.outputPath,
-            }
-          );
-
-          if (result.status === "SUCCESS" && result.outputPath) {
-            return result.outputPath;
-          }
-
-          logger.error(`[${jobId}] Template ${templateKey} failed`, {
-            error: result.error,
-          });
-          return null;
-        } catch (error) {
-          logger.error(
-            `[${jobId}] Template ${templateKey} processing failed with error:`,
-            {
-              error: error instanceof Error ? error.message : "Unknown error",
-              stack: error instanceof Error ? error.stack : undefined,
-            }
-          );
-          return null;
+      logger.info(
+        `[${jobId}] Processing batch ${batchNumber}/${totalBatches}`,
+        {
+          batchTemplates: batch,
+          batchSize: batch.length,
         }
-      })
-    );
+      );
+
+      // Process each template in the current batch in parallel
+      const batchResults = await Promise.all(
+        batch.map(async (templateKey, batchIndex) => {
+          try {
+            logger.info(
+              `[${jobId}] Starting template ${templateKey} (${batchIndex + 1}/${
+                batch.length
+              }) in batch ${batchNumber}/${totalBatches}`
+            );
+
+            const result = await this.processTemplate(
+              templateKey,
+              runwayVideos,
+              {
+                jobId,
+                coordinates,
+                cacheEnabled: !isRegeneration,
+                preGeneratedMapVideo: templateMapVideo,
+                isRegeneration,
+              }
+            );
+
+            logger.info(
+              `[${jobId}] Template ${templateKey} processing completed in batch ${batchNumber}`,
+              {
+                status: result.status,
+                processingTime: result.processingTime,
+                hasOutput: !!result.outputPath,
+              }
+            );
+
+            if (result.status === "SUCCESS" && result.outputPath) {
+              return result.outputPath;
+            }
+
+            logger.error(
+              `[${jobId}] Template ${templateKey} failed in batch ${batchNumber}`,
+              {
+                error: result.error,
+              }
+            );
+            return null;
+          } catch (error) {
+            logger.error(
+              `[${jobId}] Template ${templateKey} processing failed with error in batch ${batchNumber}:`,
+              {
+                error: error instanceof Error ? error.message : "Unknown error",
+                stack: error instanceof Error ? error.stack : undefined,
+              }
+            );
+            return null;
+          }
+        })
+      );
+
+      allResults.push(...batchResults);
+
+      // Cleanup after each batch
+      if (global.gc) {
+        global.gc();
+      }
+
+      // Add small delay between batches if not the last batch
+      if (batchNumber < totalBatches) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    // Move cleanup here - after all templates are processed
+    logger.info(`[${jobId}] Cleaning up input video files`);
+    await this.cleanupClipFiles(runwayVideos);
 
     // Filter out null values and empty strings
-    const successfulTemplates = templateResults.filter(
+    const successfulTemplates = allResults.filter(
       (path): path is string => typeof path === "string" && path.length > 0
     );
 
-    logger.info(`[${jobId}] Template processing completed`, {
-      totalTemplates: availableTemplates.length,
+    logger.info(`[${jobId}] All template batches processing completed`, {
+      totalTemplates: finalTemplates.length,
       successfulTemplates: successfulTemplates.length,
-      failedTemplates: availableTemplates.length - successfulTemplates.length,
+      failedTemplates: finalTemplates.length - successfulTemplates.length,
       successfulPaths: successfulTemplates,
     });
 
     if (successfulTemplates.length === 0) {
       throw new Error("No templates were successfully processed");
     }
-
-    // Update listing with template URLs
-    const listing = await this.getJobListing(jobId);
-    await this.prisma.listing.update({
-      where: { id: listing.id },
-      data: {
-        metadata: {
-          templates: [
-            ...(((listing.metadata as any)?.templates || []).filter(
-              (t: any) => !successfulTemplates.includes(t.url)
-            ) || []),
-            ...successfulTemplates.map((url) => ({
-              key: templateKeys[templateResults.indexOf(url)],
-              url,
-              createdAt: new Date().toISOString(),
-            })),
-          ],
-        } satisfies Prisma.InputJsonValue,
-      },
-    });
-
-    logger.info(`[${jobId}] Updated listing with template URLs`, {
-      listingId: listing.id,
-      templateCount: successfulTemplates.length,
-    });
 
     return successfulTemplates;
   }
@@ -1148,16 +1287,64 @@ export class ProductionPipeline {
           totalFiles: inputFiles.length,
         });
 
-        const processedResults = await this.processRunwayVideos(
-          inputFiles,
-          jobId,
-          _isRegeneration,
-          _regenerationContext,
-          coordinates
-        );
+        // If this is a regeneration, we need to process only the new photos
+        // but keep track of all videos for template generation
+        if (_isRegeneration && _regenerationContext) {
+          logger.info(`[${jobId}] Processing regeneration context`, {
+            toRegenerate: _regenerationContext.photosToRegenerate.length,
+            existing: _regenerationContext.existingPhotos.length,
+            total: _regenerationContext.totalPhotos,
+          });
 
-        runwayVideos = processedResults.runwayVideos;
-        mapVideo = processedResults.mapVideo;
+          // Process only the photos that need regeneration
+          const processedResults = await this.processRunwayVideos(
+            _regenerationContext.photosToRegenerate.map(
+              (p) => p.processedFilePath
+            ),
+            jobId,
+            _isRegeneration,
+            _regenerationContext,
+            coordinates
+          );
+
+          // Combine the new processed videos with existing ones in the correct order
+          const allVideos = new Array(_regenerationContext.totalPhotos);
+
+          // First, place all existing photos
+          _regenerationContext.existingPhotos.forEach((photo) => {
+            allVideos[photo.order] = photo.processedFilePath;
+          });
+
+          // Then, place all regenerated photos
+          _regenerationContext.photosToRegenerate.forEach((photo, index) => {
+            allVideos[photo.order] = processedResults.runwayVideos[index];
+          });
+
+          // Remove any undefined entries (shouldn't happen, but just in case)
+          runwayVideos = allVideos.filter(Boolean);
+          mapVideo = processedResults.mapVideo;
+
+          logger.info(
+            `[${jobId}] Combined all videos for template processing`,
+            {
+              totalVideos: runwayVideos.length,
+              regeneratedCount: processedResults.runwayVideos.length,
+              existingCount: _regenerationContext.existingPhotos.length,
+              hasMapVideo: !!mapVideo,
+            }
+          );
+        } else {
+          const processedResults = await this.processRunwayVideos(
+            inputFiles,
+            jobId,
+            _isRegeneration,
+            _regenerationContext,
+            coordinates
+          );
+
+          runwayVideos = processedResults.runwayVideos;
+          mapVideo = processedResults.mapVideo;
+        }
       }
 
       await this.updateJobProgress(jobId, {
@@ -1166,7 +1353,6 @@ export class ProductionPipeline {
         message: "Processing templates",
       });
 
-      // ALWAYS run all templates, regardless of _isRegeneration
       const availableTemplates = await this.getAvailableTemplates(
         jobId,
         ALL_TEMPLATES
@@ -1196,12 +1382,64 @@ export class ProductionPipeline {
         throw new Error("No templates were successfully processed");
       }
 
+      // Get the original job to copy its data
+      const originalJob = await this.prisma.videoJob.findUnique({
+        where: { id: jobId },
+        select: {
+          userId: true,
+          listingId: true,
+        },
+      });
+
+      if (!originalJob) {
+        throw new Error("Original job not found");
+      }
+
+      // Create a new job for each successful template
+      const jobs = await Promise.all(
+        successfulTemplates.map(async (outputPath, index) => {
+          const templateKey = availableTemplates[index];
+
+          return this.prisma.videoJob.create({
+            data: {
+              userId: originalJob.userId,
+              listingId: originalJob.listingId,
+              status: "COMPLETED",
+              progress: 100,
+              template: templateKey,
+              outputFile: outputPath,
+              inputFiles: runwayVideos,
+              completedAt: new Date(),
+              metadata: {
+                template: templateKey,
+                processedAt: new Date().toISOString(),
+                regeneration: _isRegeneration
+                  ? {
+                      timestamp: new Date().toISOString(),
+                      regeneratedPhotoIds:
+                        _regenerationContext?.regeneratedPhotoIds || [],
+                      totalPhotos: _regenerationContext?.totalPhotos || 0,
+                    }
+                  : undefined,
+              } satisfies Prisma.InputJsonValue,
+            },
+          });
+        })
+      );
+
+      logger.info(`[${jobId}] Created ${jobs.length} video jobs`, {
+        templates: jobs.map((job) => job.template),
+        outputFiles: jobs.map((job) => job.outputFile),
+      });
+
+      // Update the original job to mark it as completed
       await this.prisma.videoJob.update({
         where: { id: jobId },
         data: {
           status: "COMPLETED",
           progress: 100,
           outputFile: successfulTemplates[0],
+          completedAt: new Date(),
           metadata: {
             templates: templateResults.map((path, index) => ({
               key: availableTemplates[index],
@@ -1484,8 +1722,24 @@ export class ProductionPipeline {
       });
 
       if (cached) {
-        logger.info(`[${jobId}] Using cached map video: ${cached.path}`);
-        return cached.path;
+        // Verify the file actually exists on disk
+        try {
+          await fs.access(cached.path);
+          logger.info(`[${jobId}] Using cached map video: ${cached.path}`);
+          return cached.path;
+        } catch (error) {
+          logger.warn(
+            `[${jobId}] Cached map video file not found on disk, removing from cache`,
+            {
+              path: cached.path,
+              error,
+            }
+          );
+          // Remove the invalid cache entry
+          await this.prisma.processedAsset.delete({
+            where: { id: cached.id },
+          });
+        }
       } else {
         logger.warn(
           `[${jobId}] No cached map video found, generating a new one.`
@@ -1500,6 +1754,17 @@ export class ProductionPipeline {
 
       if (!mapVideo) {
         throw new Error("Map video generation failed");
+      }
+
+      // Verify the newly generated file exists
+      try {
+        await fs.access(mapVideo);
+      } catch (error) {
+        logger.error(`[${jobId}] Generated map video file not found on disk`, {
+          path: mapVideo,
+          error,
+        });
+        throw new Error("Generated map video file not found");
       }
 
       await this.resourceManager.trackResource(mapVideo);
@@ -1615,5 +1880,25 @@ export class ProductionPipeline {
     }
 
     return job.listing;
+  }
+
+  private async cleanupClipFiles(clipPaths: string[]) {
+    // Add logging and error handling
+    try {
+      const uniqueClips = [...new Set(clipPaths)];
+      logger.info(`Cleaning up ${uniqueClips.length} unique clip files`);
+
+      for (const clipPath of uniqueClips) {
+        try {
+          await fs.unlink(clipPath);
+        } catch (error) {
+          // Log but don't throw - we want to try cleaning up all files
+          logger.warn(`Failed to delete clip file: ${clipPath}`, { error });
+        }
+      }
+    } catch (error) {
+      logger.error("Error during clip cleanup", { error });
+      // Don't throw - cleanup failure shouldn't fail the whole process
+    }
   }
 }

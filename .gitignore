@@ -62,3 +62,7 @@ coverage/
 .cursor/*
 
 default_output
+
+/output
+/temp
+/assets

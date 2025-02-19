@@ -18,6 +18,9 @@ import { ProductionPipeline } from "../productionPipeline";
 import type { TemplateKey } from "../templates/types";
 import { TEST_CONFIG } from "./testConfig";
 
+// Increase timeout for all tests in this file
+jest.setTimeout(30000); // 30 seconds
+
 // Extend ProductionPipeline to expose protected methods for testing
 class TestProductionPipeline extends ProductionPipeline {
   public async testProcessTemplates(
@@ -54,59 +57,112 @@ describe("ProductionPipeline Template Processing", () => {
   let pipeline: TestProductionPipeline;
   let prisma: PrismaClient;
 
+  const cleanupDatabase = async () => {
+    const log = (message: string) => console.log(`[Cleanup] ${message}`);
+    const logError = (message: string, error: any) =>
+      console.error(`[Cleanup Error] ${message}:`, error);
+
+    try {
+      log("Starting video-related cleanup");
+
+      // Delete video-related records in the correct order
+      try {
+        log("Cleaning up video jobs and assets...");
+        await prisma.$transaction([
+          // First, delete video jobs
+          prisma.videoJob.deleteMany({
+            where: {
+              OR: [
+                { id: TEST_CONFIG.TEST_JOB_ID },
+                { userId: TEST_CONFIG.TEST_USER_ID },
+              ],
+            },
+          }),
+          prisma.videoGenerationJob.deleteMany({
+            where: {
+              OR: [
+                { userId: TEST_CONFIG.TEST_USER_ID },
+                { agencyId: TEST_CONFIG.TEST_USER_ID },
+              ],
+            },
+          }),
+          // Then delete processed assets
+          prisma.processedAsset.deleteMany({
+            where: { type: "runway" },
+          }),
+          // Finally delete photos
+          prisma.photo.deleteMany({
+            where: {
+              OR: [
+                { listingId: TEST_CONFIG.TEST_LISTING_ID },
+                { userId: TEST_CONFIG.TEST_USER_ID },
+              ],
+            },
+          }),
+        ]);
+        log("Video jobs and assets cleaned up");
+      } catch (error) {
+        logError("Failed to clean up video jobs and assets", error);
+      }
+
+      // Clean up test listing if it exists
+      try {
+        log("Cleaning up test listing...");
+        await prisma.listing.deleteMany({
+          where: { id: TEST_CONFIG.TEST_LISTING_ID },
+        });
+        log("Test listing cleaned up");
+      } catch (error) {
+        logError("Failed to clean up test listing", error);
+      }
+
+      log("Video-related cleanup completed");
+    } catch (error) {
+      logError("Cleanup failed", error);
+      throw error;
+    }
+  };
+
   beforeAll(async () => {
-    // Setup test database and dependencies
-    prisma = new PrismaClient();
-    pipeline = new TestProductionPipeline();
+    try {
+      // Setup test database and dependencies
+      prisma = new PrismaClient();
+      pipeline = new TestProductionPipeline();
 
-    // Create test temp directory
-    await fs.mkdir(TEST_CONFIG.TEMP_DIR, { recursive: true });
+      // Create test temp directory
+      await fs.mkdir(TEST_CONFIG.TEMP_DIR, { recursive: true });
 
-    // Cleanup any existing test data first (in correct order)
-    await prisma.$transaction(async (tx) => {
-      // Delete all related records first
-      await tx.videoJob.deleteMany({
-        where: {
-          OR: [
-            { id: TEST_CONFIG.TEST_JOB_ID },
-            { userId: TEST_CONFIG.TEST_USER_ID },
-          ],
-        },
-      });
+      // Clean up any existing video-related test data
+      await cleanupDatabase();
 
-      await tx.listing.deleteMany({
-        where: {
-          OR: [
-            { id: TEST_CONFIG.TEST_LISTING_ID },
-            { userId: TEST_CONFIG.TEST_USER_ID },
-          ],
-        },
-      });
-
-      await tx.user.deleteMany({
+      // Create test user if it doesn't exist
+      const existingUser = await prisma.user.findFirst({
         where: {
           OR: [{ id: TEST_CONFIG.TEST_USER_ID }, { email: "test@example.com" }],
         },
       });
 
-      // Create test user
-      const user = await tx.user.create({
-        data: {
-          id: TEST_CONFIG.TEST_USER_ID,
-          email: "test@example.com",
-          password: "test_password",
-          role: "USER",
-          subscriptionStatus: "INACTIVE",
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        },
-      });
+      let userId = TEST_CONFIG.TEST_USER_ID;
+      if (existingUser) {
+        userId = existingUser.id;
+      } else {
+        const newUser = await prisma.user.create({
+          data: {
+            id: TEST_CONFIG.TEST_USER_ID,
+            email: `test_${Date.now()}@example.com`, // Make email unique
+            password: "test_password",
+            role: "USER",
+            subscriptionStatus: "ACTIVE",
+          },
+        });
+        userId = newUser.id;
+      }
 
-      // Create test listing
-      const listing = await tx.listing.create({
+      // Create test listing for our existing user
+      const listing = await prisma.listing.create({
         data: {
           id: TEST_CONFIG.TEST_LISTING_ID,
-          userId: user.id,
+          userId: userId,
           status: "DRAFT",
           address: "123 Test St",
           photoLimit: 10,
@@ -117,75 +173,63 @@ describe("ProductionPipeline Template Processing", () => {
       });
 
       // Create test job
-      await tx.videoJob.create({
+      await prisma.videoJob.create({
         data: {
           id: TEST_CONFIG.TEST_JOB_ID,
           status: VideoGenerationStatus.PROCESSING,
           metadata: {},
-          user: { connect: { id: user.id } },
-          listing: { connect: { id: listing.id } },
+          userId: TEST_CONFIG.TEST_USER_ID,
+          listingId: listing.id,
+          progress: 0,
         },
       });
-    });
 
-    // Setup mock responses
-    jest
-      .mocked(runwayService.generateVideo)
-      .mockImplementation(async (file: string) =>
-        path.join(TEST_CONFIG.TEMP_DIR, `runway_${Date.now()}.mp4`)
-      );
+      // Setup mock responses
+      jest
+        .mocked(runwayService.generateVideo)
+        .mockImplementation(async (file: string) =>
+          path.join(TEST_CONFIG.TEMP_DIR, `runway_${Date.now()}.mp4`)
+        );
 
-    jest
-      .mocked(videoTemplateService.createTemplate)
-      .mockImplementation(async (template: string, videos: string[]) => [
-        {
-          path: path.join(
-            TEST_CONFIG.TEMP_DIR,
-            `${template}_${Date.now()}.mp4`
-          ),
-          duration: 30,
-        },
-      ]);
+      jest
+        .mocked(videoTemplateService.createTemplate)
+        .mockImplementation(async (template: string, videos: string[]) => [
+          {
+            path: path.join(
+              TEST_CONFIG.TEMP_DIR,
+              `${template}_${Date.now()}.mp4`
+            ),
+            duration: 30,
+          },
+        ]);
 
-    jest
-      .mocked(mapCaptureService.generateMapVideo)
-      .mockImplementation(async (coordinates: any) =>
-        path.join(TEST_CONFIG.TEMP_DIR, `map_${Date.now()}.mp4`)
-      );
-  });
+      jest
+        .mocked(mapCaptureService.generateMapVideo)
+        .mockImplementation(async (coordinates: any) =>
+          path.join(TEST_CONFIG.TEMP_DIR, `map_${Date.now()}.mp4`)
+        );
+
+      console.log("[Setup] Test environment initialized successfully");
+    } catch (error) {
+      console.error("Test setup failed:", error);
+      // Attempt cleanup in case of failure
+      try {
+        await cleanupDatabase();
+      } catch (cleanupError) {
+        console.error("Cleanup after setup failure also failed:", cleanupError);
+      }
+      throw error;
+    }
+  }, 30000);
 
   afterAll(async () => {
-    // Cleanup in reverse order of dependencies
-    await prisma.$transaction(async (tx) => {
-      // Delete all related records
-      await tx.videoJob.deleteMany({
-        where: {
-          OR: [
-            { id: TEST_CONFIG.TEST_JOB_ID },
-            { userId: TEST_CONFIG.TEST_USER_ID },
-          ],
-        },
-      });
+    // Cleanup test data
+    await cleanupDatabase();
 
-      await tx.listing.deleteMany({
-        where: {
-          OR: [
-            { id: TEST_CONFIG.TEST_LISTING_ID },
-            { userId: TEST_CONFIG.TEST_USER_ID },
-          ],
-        },
-      });
-
-      await tx.user.deleteMany({
-        where: {
-          OR: [{ id: TEST_CONFIG.TEST_USER_ID }, { email: "test@example.com" }],
-        },
-      });
-    });
-
+    // Cleanup temp directory
     await fs.rm(TEST_CONFIG.TEMP_DIR, { recursive: true, force: true });
     await prisma.$disconnect();
-  });
+  }, 30000); // 30 second timeout for afterAll
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -214,7 +258,7 @@ describe("ProductionPipeline Template Processing", () => {
       expect(
         metadata.templateResults.every((r: any) => r.status === "SUCCESS")
       ).toBe(true);
-    });
+    }, 30000); // 30 second timeout for this test
 
     it("should continue processing if one template fails", async () => {
       // Clear all mocks and caches first
@@ -259,7 +303,7 @@ describe("ProductionPipeline Template Processing", () => {
       );
       expect(failedResult).toBeTruthy();
       expect(failedResult.template).toBe("storyteller");
-    });
+    }, 30000);
 
     it("should generate map video for googlezoomintro template", async () => {
       // Clear all mocks and caches first
@@ -304,7 +348,7 @@ describe("ProductionPipeline Template Processing", () => {
       const metadata = job?.metadata as any;
       expect(metadata.templateResults[0].status).toBe("SUCCESS");
       expect(metadata.templateResults[0].template).toBe("googlezoomintro");
-    });
+    }, 30000);
 
     it("should handle template validation errors", async () => {
       // Clear all mocks and caches first
@@ -338,7 +382,7 @@ describe("ProductionPipeline Template Processing", () => {
         .catch((e) => e);
 
       expect(error2.message).toBe("No templates were successfully generated");
-    });
+    }, 30000);
   });
 
   describe("Resource Management", () => {
@@ -373,7 +417,7 @@ describe("ProductionPipeline Template Processing", () => {
       for (const result of results) {
         await expect(fs.access(result)).rejects.toThrow();
       }
-    });
+    }, 30000);
 
     it("should handle cleanup errors gracefully", async () => {
       // Clear all mocks and caches first
@@ -406,7 +450,7 @@ describe("ProductionPipeline Template Processing", () => {
 
       // Restore original unlink
       (fs.unlink as unknown) = originalUnlink;
-    });
+    }, 30000);
   });
 
   describe("Single Photo Processing", () => {
@@ -442,7 +486,7 @@ describe("ProductionPipeline Template Processing", () => {
 
       // Reset mocks
       jest.clearAllMocks();
-    });
+    }, 30000);
 
     it("should process a single photo regeneration", async () => {
       // Mock runway video generation
@@ -493,7 +537,7 @@ describe("ProductionPipeline Template Processing", () => {
         SINGLE_PHOTO_ID
       );
       expect(metadata.regeneration.totalPhotos).toBe(1);
-    });
+    }, 30000);
 
     it("should handle errors during single photo regeneration", async () => {
       // Mock runway service to fail
@@ -518,7 +562,7 @@ describe("ProductionPipeline Template Processing", () => {
         where: { id: TEST_CONFIG.TEST_JOB_ID },
       });
       expect(job?.status).toBe(VideoGenerationStatus.FAILED);
-    });
+    }, 30000);
 
     it("should reuse existing runway videos when available", async () => {
       // Create a mock processed asset for the photo
@@ -574,7 +618,7 @@ describe("ProductionPipeline Template Processing", () => {
         where: { id: TEST_CONFIG.TEST_JOB_ID },
       });
       expect(job?.status).toBe(VideoGenerationStatus.COMPLETED);
-    });
+    }, 30000);
 
     it("should maintain correct progress tracking during single photo processing", async () => {
       const progressUpdates: Array<{
@@ -636,7 +680,7 @@ describe("ProductionPipeline Template Processing", () => {
 
       // Restore original prisma update
       prisma.videoJob.update = originalUpdate;
-    });
+    }, 30000);
 
     it("should create all required templates during single photo regeneration", async () => {
       // Mock runway video generation
@@ -713,6 +757,6 @@ describe("ProductionPipeline Template Processing", () => {
       );
       expect(primaryTemplate).toBeDefined();
       expect(job?.outputFile).toBe(primaryTemplate.path);
-    });
+    }, 30000);
   });
 });

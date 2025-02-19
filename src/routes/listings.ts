@@ -74,11 +74,6 @@ const getListings = async (req: Request, res: Response): Promise<void> => {
       },
     });
 
-    logger.info("[Listings] Found listings", {
-      count: listings.length,
-      userId: authenticatedUserId,
-    });
-
     res.json({
       success: true,
       data: listings,
@@ -133,11 +128,6 @@ const getListing = async (req: Request, res: Response): Promise<void> => {
       });
       return;
     }
-
-    logger.info("[Listings] Found listing", {
-      listingId,
-      userId,
-    });
 
     res.json({
       success: true,
@@ -701,9 +691,14 @@ router.get(
       const { listingId } = req.params;
       const userId = req.user!.id;
 
+      logger.info("[LATEST_VIDEOS] Starting request", {
+        listingId,
+        userId,
+      });
+
       // Validate listingId
       if (!listingId || listingId === "undefined") {
-        logger.error("[LATEST_VIDEOS_ERROR] Invalid listingId", {
+        logger.error("[LATEST_VIDEOS] Invalid listingId", {
           listingId,
           userId,
         });
@@ -713,11 +708,6 @@ router.get(
         });
         return;
       }
-
-      logger.info("[LATEST_VIDEOS] Fetching videos", {
-        listingId,
-        userId,
-      });
 
       const videos = await prisma.videoJob.findMany({
         where: {
@@ -730,11 +720,27 @@ router.get(
         select: {
           id: true,
           status: true,
+          template: true,
           outputFile: true,
           thumbnailUrl: true,
           createdAt: true,
           metadata: true,
+          progress: true,
+          listingId: true,
+          inputFiles: true,
+          updatedAt: true,
         },
+      });
+
+      logger.info("[LATEST_VIDEOS] Found videos", {
+        videoCount: videos.length,
+        videos: videos.map((v) => ({
+          id: v.id,
+          template: v.template,
+          status: v.status,
+          createdAt: v.createdAt,
+          metadata: v.metadata,
+        })),
       });
 
       // Calculate processing status
@@ -749,29 +755,33 @@ router.get(
       // Determine if polling should end (no processing jobs and at least one video)
       const shouldEndPolling = processingCount === 0 && videos.length > 0;
 
-      logger.info("[LATEST_VIDEOS] Found videos", {
-        listingId,
-        count: videos.length,
-        processing: processingCount,
-        failed: failedCount,
-        completed: completedCount,
+      const response = {
+        success: true,
+        data: {
+          videos,
+          status: {
+            isProcessing: processingCount > 0,
+            processingCount,
+            failedCount,
+            completedCount,
+            totalCount: videos.length,
+            shouldEndPolling,
+          },
+        },
+      };
+
+      logger.info("[LATEST_VIDEOS] Sending response", {
+        processingCount,
+        failedCount,
+        completedCount,
+        totalCount: videos.length,
         shouldEndPolling,
+        videoTemplates: videos.map((v) => v.template),
       });
 
-      res.json({
-        success: true,
-        videos,
-        status: {
-          isProcessing: processingCount > 0,
-          processingCount,
-          failedCount,
-          completedCount,
-          totalCount: videos.length,
-          shouldEndPolling,
-        },
-      });
+      res.json(response);
     } catch (error) {
-      logger.error("[LATEST_VIDEOS_ERROR]", {
+      logger.error("[LATEST_VIDEOS] Error:", {
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,
       });

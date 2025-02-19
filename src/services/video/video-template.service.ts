@@ -131,11 +131,29 @@ export class VideoTemplateService {
       hasMapVideo: !!mapVideoPath,
     });
 
+    // Validate inputs
+    if (!inputVideos.length) {
+      throw new Error("No input videos provided");
+    }
+
     // Validate template exists
     const template = reelTemplates[templateKey];
     if (!template) {
       logger.error("Template not found", { templateKey });
       throw new Error(`Template ${templateKey} not found`);
+    }
+
+    // Validate sequence
+    if (!template.sequence.length) {
+      throw new Error("Template sequence cannot be empty");
+    }
+
+    // Validate durations
+    if (
+      !template.durations ||
+      (Array.isArray(template.durations) && !template.durations.length)
+    ) {
+      throw new Error("Template must have valid durations");
     }
 
     // Resolve music path if present
@@ -163,12 +181,20 @@ export class VideoTemplateService {
     // Count how many actual video slots we need (excluding map)
     const videoSlots = template.sequence.filter((s) => s !== "map").length;
     const availableVideos = inputVideos.length;
+    const hasMapRequirement = template.sequence.includes("map");
+
+    // Validate map video requirement
+    if (hasMapRequirement && !mapVideoPath) {
+      logger.error("Map video required but not provided", { templateKey });
+      throw new Error("Map video required but not provided");
+    }
 
     logger.info("Template analysis", {
       totalSlots: template.sequence.length,
       videoSlots,
       availableVideos,
       hasMapVideo: !!mapVideoPath,
+      hasMapRequirement,
       hasTransitions: !!template.transitions?.length,
       hasMusic: !!template.music?.isValid,
     });
@@ -176,11 +202,48 @@ export class VideoTemplateService {
     // If we have fewer videos than slots, adapt the sequence
     let adaptedSequence = [...template.sequence];
     if (availableVideos < videoSlots) {
-      // Keep the map and reuse available videos in a round-robin fashion
+      // Keep track of used indices and their frequencies
+      const indexFrequency = new Map<number, number>();
+
+      // First pass: Handle map markers and validate indices
       adaptedSequence = template.sequence.map((item) => {
         if (item === "map") return item;
-        const index = typeof item === "number" ? item : parseInt(item);
-        return index % availableVideos; // Use modulo to wrap around available videos
+
+        const rawIndex = typeof item === "number" ? item : parseInt(item);
+        if (isNaN(rawIndex)) {
+          logger.warn("Invalid sequence item, using fallback index 0", {
+            item,
+          });
+          return 0;
+        }
+        return rawIndex;
+      });
+
+      // Second pass: Adapt sequence for available videos
+      adaptedSequence = adaptedSequence.map((item) => {
+        if (item === "map") return item;
+
+        const index = item as number;
+
+        // Find the least used index within available range
+        let adaptedIndex = 0;
+        let minFrequency = Infinity;
+
+        for (let i = 0; i < availableVideos; i++) {
+          const freq = indexFrequency.get(i) || 0;
+          if (freq < minFrequency) {
+            minFrequency = freq;
+            adaptedIndex = i;
+          }
+        }
+
+        // Update frequency count
+        indexFrequency.set(
+          adaptedIndex,
+          (indexFrequency.get(adaptedIndex) || 0) + 1
+        );
+
+        return adaptedIndex;
       });
 
       logger.info("Adapted sequence for fewer videos", {
@@ -188,55 +251,48 @@ export class VideoTemplateService {
         adaptedLength: adaptedSequence.length,
         sequence: adaptedSequence,
         availableVideos,
+        indexDistribution: Object.fromEntries(indexFrequency.entries()),
       });
     }
 
+    // Create clips with proper duration handling
     const clips: VideoClip[] = [];
-    for (const sequenceItem of adaptedSequence) {
+    for (let i = 0; i < adaptedSequence.length; i++) {
+      const sequenceItem = adaptedSequence[i];
+
       if (sequenceItem === "map") {
-        if (!mapVideoPath) {
-          logger.error("Map video required but not provided", { templateKey });
-          throw new Error("Map video required but not provided");
-        }
-        const mapDuration =
-          typeof template.durations === "object"
-            ? (template.durations as Record<string, number>).map
-            : (template.durations as number[])[0];
+        const mapDuration = this.getClipDuration(template.durations, "map", i);
         clips.push({
-          path: mapVideoPath,
+          path: mapVideoPath!,
           duration: mapDuration,
         });
-      } else {
-        const index =
-          typeof sequenceItem === "number"
-            ? sequenceItem
-            : parseInt(sequenceItem);
-        // Normalize the index to fit within available videos
-        const normalizedIndex = index % availableVideos;
-        const duration =
-          typeof template.durations === "object"
-            ? (template.durations as Record<string, number>)[String(index)]
-            : (template.durations as number[])[clips.length];
-
-        // Validate video path exists
-        if (!inputVideos[normalizedIndex]) {
-          logger.error("Video not found at index", {
-            index: normalizedIndex,
-            totalVideos: inputVideos.length,
-          });
-          throw new Error(`Video not found at index ${normalizedIndex}`);
-        }
-
-        clips.push({
-          path: inputVideos[normalizedIndex],
-          duration,
-          transition: template.transitions?.[clips.length - 1],
-          colorCorrection: template.colorCorrection,
-        });
+        continue;
       }
+
+      const index = sequenceItem as number;
+      const normalizedIndex = Math.abs(index) % availableVideos;
+
+      // Get duration with fallback handling
+      const duration = this.getClipDuration(template.durations, index, i);
+
+      // Validate video path exists
+      if (!inputVideos[normalizedIndex]) {
+        logger.error("Video not found at index", {
+          index: normalizedIndex,
+          totalVideos: inputVideos.length,
+        });
+        throw new Error(`Video not found at index ${normalizedIndex}`);
+      }
+
+      clips.push({
+        path: inputVideos[normalizedIndex],
+        duration,
+        transition: template.transitions?.[i > 0 ? i - 1 : 0],
+        colorCorrection: template.colorCorrection,
+      });
     }
 
-    // Validate we have all required clips
+    // Final validation
     if (clips.length !== adaptedSequence.length) {
       logger.error("Clip count mismatch", {
         expected: adaptedSequence.length,
@@ -246,6 +302,35 @@ export class VideoTemplateService {
     }
 
     return clips;
+  }
+
+  /**
+   * Helper method to safely get clip duration with fallbacks
+   */
+  private getClipDuration(
+    durations: number[] | Record<string | number, number>,
+    index: number | string,
+    position: number
+  ): number {
+    const DEFAULT_DURATION = 2.0; // Fallback duration in seconds
+
+    try {
+      if (Array.isArray(durations)) {
+        // For array durations, use position as fallback
+        return durations[position] || durations[0] || DEFAULT_DURATION;
+      } else {
+        // For object durations, use index as key with fallbacks
+        return durations[index] || durations[0] || DEFAULT_DURATION;
+      }
+    } catch (error) {
+      logger.warn("Error getting clip duration, using default", {
+        error,
+        index,
+        position,
+        defaultDuration: DEFAULT_DURATION,
+      });
+      return DEFAULT_DURATION;
+    }
   }
 
   async extractThumbnail(videoPath: string): Promise<string> {
