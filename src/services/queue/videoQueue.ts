@@ -381,14 +381,13 @@ export class VideoQueueService {
 
   private calculatePriority(basePriority: number, tierId?: string): number {
     const tierMultiplier: Record<string, number> = {
-      [SUBSCRIPTION_TIERS.BASIC]: 1,
-      [SUBSCRIPTION_TIERS.PRO]: 2,
-      [SUBSCRIPTION_TIERS.ENTERPRISE]: 3,
-      [SUBSCRIPTION_TIERS.AGENCY]: 4,
+      [SUBSCRIPTION_TIERS.REELTY]: 1,
+      [SUBSCRIPTION_TIERS.REELTY_PRO]: 2,
+      [SUBSCRIPTION_TIERS.REELTY_PRO_PLUS]: 3,
     };
 
     return (
-      basePriority * (tierMultiplier[tierId || SUBSCRIPTION_TIERS.BASIC] || 1)
+      basePriority * (tierMultiplier[tierId || SUBSCRIPTION_TIERS.REELTY] || 1)
     );
   }
 

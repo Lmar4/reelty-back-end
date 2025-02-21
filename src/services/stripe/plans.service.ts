@@ -1,4 +1,4 @@
-import { PrismaClient, SubscriptionTier, Prisma } from "@prisma/client";
+import { PrismaClient, SubscriptionTier, PlanType } from "@prisma/client";
 import Stripe from "stripe";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
@@ -7,7 +7,12 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
 
 const prisma = new PrismaClient();
 
-export type PlanType = "PAY_AS_YOU_GO" | "MONTHLY";
+export enum SubscriptionTierId {
+  FREE = "FREE",
+  REELTY = "REELTY",
+  REELTY_PRO = "REELTY_PRO",
+  REELTY_PRO_PLUS = "REELTY_PRO_PLUS",
+}
 
 export interface PlanMetadata {
   features: string[];
@@ -40,20 +45,22 @@ interface TierData
   planType?: PlanType;
   creditsPerInterval?: number;
   premiumTemplatesEnabled?: boolean;
+  tierId?: SubscriptionTierId;
 }
 
 export class PlansService {
   // Create or update a subscription plan
   async syncPlan(tier: TierData, metadata: PlanMetadata) {
     try {
-      if (!tier.name || !tier.description) {
-        throw new Error("Name and description are required");
+      if (!tier.name || !tier.description || !tier.tierId) {
+        throw new Error("Name, description, and tierId are required");
       }
 
       // First, check if a tier with these Stripe IDs already exists
       const existingTier = await prisma.subscriptionTier.findFirst({
         where: {
           OR: [
+            { id: tier.tierId },
             { name: tier.name },
             { stripeProductId: tier.stripeProductId },
             { stripePriceId: tier.stripePriceId },
@@ -114,6 +121,7 @@ export class PlansService {
 
       // Prepare subscription tier data
       const subscriptionTierData = {
+        tierId: tier.tierId,
         name: tier.name,
         description: tier.description,
         monthlyPrice: tier.monthlyPrice!,
@@ -200,6 +208,7 @@ export class PlansService {
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 59,
         credits: 1,
+        tierId: SubscriptionTierId.FREE,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -213,6 +222,7 @@ export class PlansService {
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 236,
         credits: 4,
+        tierId: SubscriptionTierId.REELTY,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -226,6 +236,7 @@ export class PlansService {
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 590,
         credits: 10,
+        tierId: SubscriptionTierId.REELTY_PRO,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -240,6 +251,7 @@ export class PlansService {
         type: "MONTHLY" as PlanType,
         price: 39,
         creditsPerInterval: 1,
+        tierId: SubscriptionTierId.REELTY,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -254,6 +266,7 @@ export class PlansService {
         type: "MONTHLY" as PlanType,
         price: 129,
         creditsPerInterval: 4,
+        tierId: SubscriptionTierId.REELTY_PRO,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -268,6 +281,7 @@ export class PlansService {
         type: "MONTHLY" as PlanType,
         price: 249,
         creditsPerInterval: 10,
+        tierId: SubscriptionTierId.REELTY_PRO_PLUS,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -295,6 +309,7 @@ export class PlansService {
 
       const credits = plan.creditsPerInterval || plan.credits || 0;
       const tierData: TierData = {
+        tierId: plan.tierId,
         name: plan.name,
         description: `${
           plan.type === "MONTHLY" ? "Monthly subscription with " : ""

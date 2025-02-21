@@ -201,11 +201,3 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
     },
   },
 } as const;
-
-type ValidateTemplates = keyof typeof reelTemplates extends TemplateKey
-  ? TemplateKey extends keyof typeof reelTemplates
-    ? true
-    : false
-  : false;
-type Assert<T extends true> = T;
-type _TypeCheck = Assert<ValidateTemplates>;

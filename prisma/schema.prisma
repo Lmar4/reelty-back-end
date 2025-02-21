@@ -46,6 +46,13 @@ enum PlanType {
   MONTHLY
 }
 
+enum SubscriptionTierId {
+  FREE       @map("550e8400-e29b-41d4-a716-446655440000")
+  REELTY     @map("550e8400-e29b-41d4-a716-446655440001")
+  REELTY_PRO @map("550e8400-e29b-41d4-a716-446655440002")
+  REELTY_PRO_PLUS @map("550e8400-e29b-41d4-a716-446655440003")
+}
+
 model User {
   id                    String      @id // Clerk ID
   email                 String      @unique
@@ -59,7 +66,8 @@ model User {
   stripeProductId      String?
   subscriptionStatus   SubscriptionStatus    @default(INACTIVE)
   subscriptionPeriodEnd DateTime?
-  currentTierId        String?     @db.Uuid
+  currentTierId        SubscriptionTierId?
+  currentTier          SubscriptionTier?   @relation(fields: [currentTierId], references: [tierId])
   lastLoginAt         DateTime?
   createdAt           DateTime    @default(now())
   updatedAt           DateTime    @updatedAt
@@ -89,7 +97,6 @@ model User {
   searchHistory   SearchHistory[]
   errorLogs       ErrorLog[]
   tempUploads     TempUpload[]
-  currentTier     SubscriptionTier? @relation(fields: [currentTierId], references: [id])
   bulkDiscount    BulkDiscount?   @relation(fields: [bulkDiscountId], references: [id])
   bulkDiscountId  String?        @db.Uuid
 
@@ -101,7 +108,8 @@ model User {
 
 model SubscriptionTier {
   id                   String   @id @default(uuid()) @db.Uuid
-  name                 String
+  tierId               SubscriptionTierId @unique
+  name                 String   @unique
   description          String
   stripePriceId        String   @unique
   stripeProductId      String   @unique
@@ -131,14 +139,19 @@ model Template {
   id          String   @id @default(cuid())
   name        String
   description String
+  key         String   // Template key for internal reference
   tiers       String[] // ["free", "pro", "enterprise"]
   order       Int      @default(0)
+  sequence    Json     // Template sequence configuration
+  durations   Json     // Template duration configuration
   thumbnailUrl String? @map("thumbnail_url")
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   // Relations
   subscriptionTiers SubscriptionTier[] @relation("TemplateToSubscriptionTier")
+
+  @@map("templates")
 }
 
 model CreditLog {
@@ -178,16 +191,16 @@ model Asset {
   description     String?
   filePath        String   @map("file_path")
   type            AssetType
-  subscriptionTier String  @map("subscription_tier") @db.Uuid
+  subscriptionTierId String  @map("subscription_tier") @db.Uuid
   isActive        Boolean  @default(true) @map("is_active")
   isDefault       Boolean  @default(false) @map("is_default")
   createdAt       DateTime @default(now()) @map("created_at")
   updatedAt       DateTime @updatedAt @map("updated_at")
 
   // Relations
-  tier            SubscriptionTier @relation(fields: [subscriptionTier], references: [id])
+  subscriptionTier SubscriptionTier @relation(fields: [subscriptionTierId], references: [id])
 
-  @@index([type, subscriptionTier])
+  @@index([type, subscriptionTierId])
   @@map("assets")
 }
 

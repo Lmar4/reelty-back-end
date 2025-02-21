@@ -4,7 +4,7 @@ import multer from "multer";
 import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
-import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
+import { ProductionPipeline } from "../services/imageProcessing/__productionPipeline";
 import { StorageService } from "../services/storage";
 import { s3VideoService } from "../services/video/s3-video.service";
 import { logger } from "../utils/logger";
@@ -28,6 +28,14 @@ const createListingSchema = z.object({
       .nullable()
       .optional(),
     photoLimit: z.number().optional(),
+    photos: z
+      .array(
+        z.object({
+          s3Key: z.string(),
+          filePath: z.string().optional(),
+        })
+      )
+      .optional(),
   }),
 });
 
@@ -150,13 +158,14 @@ const getListing = async (req: Request, res: Response): Promise<void> => {
 const createListing = async (req: Request, res: Response): Promise<void> => {
   try {
     const userId = req.user!.id;
-    const { address, description, coordinates, photoLimit } = req.body;
+    const { address, description, coordinates, photoLimit, photos } = req.body;
 
     logger.info("[Listings] Creating new listing", {
       userId,
       address,
       hasCoordinates: !!coordinates,
       photoLimit,
+      photoCount: photos?.length || 0,
       body: req.body,
     });
 
@@ -173,29 +182,93 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const listingData: Prisma.ListingUncheckedCreateInput = {
-      userId,
-      address,
-      description,
-      coordinates: coordinates || null,
-      photoLimit: photoLimit || 10,
-      status: "ACTIVE",
-    };
+    // Create listing and process photos in a transaction
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Create the listing first
+      const listing = await tx.listing.create({
+        data: {
+          userId,
+          address,
+          description,
+          coordinates: coordinates || null,
+          photoLimit: photoLimit || 10,
+          status: "ACTIVE",
+        },
+      });
 
-    const listing = await prisma.listing.create({
-      data: listingData,
-      include: {
-        photos: true,
-      },
+      // 2. If photos were provided, create photo records
+      const photoRecords = [];
+      if (Array.isArray(photos) && photos.length > 0) {
+        for (const photo of photos) {
+          const { s3Key } = photo;
+          const photoRecord = await tx.photo.create({
+            data: {
+              userId,
+              listingId: listing.id,
+              s3Key,
+              filePath: `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Key}`,
+              status: "completed",
+            },
+          });
+          photoRecords.push(photoRecord);
+        }
+      }
+
+      // 3. Create video generation job if we have photos
+      let videoJob = null;
+      if (photoRecords.length > 0) {
+        videoJob = await tx.videoJob.create({
+          data: {
+            listingId: listing.id,
+            userId,
+            status: "PROCESSING",
+            template: "crescendo",
+            inputFiles: photoRecords.map((photo) => photo.filePath),
+          },
+        });
+      }
+
+      return { listing, photos: photoRecords, videoJob };
     });
 
     logger.info("[Listings] Created successfully", {
-      listingId: listing.id,
+      listingId: result.listing.id,
+      photoCount: result.photos.length,
+      hasVideoJob: !!result.videoJob,
     });
+
+    // Start video generation if we have a job
+    if (result.videoJob && result.photos.length > 0) {
+      logger.info("[Listings] Starting video generation", {
+        jobId: result.videoJob.id,
+        listingId: result.listing.id,
+        photoCount: result.photos.length,
+      });
+
+      // Start the production pipeline in the background
+      productionPipeline
+        .execute({
+          jobId: result.videoJob.id,
+          inputFiles: result.photos.map((photo) => photo.filePath),
+          template: "crescendo",
+          coordinates,
+        })
+        .catch((error: unknown) => {
+          logger.error("[Listings] Error in production pipeline", {
+            error: error instanceof Error ? error.message : "Unknown error",
+            jobId: result.videoJob?.id,
+            listingId: result.listing.id,
+          });
+        });
+    }
 
     res.status(201).json({
       success: true,
-      data: listing,
+      data: {
+        ...result.listing,
+        photos: result.photos,
+        videoJob: result.videoJob,
+      },
     });
   } catch (error) {
     logger.error("[Listings] Error creating listing", {

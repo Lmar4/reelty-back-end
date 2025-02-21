@@ -1,9 +1,8 @@
 export const SUBSCRIPTION_TIERS = {
-  BASIC: "550e8400-e29b-41d4-a716-446655440000",
-  PRO: "550e8400-e29b-41d4-a716-446655440001",
-  ENTERPRISE: "550e8400-e29b-41d4-a716-446655440002",
-  AGENCY: "550e8400-e29b-41d4-a716-446655440004",
-  ADMIN: "550e8400-e29b-41d4-a716-446655440003",
+  FREE: "550e8400-e29b-41d4-a716-446655440000", // Free tier
+  REELTY: "550e8400-e29b-41d4-a716-446655440001", // Basic/Reelty tier
+  REELTY_PRO: "550e8400-e29b-41d4-a716-446655440002", // Pro tier
+  REELTY_PRO_PLUS: "550e8400-e29b-41d4-a716-446655440003", // Pro+ tier
 } as const;
 
 export type SubscriptionTierId =
@@ -22,25 +21,34 @@ export const getTierNameFromId = (id: SubscriptionTierId): string => {
   return entry ? entry[0] : "UNKNOWN";
 };
 
-// Helper function to check if a tier is an agency tier
-export const isAgencyTier = (id: SubscriptionTierId): boolean => {
-  return id === SUBSCRIPTION_TIERS.AGENCY;
-};
-
 // Helper function to get max users allowed for a tier
 export const getMaxUsersForTier = (id: SubscriptionTierId): number => {
   switch (id) {
-    case SUBSCRIPTION_TIERS.AGENCY:
-      return 10; // Default max users for agency
-    case SUBSCRIPTION_TIERS.ENTERPRISE:
-      return 5;
-    case SUBSCRIPTION_TIERS.PRO:
-      return 1;
-    case SUBSCRIPTION_TIERS.BASIC:
-      return 1;
-    case SUBSCRIPTION_TIERS.ADMIN:
+    case SUBSCRIPTION_TIERS.REELTY_PRO_PLUS:
       return -1; // Unlimited
+    case SUBSCRIPTION_TIERS.REELTY_PRO:
+      return 10;
+    case SUBSCRIPTION_TIERS.REELTY:
+      return 1;
+    case SUBSCRIPTION_TIERS.FREE:
+      return 1;
     default:
       return 1;
+  }
+};
+
+// Helper function to get credits per interval for a tier
+export const getCreditsForTier = (id: SubscriptionTierId): number => {
+  switch (id) {
+    case SUBSCRIPTION_TIERS.REELTY_PRO_PLUS:
+      return 10; // 10 credits per month
+    case SUBSCRIPTION_TIERS.REELTY_PRO:
+      return 4; // 4 credits per month
+    case SUBSCRIPTION_TIERS.REELTY:
+      return 1; // 1 credit per month
+    case SUBSCRIPTION_TIERS.FREE:
+      return 0; // No credits
+    default:
+      return 0;
   }
 };

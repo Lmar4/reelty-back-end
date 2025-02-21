@@ -168,7 +168,7 @@ export class ImageProcessor {
   private async downloadInChunks(s3Path: string): Promise<Buffer> {
     return this.retryOperation(async () => {
       const chunks: Buffer[] = [];
-      const stream = await s3Service.downloadFile(s3Path);
+      const stream = await s3Service.downloadFile(s3Path, "temp/image");
 
       // If we already have a Buffer, return it directly
       if (Buffer.isBuffer(stream)) {
@@ -177,7 +177,7 @@ export class ImageProcessor {
 
       // Otherwise, handle as a stream
       return new Promise<Buffer>((resolve, reject) => {
-        const readable = stream as Readable;
+        const readable = stream as unknown as Readable;
         readable.on("data", (chunk: Buffer) => chunks.push(chunk));
         readable.on("end", () => resolve(Buffer.concat(chunks)));
         readable.on("error", reject);

@@ -11,7 +11,7 @@ import { TemplateKey } from "./templates/types";
 import { reelTemplates } from "./templates/types";
 import { AssetCacheService } from "../cache/assetCache";
 import { s3Service } from "../storage/s3.service";
-import { ProductionPipeline } from "./productionPipeline";
+import { ProductionPipeline } from "./__productionPipeline";
 import { MapCaptureService } from "../map-capture/map-capture.service";
 
 const prisma = new PrismaClient();
@@ -110,7 +110,9 @@ export class ImageToVideoConverter {
 
   private async generateRunwayVideo(
     imageUrl: string,
-    index: number
+    index: number,
+    listingId: string,
+    jobId: string
   ): Promise<string> {
     try {
       console.log("Starting video generation:", { imageUrl, index });
@@ -162,7 +164,7 @@ export class ImageToVideoConverter {
       }
 
       console.log("Sending request to Runway with public URL:", publicUrl);
-      return await runwayService.generateVideo(publicUrl, index);
+      return await runwayService.generateVideo(publicUrl, index, listingId, jobId);
     } catch (error) {
       console.error("Generation failed:", {
         error: error instanceof Error ? error.message : "Unknown error",
@@ -507,7 +509,7 @@ export class ImageToVideoConverter {
         `[${jobId}] Generating video ${batchIndex + 1}/${validPaths.length}:`,
         item.path
       );
-      const videoPath = await this.generateRunwayVideo(item.path, item.index);
+      const videoPath = await this.generateRunwayVideo(item.path, item.index, "", "");
 
       // Cache the result
       await this.assetCache.cacheAsset({
@@ -817,7 +819,7 @@ export class ImageToVideoConverter {
 
           console.log("Using public URL for Runway:", publicUrl);
 
-          const videoPath = await this.generateRunwayVideo(publicUrl, index);
+          const videoPath = await this.generateRunwayVideo(publicUrl, index, "", "");
           await this.cacheVideo(s3WebpPath, videoPath, index);
 
           console.log("Video created successfully:", videoPath);

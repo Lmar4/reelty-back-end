@@ -14,7 +14,7 @@ import path from "path";
 import { mapCaptureService } from "../../map-capture/map-capture.service";
 import { runwayService } from "../../video/runway.service";
 import { videoTemplateService } from "../../video/video-template.service";
-import { ProductionPipeline } from "../productionPipeline";
+import { ProductionPipeline } from "../__productionPipeline";
 import type { TemplateKey } from "../templates/types";
 import { TEST_CONFIG } from "./testConfig";
 

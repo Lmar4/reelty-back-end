@@ -6,6 +6,8 @@ import {
 import { s3Service } from "../storage/s3.service";
 import { imageProcessor } from "../imageProcessing/image.service";
 import { runwayService } from "../video/runway.service";
+import path from "path";
+import fs from "fs";
 
 export class AssetCacheManager {
   private static instance: AssetCacheManager;
@@ -76,7 +78,10 @@ export class AssetCacheManager {
     const cached = this.getCacheEntry<Buffer>("s3", key);
     if (cached) return cached;
 
-    const promise = s3Service.downloadFile(key);
+    const localPath = path.join(process.cwd(), "temp", "cache", key);
+    const promise = s3Service
+      .downloadFile(key, localPath)
+      .then(() => fs.promises.readFile(localPath));
     return this.setCacheEntry("s3", key, promise);
   }
 
@@ -98,7 +103,12 @@ export class AssetCacheManager {
     const cached = this.getCacheEntry<string>("video-segments", cacheKey);
     if (cached) return cached;
 
-    const promise = runwayService.generateVideo(imageUrl, index);
+    const promise = runwayService.generateVideo(
+      imageUrl,
+      index,
+      "default", // default listingId for cache manager
+      cacheKey // using cacheKey as jobId for tracking
+    );
     return this.setCacheEntry("video-segments", cacheKey, promise);
   }
 

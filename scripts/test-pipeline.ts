@@ -1,4 +1,4 @@
-import { ProductionPipeline } from "../src/services/imageProcessing/productionPipeline";
+import { ProductionPipeline } from "../src/services/imageProcessing/__productionPipeline";
 import path from "path";
 
 async function testPipeline() {

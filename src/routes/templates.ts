@@ -24,6 +24,9 @@ const templateSchema = z.object({
         message: "Invalid subscription tier ID provided",
       }),
     order: z.number().default(0),
+    key: z.string().min(1),
+    sequence: z.array(z.unknown()),
+    durations: z.array(z.unknown()),
   }),
 });
 
@@ -82,7 +85,7 @@ const getTemplates: RequestHandler = async (req, res) => {
 // Create template
 const createTemplate: RequestHandler = async (req, res) => {
   try {
-    const { name, description, order, subscriptionTierIds } = req.body;
+    const { name, description, order, subscriptionTierIds, key, sequence, durations } = req.body;
 
     // Validate subscription tier IDs
     if (!subscriptionTierIds.every(isValidTierId)) {
@@ -104,6 +107,9 @@ const createTemplate: RequestHandler = async (req, res) => {
           description,
           order: order || 0,
           tiers: validTierIds.map(getTierNameFromId),
+          key,
+          sequence,
+          durations,
           subscriptionTiers: {
             connect: validTierIds.map((id) => ({ id })),
           },

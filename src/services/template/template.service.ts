@@ -631,7 +631,9 @@ export class TemplateService {
               description: template.description,
               tiers: ["free"], // Default to free tier
               order: 0,
-              // Thumbnail will be updated later
+              key: key, // Add template key
+              sequence: template.sequence, // Add sequence from template config
+              durations: template.durations || [], // Add durations, default to empty array if not defined
             },
           });
           logger.info(`Created new template: ${template.name}`);

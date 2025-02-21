@@ -3,7 +3,7 @@ import express, { RequestHandler } from "express";
 import { z } from "zod";
 import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
-import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
+import { ProductionPipeline } from "../services/imageProcessing/__productionPipeline";
 import { TemplateKey } from "../services/imageProcessing/templates/types";
 
 const router = express.Router();

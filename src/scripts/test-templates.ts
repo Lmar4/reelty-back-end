@@ -1,7 +1,7 @@
 import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import * as path from "path";
 import { config } from "dotenv";
-import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
+import { ProductionPipeline } from "../services/imageProcessing/__productionPipeline";
 import { logger } from "../utils/logger";
 import { TemplateKey } from "../services/imageProcessing/templates/types";
 

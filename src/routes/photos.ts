@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { isAuthenticated } from "../middleware/auth";
 import { prisma } from "../lib/prisma";
-import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
+import { ProductionPipeline } from "../services/imageProcessing/__productionPipeline";
 import { VideoGenerationStatus } from "@prisma/client";
 import { logger } from "../utils/logger";
 import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";

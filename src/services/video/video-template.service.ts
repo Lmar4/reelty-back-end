@@ -54,7 +54,10 @@ export class VideoTemplateService {
    * @param musicPath - The original music path from the template
    * @returns The resolved absolute path if found, null otherwise
    */
-  private async resolveAssetPath(assetPath: string, type: 'music' | 'watermark'): Promise<string | null> {
+  private async resolveAssetPath(
+    assetPath: string,
+    type: "music" | "watermark"
+  ): Promise<string | null> {
     // Define possible locations to check
     const basePaths = [
       path.join(process.cwd(), "public"),
@@ -65,10 +68,12 @@ export class VideoTemplateService {
       path.join(__dirname, `../../../assets/${type}`),
     ];
 
-    const possiblePaths = basePaths.map(base => path.join(base, path.basename(assetPath)));
+    const possiblePaths = basePaths.map((base) =>
+      path.join(base, path.basename(assetPath))
+    );
 
-    logger.info("Checking possible music file locations", {
-      originalPath: musicPath,
+    logger.info("Checking possible asset file locations", {
+      originalPath: assetPath,
       searchPaths: possiblePaths,
     });
 
@@ -76,21 +81,21 @@ export class VideoTemplateService {
     for (const possiblePath of possiblePaths) {
       try {
         await fs.promises.access(possiblePath, fs.constants.R_OK);
-        logger.info("Found music file", {
-          originalPath: musicPath,
+        logger.info("Found asset file", {
+          originalPath: assetPath,
           resolvedPath: possiblePath,
         });
         return possiblePath;
       } catch (error) {
-        logger.debug("Music file not found at path", {
+        logger.debug("Asset file not found at path", {
           path: possiblePath,
           error: error instanceof Error ? error.message : "Unknown error",
         });
       }
     }
 
-    logger.warn("Music file not found in any location", {
-      originalPath: musicPath,
+    logger.warn("Asset file not found in any location", {
+      originalPath: assetPath,
       searchedPaths: possiblePaths,
     });
     return null;
@@ -173,7 +178,7 @@ export class VideoTemplateService {
     if (template.music?.path) {
       const resolvedMusicPath = await this.resolveAssetPath(
         template.music.path,
-        'music'
+        "music"
       );
       if (resolvedMusicPath) {
         template.music.path = resolvedMusicPath;
@@ -196,20 +201,20 @@ export class VideoTemplateService {
     let watermarkConfig: WatermarkConfig | undefined;
     if (options?.watermark) {
       const watermarkPath = await this.resolveAssetPath(
-        'reelty_watermark.png',
-        'watermark'
+        "reelty_watermark.png",
+        "watermark"
       );
-      
+
       if (watermarkPath) {
         watermarkConfig = {
           path: watermarkPath,
           position: {
             x: "(main_w-overlay_w)/2",
-            y: "main_h-overlay_h-20"
-          }
+            y: "main_h-overlay_h-20",
+          },
         };
         logger.info("Watermark resolved and will be applied", {
-          path: watermarkPath
+          path: watermarkPath,
         });
       } else {
         logger.warn("Watermark requested but file not found");
@@ -240,20 +245,20 @@ export class VideoTemplateService {
     // Keep only map markers and indices that exist in our input videos
     const adaptedSequence = template.sequence.filter((item) => {
       if (item === "map") return true;
-      
+
       const index = typeof item === "number" ? item : parseInt(item);
       if (isNaN(index)) {
         logger.warn("Invalid sequence item, skipping", { item });
         return false;
       }
-      
+
       // Only keep indices that are within our available videos
       const hasVideo = index < availableVideos;
       if (!hasVideo) {
-        logger.info("Skipping out-of-range index", { 
-          index, 
+        logger.info("Skipping out-of-range index", {
+          index,
           availableVideos,
-          template: templateKey
+          template: templateKey,
         });
       }
       return hasVideo;
@@ -274,14 +279,14 @@ export class VideoTemplateService {
       adaptedSequence,
       originalDurations: template.durations,
       usedDurations,
-      availableVideos
+      availableVideos,
     });
 
     logger.info("Filtered sequence to available videos", {
       originalLength: template.sequence.length,
       filteredLength: adaptedSequence.length,
       sequence: adaptedSequence,
-      availableVideos
+      availableVideos,
     });
 
     // Create clips with proper duration handling
@@ -311,7 +316,7 @@ export class VideoTemplateService {
       }
 
       const index = sequenceItem as number;
-      
+
       // Use exact index from sequence (we've already filtered invalid ones)
       // Get exact duration for this index from template
       // Use the pre-calculated duration that matches our adapted sequence
@@ -323,7 +328,9 @@ export class VideoTemplateService {
           adaptedSequence,
           usedDurations,
         });
-        throw new Error(`Duration not found for adapted sequence position ${i}`);
+        throw new Error(
+          `Duration not found for adapted sequence position ${i}`
+        );
       }
 
       clips.push({
@@ -345,8 +352,6 @@ export class VideoTemplateService {
 
     return clips;
   }
-
-
 
   async extractThumbnail(videoPath: string): Promise<string> {
     const outputPath = path.join(

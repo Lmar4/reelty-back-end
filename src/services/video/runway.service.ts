@@ -113,14 +113,19 @@ export class RunwayService {
     );
   }
 
-  public async generateVideo(imageUrl: string, index: number): Promise<string> {
+  public async generateVideo(
+    imageUrl: string,
+    index: number,
+    listingId: string,
+    jobId: string
+  ): Promise<string> {
     try {
       // Create task with retry
       const taskId = await this.retryWithBackoff(
         () => this.createTask(imageUrl, index),
         "Task creation"
       );
-      logger.info("Task created on Runway:", { taskId });
+      logger.info("Task created on Runway:", { taskId, listingId, jobId });
 
       // Poll for completion
       const status = await this.pollTaskStatus(taskId);
@@ -130,7 +135,7 @@ export class RunwayService {
 
       // Download result with retry
       const localPath = await this.retryWithBackoff(
-        () => this.downloadResult(taskId, index),
+        () => this.downloadResult(taskId, index, listingId, jobId),
         "Result download"
       );
 
@@ -162,7 +167,9 @@ export class RunwayService {
 
       if (imageUrl.includes("X-Amz-") || imageUrl.startsWith("s3://")) {
         // Handle pre-signed URL or direct S3 URL
-        imageBuffer = await s3Service.downloadFile(imageUrl);
+        const tempPath = await tempFileManager.createTempPath("image.jpg");
+        await s3Service.downloadFile(imageUrl, tempPath.path);
+        imageBuffer = await fs.readFile(tempPath.path);
       } else {
         // Handle regular HTTPS URL
         const response = await fetch(imageUrl);
@@ -244,17 +251,18 @@ export class RunwayService {
     throw new Error("Video generation timed out after 5 minutes");
   }
 
-  private async downloadResult(taskId: string, index: number): Promise<string> {
+  private async downloadResult(
+    taskId: string,
+    index: number,
+    listingId: string,
+    jobId: string
+  ): Promise<string> {
     const task = await this.client.tasks.retrieve(taskId);
-
-    if (!task.output?.[0]) {
-      throw new Error("No video output URL found");
-    }
+    if (!task.output?.[0]) throw new Error("No video output URL found");
 
     const videoResponse = await fetch(task.output[0]);
-    if (!videoResponse.ok) {
+    if (!videoResponse.ok)
       throw new Error(`Download failed: ${videoResponse.statusText}`);
-    }
 
     const tempFile = await tempFileManager.createTempPath(
       `segment_${index}.mp4`
@@ -262,23 +270,9 @@ export class RunwayService {
     const videoBuffer = Buffer.from(await videoResponse.arrayBuffer());
     await tempFileManager.writeFile(tempFile, videoBuffer);
 
-    // Upload to S3 and wait for it to complete
-    const s3Key = `videos/runway/${Date.now()}_segment_${index}.mp4`;
-    try {
-      await s3Service.uploadFile(videoBuffer, s3Key);
-      logger.info("Video saved:", {
-        taskId,
-        localPath: tempFile.path,
-        s3Key,
-      });
-    } catch (error) {
-      logger.error("Failed to upload video to S3:", {
-        error: error instanceof Error ? error.message : "Unknown error",
-        taskId,
-        s3Key,
-      });
-      // Continue with the local file even if S3 upload fails
-    }
+    const s3Key = `properties/${listingId}/videos/runway/${jobId}/segment_${index}.mp4`;
+    await s3Service.uploadFile(videoBuffer, s3Key);
+    logger.info("Video saved:", { taskId, localPath: tempFile.path, s3Key });
 
     return tempFile.path;
   }

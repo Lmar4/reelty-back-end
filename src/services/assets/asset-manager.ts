@@ -2,32 +2,40 @@ import path from "path";
 import fs from "fs/promises";
 import { logger } from "../../utils/logger";
 import { s3Service } from "../storage/s3.service";
-import { PrismaClient } from "@prisma/client";
-
-type AssetType = "music" | "watermark" | "overlay" | "template" | "lottie";
+import {
+  PrismaClient,
+  ProcessedAsset,
+  Prisma,
+  AssetType,
+} from "@prisma/client";
+import * as crypto from "crypto";
 
 interface CachedAsset {
-  localPath: string;
+  path: string;
   expiresAt: Date;
 }
 
-class AssetManager {
+interface AssetMetadata {
+  expiresAt: string;
+  localPath?: string;
+}
+
+export class AssetManager {
   private static instance: AssetManager;
-  private assetPaths: Map<AssetType, string>;
-  private assetCache: Map<string, CachedAsset>;
-  private initialized: boolean;
-  private readonly CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
   private readonly prisma: PrismaClient;
-  private cleanupInterval: NodeJS.Timeout | null = null;
+  private readonly CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+  private readonly assetPaths: Map<AssetType, string>;
 
   private constructor() {
-    this.assetPaths = new Map();
-    this.assetCache = new Map();
-    this.initialized = false;
     this.prisma = new PrismaClient();
-    
-    // Start cleanup interval
-    this.cleanupInterval = setInterval(() => this.cleanupStaleAssets(), 60 * 60 * 1000); // Run every hour
+    this.assetPaths = new Map([
+      [AssetType.MUSIC, path.join(process.cwd(), "temp", "assets", "music")],
+      [
+        AssetType.WATERMARK,
+        path.join(process.cwd(), "temp", "assets", "watermarks"),
+      ],
+      [AssetType.LOTTIE, path.join(process.cwd(), "temp", "assets", "lottie")],
+    ]);
   }
 
   public static getInstance(): AssetManager {
@@ -37,172 +45,124 @@ class AssetManager {
     return AssetManager.instance;
   }
 
-  public async initialize(): Promise<void> {
-    if (this.initialized) {
-      return;
-    }
+  private generateHash(filePath: string): string {
+    const hash = crypto.createHash("sha256");
+    hash.update(`${filePath}${Date.now()}`);
+    return hash.digest("hex");
+  }
 
+  async getAssetPath(
+    type: AssetType,
+    name: string,
+    s3Key?: string
+  ): Promise<string> {
     try {
-      // Set up temp asset directories
-      const baseDir = path.join(process.cwd(), "temp", "assets");
-      const assetTypes: AssetType[] = [
-        "music",
-        "watermark",
-        "overlay",
-        "template",
-        "lottie"
-      ];
+      const cacheKey = s3Key || `${type}/${name}`;
 
-      for (const type of assetTypes) {
-        const assetPath = path.join(baseDir, type);
-        await fs.mkdir(assetPath, { recursive: true });
-        this.assetPaths.set(type, assetPath);
+      // Check ProcessedAsset cache first
+      const cached = await this.prisma.processedAsset.findUnique({
+        where: { cacheKey },
+      });
+
+      if (cached) {
+        const metadata = cached.metadata as unknown as AssetMetadata;
+        if (new Date(metadata.expiresAt) > new Date() && metadata.localPath) {
+          try {
+            await fs.access(metadata.localPath);
+            return metadata.localPath;
+          } catch {
+            // File doesn't exist, continue to download
+          }
+        }
       }
 
-      // Clean up any stale assets on startup
-      await this.cleanupStaleAssets();
+      // Get or create asset directory
+      const basePath =
+        this.assetPaths.get(type) ||
+        path.join(process.cwd(), "temp", "assets", type);
+      await fs.mkdir(basePath, { recursive: true });
 
-      this.initialized = true;
-      logger.info("Asset manager initialized with temp directories");
+      const localPath = path.join(basePath, name);
+
+      if (s3Key) {
+        await s3Service.downloadFile(s3Key, localPath);
+
+        const expiresAt = new Date(Date.now() + this.CACHE_TTL);
+        const hash = this.generateHash(localPath);
+
+        // Update or create cache entry
+        await this.prisma.processedAsset.upsert({
+          where: { cacheKey },
+          update: {
+            path: localPath,
+            hash,
+            updatedAt: new Date(),
+            metadata: {
+              expiresAt: expiresAt.toISOString(),
+              localPath,
+            },
+          },
+          create: {
+            type: "asset",
+            path: localPath,
+            cacheKey,
+            hash,
+            metadata: {
+              expiresAt: expiresAt.toISOString(),
+              localPath,
+            },
+          },
+        });
+
+        return localPath;
+      }
+
+      // For local assets, just verify existence
+      await fs.access(localPath);
+      return localPath;
     } catch (error) {
-      logger.error("Failed to initialize asset manager:", error);
+      logger.error("Failed to get asset path", {
+        type,
+        name,
+        s3Key,
+        error,
+      });
       throw error;
     }
   }
 
-  public async getAssetPath(type: AssetType, name: string, s3Key?: string): Promise<string> {
-    if (!this.initialized) {
-      await this.initialize();
-    }
-
-    const basePath = this.assetPaths.get(type);
-    if (!basePath) {
-      throw new Error(`Invalid asset type: ${type}`);
-    }
-
-    // Generate cache key
-    const cacheKey = s3Key || `${type}/${name}`;
-    
-    // Check memory cache first
-    const cached = this.assetCache.get(cacheKey);
-    if (cached && cached.expiresAt > new Date()) {
-      try {
-        await fs.access(cached.localPath);
-        return cached.localPath;
-      } catch {
-        // File doesn't exist, remove from cache
-        this.assetCache.delete(cacheKey);
-      }
-    }
-
-    // Check DB cache
-    const dbCached = await this.prisma.cachedAsset.findUnique({
-      where: { cacheKey },
-    });
-
-    if (dbCached && new Date(dbCached.metadata.expiresAt) > new Date()) {
-      try {
-        await fs.access(dbCached.path);
-        // Update memory cache
-        this.assetCache.set(cacheKey, {
-          localPath: dbCached.path,
-          expiresAt: new Date(dbCached.metadata.expiresAt)
-        });
-        return dbCached.path;
-      } catch {
-        // File doesn't exist, remove from DB cache
-        await this.prisma.cachedAsset.delete({
-          where: { cacheKey }
-        });
-      }
-    }
-
-    // Download from S3 if s3Key provided
-    if (s3Key) {
-      const localPath = path.join(basePath, name);
-      await s3Service.downloadToFile(s3Key, localPath);
-      
-      const expiresAt = new Date(Date.now() + this.CACHE_TTL);
-      
-      // Update both caches
-      this.assetCache.set(cacheKey, { localPath, expiresAt });
-      await this.prisma.cachedAsset.create({
-        data: {
-          type,
-          path: localPath,
-          cacheKey,
+  async cleanup(): Promise<void> {
+    try {
+      const expiredAssets = await this.prisma.processedAsset.findMany({
+        where: {
+          type: "asset",
           metadata: {
-            s3Key,
-            expiresAt: expiresAt.toISOString()
-          }
-        }
+            not: {
+              equals: null,
+            },
+          },
+        },
       });
 
-      return localPath;
-    }
-
-    // If no S3 key, check local assets
-    const assetPath = path.join(basePath, name);
-    try {
-      await fs.access(assetPath);
-      return assetPath;
-    } catch (error) {
-      throw new Error(`Asset not found: ${name} (type: ${type})`);
-    }
-  }
-
-  private async cleanupStaleAssets(): Promise<void> {
-    try {
-      const now = new Date();
-
-      // Clean up memory cache
-      for (const [key, cached] of this.assetCache.entries()) {
-        if (cached.expiresAt <= now) {
+      for (const asset of expiredAssets) {
+        const metadata = asset.metadata as unknown as AssetMetadata;
+        if (new Date(metadata.expiresAt) < new Date() && metadata.localPath) {
           try {
-            await fs.unlink(cached.localPath);
+            await fs.unlink(metadata.localPath);
+            await this.prisma.processedAsset.delete({
+              where: { id: asset.id },
+            });
           } catch (error) {
-            logger.warn(`Failed to delete stale asset: ${cached.localPath}`, error);
+            logger.error("Failed to cleanup asset", {
+              assetId: asset.id,
+              path: metadata.localPath,
+              error,
+            });
           }
-          this.assetCache.delete(key);
         }
       }
-
-      // Clean up DB cache
-      const staleAssets = await this.prisma.cachedAsset.findMany({
-        where: {
-          metadata: {
-            path: ['expiresAt'],
-            lt: now.toISOString()
-          }
-        }
-      });
-
-      for (const asset of staleAssets) {
-        try {
-          await fs.unlink(asset.path);
-        } catch (error) {
-          logger.warn(`Failed to delete stale asset: ${asset.path}`, error);
-        }
-      }
-
-      await this.prisma.cachedAsset.deleteMany({
-        where: {
-          metadata: {
-            path: ['expiresAt'],
-            lt: now.toISOString()
-          }
-        }
-      });
-
     } catch (error) {
-      logger.error("Error during stale asset cleanup:", error);
-    }
-  }
-
-  public async stop(): Promise<void> {
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = null;
+      logger.error("Failed to run asset cleanup", { error });
     }
   }
 
@@ -283,4 +243,4 @@ class AssetManager {
   }
 }
 
-export const assetManager = new AssetManager();
+export const assetManager = AssetManager.getInstance();

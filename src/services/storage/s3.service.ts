@@ -2,11 +2,15 @@ import {
   S3Client,
   GetObjectCommand,
   PutObjectCommand,
+  DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { Readable } from "stream";
 import { rateLimiter } from "./rate-limiter";
 import { createReadStream } from "fs";
 import { logger } from "../../utils/logger";
+import * as fs from "fs";
+import { parse as parseUrl } from "url";
+import { Upload } from "@aws-sdk/lib-storage";
 
 const MAX_RETRIES = 5;
 const BASE_DELAY = 1000; // 1 second
@@ -17,17 +21,19 @@ export interface S3ParsedUrl {
   originalUrl: string;
 }
 
+if (!process.env.AWS_REGION || !process.env.AWS_S3_BUCKET) {
+  throw new Error("Required AWS environment variables are not set");
+}
+
 export class S3Service {
-  private s3Client: S3Client;
+  private readonly s3Client: S3Client;
+  private readonly bucket: string;
 
   constructor() {
     this.s3Client = new S3Client({
-      region: process.env.AWS_REGION || "us-east-2",
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-      },
+      region: process.env.AWS_REGION as string,
     });
+    this.bucket = process.env.AWS_S3_BUCKET as string;
   }
 
   private async retryWithBackoff<T>(
@@ -94,56 +100,67 @@ export class S3Service {
     return { bucket, key, originalUrl: url };
   }
 
-  public async downloadFile(url: string): Promise<Buffer> {
-    return this.retryWithBackoff(async () => {
-      try {
-        // If the URL contains X-Amz-Signature, it's a pre-signed URL
-        if (url.includes("X-Amz-")) {
-          const response = await fetch(url);
-          if (!response.ok) {
-            throw new Error(`HTTP error! status: ${response.status}`);
-          }
-          return Buffer.from(await response.arrayBuffer());
-        }
-
-        // Otherwise, use GetObjectCommand for direct S3 paths
-        const { bucket, key } = this.parseUrl(url);
-        console.log("Downloading from S3:", { bucket, key });
-
-        const command = new GetObjectCommand({
-          Bucket: bucket,
-          Key: key,
-        });
-
-        const response = await this.s3Client.send(command);
-
-        if (!response.Body) {
-          throw new Error("No response body from S3");
-        }
-
-        const chunks: Uint8Array[] = [];
-        const stream = response.Body as Readable;
-
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-
-        const buffer = Buffer.concat(chunks);
-
-        if (buffer.length === 0) {
-          throw new Error("Downloaded buffer is empty");
-        }
-
-        return buffer;
-      } catch (error) {
-        console.error("S3 download error:", {
-          url,
-          error: error instanceof Error ? error.message : "Unknown error",
-          stack: error instanceof Error ? error.stack : undefined,
-        });
-        throw error;
+  public getKeyFromUrl(url: string): string | null {
+    try {
+      if (url.startsWith("s3://")) {
+        return url.replace("s3://", "");
       }
-    });
+
+      const urlObj = new URL(url);
+      const pathParts = urlObj.pathname.split("/");
+      return pathParts.slice(1).join("/");
+    } catch (error) {
+      logger.error("Failed to parse S3 URL:", error);
+      return null;
+    }
+  }
+
+  public async deleteFile(s3Key: string): Promise<void> {
+    try {
+      await this.s3Client.send(
+        new DeleteObjectCommand({
+          Bucket: this.bucket,
+          Key: s3Key,
+        })
+      );
+    } catch (error) {
+      logger.error("Failed to delete S3 file:", error);
+      throw error;
+    }
+  }
+
+  public async downloadFile(url: string, localPath: string): Promise<void> {
+    try {
+      const s3Key = this.getKeyFromUrl(url);
+      if (!s3Key) {
+        throw new Error("Invalid S3 URL");
+      }
+
+      const response = await this.s3Client.send(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: s3Key,
+        })
+      );
+
+      if (!response.Body) {
+        throw new Error("Empty response from S3");
+      }
+
+      const writeStream = fs.createWriteStream(localPath);
+      await new Promise<void>((resolve, reject) => {
+        if (response.Body instanceof Readable) {
+          response.Body.pipe(writeStream)
+            .on("finish", () => resolve())
+            .on("error", (err: Error) => reject(err));
+        } else {
+          reject(new Error("Response body is not a readable stream"));
+        }
+      });
+    } catch (error) {
+      logger.error("Failed to download file from S3:", error);
+      throw error;
+    }
   }
 
   public getCleanS3Path(key: string): string {
@@ -197,6 +214,79 @@ export class S3Service {
         throw error;
       }
     });
+  }
+
+  parseS3Url(url: string): { bucket: string; key: string } {
+    const parsed = parseUrl(url);
+    const pathComponents = parsed.pathname?.split("/") || [];
+
+    // Remove empty first element if path starts with /
+    if (pathComponents[0] === "") {
+      pathComponents.shift();
+    }
+
+    return {
+      bucket: parsed.hostname?.split(".")[0] || this.bucket,
+      key: pathComponents.join("/"),
+    };
+  }
+
+  async uploadVideo(localPath: string, s3Key: string): Promise<string> {
+    return this.retryWithBackoff(async () => {
+      try {
+        const fileStream = fs.createReadStream(localPath);
+        const upload = new Upload({
+          client: this.s3Client,
+          params: {
+            Bucket: this.bucket,
+            Key: s3Key,
+            Body: fileStream,
+            ContentType: "video/mp4",
+          },
+        });
+
+        await upload.done();
+        return this.getPublicUrl(s3Key);
+      } catch (error) {
+        logger.error("Failed to upload video", {
+          localPath,
+          s3Key,
+          error,
+        });
+        throw error;
+      }
+    });
+  }
+
+  // Standardize path generation
+  getVideoPath(listingId: string, filename: string): string {
+    return `properties/${listingId}/videos/${filename}`;
+  }
+
+  getRunwayVideoPath(listingId: string, filename: string): string {
+    return `properties/${listingId}/videos/runway/${filename}`;
+  }
+
+  getListingImagePath(userId: string, filename: string): string {
+    const timestamp = Date.now();
+    return `properties/${userId}/listings/${timestamp}-${filename}`;
+  }
+
+  // Remove redundant methods
+  // Deprecate moveFromTempToListing as it's no longer needed
+  /** @deprecated Use direct uploads to final location instead */
+  async moveFromTempToListing(
+    tempKey: string,
+    listingId: string,
+    photoId: string,
+    filename: string
+  ): Promise<string> {
+    logger.info("moveFromTempToListing is deprecated", {
+      tempKey,
+      listingId,
+      photoId,
+    });
+    throw new Error("Method deprecated - use direct uploads instead");
   }
 }
 
