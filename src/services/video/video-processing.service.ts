@@ -37,6 +37,13 @@ export interface VideoClip {
   colorCorrection?: {
     ffmpegFilter: string;
   };
+  watermark?: {
+    path: string;
+    position?: {
+      x: string; // Can be pixels or expressions like "(main_w-overlay_w)/2"
+      y: string; // Can be pixels or expressions like "main_h-overlay_h-20"
+    };
+  };
 }
 
 export interface VideoProcessingOptions {
@@ -104,7 +111,15 @@ export class VideoProcessingService {
     clipPaths: string[],
     durations: number[],
     outputPath: string,
-    template?: ReelTemplate
+    template?: ReelTemplate & {
+      watermark?: {
+        path: string;
+        position?: {
+          x: string;
+          y: string;
+        };
+      };
+    }
   ): Promise<void> {
     if (clipPaths.length === 0) {
       throw new Error("No input files provided");
@@ -131,6 +146,25 @@ export class VideoProcessingService {
       } catch (error) {
         logger.warn("Music file not accessible:", {
           path: template.music.path,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
+    }
+
+    // Add watermark if configured
+    let watermarkIndex = -1;
+    if (template?.watermark?.path) {
+      try {
+        await fsPromises.access(template.watermark.path, fs.constants.R_OK);
+        watermarkIndex = musicIndex !== -1 ? musicIndex + 1 : clipPaths.length;
+        command.input(template.watermark.path);
+        logger.info("Added watermark input:", {
+          path: template.watermark.path,
+          inputIndex: watermarkIndex
+        });
+      } catch (error) {
+        logger.warn("Watermark file not accessible:", {
+          path: template.watermark.path,
           error: error instanceof Error ? error.message : "Unknown error",
         });
       }
@@ -179,8 +213,30 @@ export class VideoProcessingService {
       filter: "concat",
       options: `n=${clipPaths.length}:v=1:a=0`,
       inputs: clipPaths.map((_, i) => `pts${i}`),
-      outputs: ["outv"],
+      outputs: ["concat"],
     });
+
+    // Add watermark if available
+    if (watermarkIndex !== -1) {
+      const position = template?.watermark?.position || {
+        x: "(main_w-overlay_w)/2",
+        y: "main_h-overlay_h-20"
+      };
+      
+      filterCommands.push({
+        filter: "overlay",
+        options: `${position.x}:${position.y}`,
+        inputs: ["concat", `${watermarkIndex}:v`],
+        outputs: ["outv"],
+      });
+    } else {
+      // If no watermark, rename concat output to outv
+      filterCommands.push({
+        filter: "null",
+        inputs: ["concat"],
+        outputs: ["outv"],
+      });
+    }
 
     // Process audio if available
     if (musicIndex !== -1) {
