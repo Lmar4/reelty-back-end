@@ -16,6 +16,7 @@ import { videoProcessingService } from "../video/video-processing.service";
 import path from "path";
 import { S3Client } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
+import { cleanupService } from "../cleanup/cleanup.service";
 
 export interface VideoClip {
   path: string;
@@ -222,6 +223,11 @@ export class ProductionPipeline {
     private readonly resourceManager = new ResourceManager()
   ) {
     this.initializeTempDirectories();
+    
+    // Initialize cleanup service
+    cleanupService.initialize().catch(error => {
+      logger.error("Failed to initialize cleanup service:", error);
+    });
 
     // Check for required AWS environment variables
     const region = process.env.AWS_REGION;
