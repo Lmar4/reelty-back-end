@@ -500,7 +500,74 @@ export class ProductionPipeline {
         existing: _regenerationContext.existingPhotos.length,
       });
 
-      // Process ONLY the photos marked for regeneration
+      // First check for cached videos for all photos
+      const existingVideos = await Promise.all(
+        _regenerationContext.existingPhotos.map(async (photo) => {
+          try {
+            const cacheKey = this.generateCacheKey({
+              type: "runway",
+              inputFiles: [photo.processedFilePath],
+            });
+            const cached = await this.prisma.processedAsset.findFirst({
+              where: {
+                type: "runway",
+                cacheKey,
+                createdAt: { gt: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+              },
+            });
+
+            if (cached?.path) {
+              try {
+                await fs.access(cached.path);
+                logger.info(
+                  `[${jobId}] Found cached Runway video for photo ${photo.id}`
+                );
+                return {
+                  ...photo,
+                  processedFilePath: cached.path,
+                };
+              } catch {
+                await this.prisma.processedAsset.delete({
+                  where: { id: cached.id },
+                });
+              }
+            }
+          } catch (error) {
+            logger.debug(
+              `[${jobId}] No cached video found for photo ${photo.id}`,
+              {
+                error,
+              }
+            );
+          }
+
+          // If no cached video found, process it with Runway
+          logger.info(`[${jobId}] Processing existing photo with Runway`, {
+            id: photo.id,
+            path: photo.processedFilePath,
+          });
+
+          const processedVideo = await this.processImageWithRunway(
+            photo.processedFilePath,
+            photo.order,
+            jobId
+          );
+
+          if (!processedVideo) {
+            logger.error(
+              `[${jobId}] Failed to process existing photo ${photo.id}`
+            );
+            return null;
+          }
+
+          return {
+            ...photo,
+            processedFilePath: processedVideo,
+          };
+        })
+      );
+
+      // Process photos marked for regeneration
       const regeneratedVideos = await Promise.all(
         _regenerationContext.photosToRegenerate.map(async (photo) => {
           logger.info(`[${jobId}] Processing regeneration for photo`, {
@@ -527,15 +594,31 @@ export class ProductionPipeline {
         })
       );
 
-      // Combine regenerated and existing videos
+      // Combine regenerated and existing videos, filtering out nulls
+      const validExistingVideos = existingVideos.filter(
+        (v): v is NonNullable<typeof v> => v !== null
+      );
+      const validRegeneratedVideos = regeneratedVideos.filter(
+        (v): v is NonNullable<typeof v> => v !== null
+      );
+
       const allVideos = [
-        ...regeneratedVideos.filter(
-          (v): v is NonNullable<typeof v> => v !== null
-        ),
-        ..._regenerationContext.existingPhotos,
+        ...validRegeneratedVideos,
+        ...validExistingVideos,
       ].sort((a, b) => (a.order || 0) - (b.order || 0));
 
       const mapVideo = await mapVideoPromise;
+
+      logger.info(`[${jobId}] Combined all videos for template processing`, {
+        existingCount: validExistingVideos.length,
+        regeneratedCount: validRegeneratedVideos.length,
+        totalVideos: allVideos.length,
+        hasMapVideo: !!mapVideo,
+      });
+
+      if (allVideos.length === 0) {
+        throw new Error("No videos were successfully processed");
+      }
 
       return {
         runwayVideos: allVideos.map((v) => v.processedFilePath),
@@ -793,33 +876,139 @@ export class ProductionPipeline {
         throw new Error(`Template configuration not found for ${template}`);
       }
 
-      // Add minimum videos validation only for non-regeneration cases
-      if (!options.isRegeneration && runwayVideos.length < 10) {
+      // For regeneration cases, use the regeneration context if available
+      let totalVideoCount = runwayVideos.length;
+      let existingCount = 0;
+
+      if (options.isRegeneration) {
+        const context = await this.getStoredRunwayResults(options.jobId);
+
+        if (context) {
+          // Use the existing photos count from the context
+          existingCount = context.paths.length;
+          totalVideoCount += existingCount;
+
+          logger.info(`[${options.jobId}] Found existing videos from context`, {
+            regeneratedCount: runwayVideos.length,
+            existingCount,
+            totalCount: totalVideoCount,
+            contextTimestamp: context.timestamp,
+          });
+        } else {
+          // Get one of the photos to find the listing ID
+          const photo = await this.prisma.photo.findFirst({
+            where: { runwayVideoPath: { in: runwayVideos } },
+            select: { listingId: true },
+          });
+
+          if (photo) {
+            // Count existing runway videos for this listing
+            existingCount = await this.prisma.photo.count({
+              where: {
+                listingId: photo.listingId,
+                runwayVideoPath: {
+                  not: null,
+                  notIn: runwayVideos,
+                },
+              },
+            });
+
+            totalVideoCount += existingCount;
+            logger.info(`[${options.jobId}] Found existing runway videos`, {
+              regeneratedCount: runwayVideos.length,
+              existingCount,
+              totalCount: totalVideoCount,
+              listingId: photo.listingId,
+            });
+          }
+        }
+      }
+
+      // Validate minimum video requirement
+      if (totalVideoCount < 10) {
         throw new Error(
-          `Template ${template} requires at least 10 videos. Got ${runwayVideos.length}`
+          `Template ${template} requires at least 10 videos. ` +
+            `Got ${totalVideoCount} total videos ` +
+            `(${runwayVideos.length} new + ${existingCount} existing). ` +
+            `At least 10 videos are required for template ${template}.`
         );
       }
 
-      // Modify sequence adaptation to respect available videos
-      const sequence = templateConfig.sequence.filter((index) => {
-        // Keep string indices (like 'map') and numbers within available range
-        return typeof index === "string" || index < runwayVideos.length;
+      // Only validate accessibility for non-regeneration cases
+      if (!options.isRegeneration) {
+        const validVideos = await Promise.all(
+          runwayVideos.map(async (videoPath) => {
+            try {
+              // Check if video exists in S3
+              if (videoPath.startsWith("http")) {
+                // For S3 URLs, check ProcessedAsset table
+                const cached = await this.prisma.processedAsset.findFirst({
+                  where: {
+                    type: "runway",
+                    path: videoPath,
+                  },
+                });
+                return cached ? videoPath : null;
+              } else {
+                // For local files, check file exists
+                await fs.access(videoPath);
+                return videoPath;
+              }
+            } catch {
+              return null;
+            }
+          })
+        );
+
+        const accessibleVideos = validVideos.filter(
+          (v): v is string => v !== null
+        );
+
+        if (accessibleVideos.length < 10) {
+          throw new Error(
+            `Template ${template} requires at least 10 accessible videos. ` +
+              `Found ${accessibleVideos.length} valid videos out of ${runwayVideos.length} total. ` +
+              `Some videos may be missing from S3 or local storage.`
+          );
+        }
+      }
+
+      // Adapt sequence for available videos
+      const adaptedSequence = templateConfig.sequence.map((index) => {
+        // Keep special indices like 'map'
+        if (typeof index === "string") {
+          return index;
+        }
+        // Use modulo to wrap around available videos
+        return index % runwayVideos.length;
       });
+
+      // Count distribution of indices for logging
+      const indexDistribution = adaptedSequence.reduce((acc, index) => {
+        if (typeof index === "number") {
+          acc[index] = (acc[index] || 0) + 1;
+        }
+        return acc;
+      }, {} as Record<number, number>);
 
       logger.info(`[${options.jobId}] Template sequence`, {
         template,
         originalSequence: templateConfig.sequence,
-        filteredSequence: sequence,
+        adaptedSequence,
         availableVideos: runwayVideos.length,
+        indexDistribution,
       });
 
-      // Validate we have enough indices after filtering
-      if (sequence.length < 5) {
-        // Minimum sequence length for a coherent video
+      // Ensure we have enough unique videos for variety
+      const uniqueIndices = new Set(
+        adaptedSequence.filter((i): i is number => typeof i === "number")
+      );
+
+      if (uniqueIndices.size < Math.min(2, runwayVideos.length)) {
         throw new Error(
-          `Template ${template} requires more valid sequence indices. ` +
-            `After filtering for ${runwayVideos.length} available videos, ` +
-            `only ${sequence.length} valid indices remain.`
+          `Template ${template} requires at least 2 unique video indices ` +
+            `for visual variety. Current sequence uses only ${uniqueIndices.size} ` +
+            `unique indices out of ${runwayVideos.length} available videos.`
         );
       }
 
@@ -1292,6 +1481,9 @@ export class ProductionPipeline {
     _regenerationContext,
     _skipRunway,
   }: ProductionPipelineInput): Promise<string> {
+    let runwayVideos = inputFiles;
+    let mapVideo: string | null = null;
+
     try {
       await this.updateJobProgress(jobId, {
         stage: "runway",
@@ -1311,9 +1503,6 @@ export class ProductionPipeline {
             }
           : undefined,
       });
-
-      let runwayVideos = inputFiles;
-      let mapVideo: string | null = null;
 
       // Process through Runway if not skipping
       if (!_skipRunway) {
@@ -1499,12 +1688,29 @@ export class ProductionPipeline {
         },
       });
 
+      // Clean up runway videos after all processing and DB operations are complete
+      logger.info(`[${jobId}] Cleaning up runway video files`);
+      await this.cleanupClipFiles(runwayVideos);
+
       return successfulTemplates[0];
     } catch (error) {
       logger.error(`[${jobId}] Pipeline execution failed:`, {
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,
       });
+
+      // Clean up runway videos even if there was an error
+      try {
+        logger.info(`[${jobId}] Cleaning up runway video files after error`);
+        await this.cleanupClipFiles(runwayVideos);
+      } catch (cleanupError) {
+        logger.warn(`[${jobId}] Failed to cleanup runway videos after error`, {
+          error:
+            cleanupError instanceof Error
+              ? cleanupError.message
+              : "Unknown error",
+        });
+      }
 
       await this.updateJobStatus(
         jobId,
@@ -1586,17 +1792,18 @@ export class ProductionPipeline {
         );
       }
 
-      // 2. Get ALL photos for this listing, including those not being regenerated
+      // 2. Get ALL photos for this listing
       const allListingPhotos = await this.prisma.photo.findMany({
         where: {
           listingId: listingId,
           processedFilePath: { not: null },
-          // Don't filter by status for regeneration to be more flexible
+          status: "completed",
         },
         select: {
           id: true,
           filePath: true,
           processedFilePath: true,
+          runwayVideoPath: true,
           status: true,
           order: true,
           createdAt: true,
@@ -1604,10 +1811,27 @@ export class ProductionPipeline {
         orderBy: [{ order: "asc" }, { createdAt: "asc" }],
       });
 
+      // Get non-regenerating photos
+      const nonRegeneratingPhotos = allListingPhotos.filter(
+        (p) => !photoIds.includes(p.id)
+      );
+
+      // For non-regenerating photos, we'll use their existing videos
+      const existingVideos = nonRegeneratingPhotos
+        .filter((p) => p.runwayVideoPath)
+        .map((p) => p.runwayVideoPath!);
+
+      logger.info(`[${jobId}] Video availability analysis`, {
+        totalPhotos: allListingPhotos.length,
+        photosToRegenerate: photosToRegenerate.length,
+        existingPhotos: nonRegeneratingPhotos.length,
+        existingVideos: existingVideos.length,
+      });
+
       // Validate processed file paths only for non-regenerating photos
-      const invalidPhotos = allListingPhotos
-        .filter((p) => !photoIds.includes(p.id)) // Only check non-regenerating photos
-        .filter((p) => !p.processedFilePath?.startsWith("http"));
+      const invalidPhotos = nonRegeneratingPhotos.filter(
+        (p) => !p.processedFilePath?.startsWith("http")
+      );
       if (invalidPhotos.length > 0) {
         throw new Error(
           `Invalid processed file paths found for photos: ${invalidPhotos
@@ -1678,9 +1902,7 @@ export class ProductionPipeline {
       // Get job and listing details for coordinates
       const job = await this.prisma.videoJob.findUnique({
         where: { id: jobId },
-        include: {
-          listing: true,
-        },
+        include: { listing: true },
       });
 
       if (!job?.listing) {
