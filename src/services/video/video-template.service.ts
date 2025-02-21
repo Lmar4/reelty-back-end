@@ -212,9 +212,31 @@ export class VideoTemplateService {
       // Only keep indices that are within our available videos
       const hasVideo = index < availableVideos;
       if (!hasVideo) {
-        logger.info("Skipping index due to missing video", { index, availableVideos });
+        logger.info("Skipping out-of-range index", { 
+          index, 
+          availableVideos,
+          template: templateKey
+        });
       }
       return hasVideo;
+    });
+
+    // Track which durations we'll actually use
+    const usedDurations = adaptedSequence.map((_, i) => {
+      // For array-style durations, use the original sequence position
+      if (Array.isArray(template.durations)) {
+        return template.durations[i];
+      }
+      // For object-style durations, use the sequence item itself
+      return template.durations[adaptedSequence[i]];
+    });
+
+    logger.info("Adapted sequence and durations", {
+      originalSequence: template.sequence,
+      adaptedSequence,
+      originalDurations: template.durations,
+      usedDurations,
+      availableVideos
     });
 
     logger.info("Filtered sequence to available videos", {
@@ -254,17 +276,16 @@ export class VideoTemplateService {
       
       // Use exact index from sequence (we've already filtered invalid ones)
       // Get exact duration for this index from template
-      const duration = Array.isArray(template.durations)
-        ? template.durations[i]
-        : template.durations[index];
-
+      // Use the pre-calculated duration that matches our adapted sequence
+      const duration = usedDurations[i];
       if (duration === undefined) {
-        logger.error("Duration not found for index", {
+        logger.error("Duration not found in adapted sequence", {
           index,
           position: i,
-          durations: template.durations,
+          adaptedSequence,
+          usedDurations,
         });
-        throw new Error(`Duration not found for index ${index}`);
+        throw new Error(`Duration not found for adapted sequence position ${i}`);
       }
 
       clips.push({
