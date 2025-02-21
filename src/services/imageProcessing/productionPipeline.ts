@@ -1225,7 +1225,7 @@ export class ProductionPipeline {
   protected async processTemplates(
     runwayVideos: string[],
     jobId: string,
-    templateKeys: TemplateKey[],
+    _templateKeys: TemplateKey[], // Ignored - we'll always use REQUIRED_TEMPLATES
     coordinates?: { lat: number; lng: number },
     preGeneratedMapVideo?: string | null,
     isRegeneration?: boolean
