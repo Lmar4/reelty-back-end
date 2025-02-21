@@ -2093,84 +2093,110 @@ export class ProductionPipeline {
     jobId: string
   ): Promise<string | null> {
     try {
-      // 🔹 Generate a cache key for this map video request
-      const cacheKey = this.generateCacheKey({ type: "map", coordinates });
+      // Generate a deterministic cache key based on coordinates
+      const cacheKey = this.generateCacheKey({ 
+        type: "map", 
+        coordinates: {
+          // Round to 6 decimal places for consistent caching of nearby locations
+          lat: Number(coordinates.lat.toFixed(6)),
+          lng: Number(coordinates.lng.toFixed(6))
+        }
+      });
 
-      // 🔹 Check if a cached map video exists
+      // Check DB cache first
       const cached = await this.prisma.processedAsset.findFirst({
         where: {
           type: "map",
           cacheKey,
-          createdAt: { gt: new Date(Date.now() - 24 * 60 * 60 * 1000) }, // 24-hour cache
+          // Keep map videos cached for 7 days
+          createdAt: { gt: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
         },
+        orderBy: {
+          createdAt: 'desc'
+        }
       });
 
       if (cached) {
-        // Verify the file actually exists on disk
+        // For S3 paths, no need to check file existence
+        if (cached.path.startsWith('http') || cached.path.startsWith('s3://')) {
+          logger.info(`[${jobId}] Using cached map video from S3: ${cached.path}`);
+          return cached.path;
+        }
+
+        // For local files, verify existence
         try {
           await fs.access(cached.path);
-          logger.info(`[${jobId}] Using cached map video: ${cached.path}`);
+          logger.info(`[${jobId}] Using cached map video from disk: ${cached.path}`);
           return cached.path;
         } catch (error) {
-          logger.warn(
-            `[${jobId}] Cached map video file not found on disk, removing from cache`,
-            {
-              path: cached.path,
-              error,
-            }
-          );
-          // Remove the invalid cache entry
+          logger.warn(`[${jobId}] Cached map video not found, will regenerate`, {
+            path: cached.path,
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+          
+          // Remove invalid cache entry
           await this.prisma.processedAsset.delete({
             where: { id: cached.id },
           });
         }
-      } else {
-        logger.warn(
-          `[${jobId}] No cached map video found, generating a new one.`
-        );
       }
 
-      // 🔹 Generate a new map video
+      logger.info(`[${jobId}] Generating new map video for coordinates`, {
+        lat: coordinates.lat,
+        lng: coordinates.lng,
+        cacheKey
+      });
+
+      // Generate new map video with retries
       const mapVideo = await this.withRetry(
-        () => mapCaptureService.generateMapVideo(coordinates, jobId),
+        async () => {
+          const video = await mapCaptureService.generateMapVideo(coordinates, jobId);
+          if (!video) throw new Error("Map video generation returned null");
+          return video;
+        },
         this.MAX_RETRIES
       );
 
-      if (!mapVideo) {
-        throw new Error("Map video generation failed");
+      // Upload to S3 if configured
+      let finalPath = mapVideo;
+      if (process.env.UPLOAD_MAPS_TO_S3 === 'true') {
+        try {
+          const s3Key = `maps/${jobId}/${path.basename(mapVideo)}`;
+          const s3Url = await this.uploadToS3(mapVideo, s3Key);
+          finalPath = s3Url;
+          
+          // Clean up local file after successful S3 upload
+          await fs.unlink(mapVideo);
+        } catch (error) {
+          logger.warn(`[${jobId}] Failed to upload map video to S3, using local path`, {
+            error: error instanceof Error ? error.message : 'Unknown error'
+          });
+        }
       }
 
-      // Verify the newly generated file exists
-      try {
-        await fs.access(mapVideo);
-      } catch (error) {
-        logger.error(`[${jobId}] Generated map video file not found on disk`, {
-          path: mapVideo,
-          error,
-        });
-        throw new Error("Generated map video file not found");
+      // Track for cleanup if keeping locally
+      if (finalPath === mapVideo) {
+        await this.resourceManager.trackResource(mapVideo);
       }
 
-      await this.resourceManager.trackResource(mapVideo);
-
-      // 🔹 Store the newly generated map video in cache
+      // Cache the result
       await this.prisma.processedAsset.create({
         data: {
           type: "map",
-          path: mapVideo,
+          path: finalPath,
           cacheKey,
-          hash: require("crypto")
-            .createHash("md5")
-            .update(mapVideo)
-            .digest("hex"),
+          hash: require("crypto").createHash("md5").update(finalPath).digest("hex"),
           metadata: {
             coordinates,
             timestamp: Date.now(),
+            jobId,
+            originalPath: mapVideo,
+            isS3: finalPath.startsWith('http') || finalPath.startsWith('s3://')
           },
         },
       });
 
-      return mapVideo;
+      return finalPath;
     } catch (error) {
       logger.error(`[${jobId}] Map video generation failed:`, error);
       return null;
