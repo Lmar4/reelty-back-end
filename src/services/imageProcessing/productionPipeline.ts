@@ -1985,7 +1985,7 @@ export class ProductionPipeline {
           _skipRunway: false,
         });
 
-        // 8. Update job with results
+        // 8. Update job with detailed results
         await this.prisma.videoJob.update({
           where: { id: jobId },
           data: {
@@ -2002,6 +2002,18 @@ export class ProductionPipeline {
                   id: p.id,
                   order: p.order,
                 })),
+                regeneratedSegments: photosToRegenerate.map(p => ({
+                  id: p.id,
+                  order: p.order,
+                  originalPath: p.processedFilePath,
+                  newPath: outputPath
+                })),
+                reusedSegments: nonRegeneratingPhotos.map(p => ({
+                  id: p.id,
+                  order: p.order,
+                  path: p.runwayVideoPath
+                })),
+                processingTime: Date.now() - startTime,
               },
             } satisfies Prisma.InputJsonValue,
           },
