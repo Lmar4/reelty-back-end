@@ -29,6 +29,14 @@ interface MusicConfig {
   startTime?: number;
 }
 
+interface WatermarkConfig {
+  path: string;
+  position?: {
+    x: string; // Can be pixels or expressions like "(main_w-overlay_w)/2"
+    y: string; // Can be pixels or expressions like "main_h-overlay_h-20"
+  };
+}
+
 export class VideoTemplateService {
   private static instance: VideoTemplateService;
 
@@ -46,16 +54,18 @@ export class VideoTemplateService {
    * @param musicPath - The original music path from the template
    * @returns The resolved absolute path if found, null otherwise
    */
-  private async resolveMusicPath(musicPath: string): Promise<string | null> {
+  private async resolveAssetPath(assetPath: string, type: 'music' | 'watermark'): Promise<string | null> {
     // Define possible locations to check
-    const possiblePaths = [
-      path.join(process.cwd(), "public", musicPath),
-      path.join(process.cwd(), musicPath),
-      path.join(process.cwd(), "assets", "music", path.basename(musicPath)),
-      path.join(__dirname, "../../../public", musicPath),
-      path.join(__dirname, "../../../", musicPath),
-      path.join(__dirname, "../../../assets/music", path.basename(musicPath)),
+    const basePaths = [
+      path.join(process.cwd(), "public"),
+      process.cwd(),
+      path.join(process.cwd(), "assets", type),
+      path.join(__dirname, "../../../public"),
+      path.join(__dirname, "../../../"),
+      path.join(__dirname, `../../../assets/${type}`),
     ];
+
+    const possiblePaths = basePaths.map(base => path.join(base, path.basename(assetPath)));
 
     logger.info("Checking possible music file locations", {
       originalPath: musicPath,
@@ -123,7 +133,10 @@ export class VideoTemplateService {
   public async createTemplate(
     templateKey: TemplateKey,
     inputVideos: string[],
-    mapVideoPath?: string
+    mapVideoPath?: string,
+    options?: {
+      watermark?: boolean;
+    }
   ): Promise<VideoClip[]> {
     logger.info("Creating template", {
       templateKey,
@@ -158,8 +171,9 @@ export class VideoTemplateService {
 
     // Resolve music path if present
     if (template.music?.path) {
-      const resolvedMusicPath = await this.resolveMusicPath(
-        template.music.path
+      const resolvedMusicPath = await this.resolveAssetPath(
+        template.music.path,
+        'music'
       );
       if (resolvedMusicPath) {
         template.music.path = resolvedMusicPath;
@@ -175,6 +189,30 @@ export class VideoTemplateService {
         logger.warn("No valid music file found, proceeding without music", {
           originalPath: template.music.path,
         });
+      }
+    }
+
+    // Handle watermark if needed
+    let watermarkConfig: WatermarkConfig | undefined;
+    if (options?.watermark) {
+      const watermarkPath = await this.resolveAssetPath(
+        'reelty_watermark.png',
+        'watermark'
+      );
+      
+      if (watermarkPath) {
+        watermarkConfig = {
+          path: watermarkPath,
+          position: {
+            x: "(main_w-overlay_w)/2",
+            y: "main_h-overlay_h-20"
+          }
+        };
+        logger.info("Watermark resolved and will be applied", {
+          path: watermarkPath
+        });
+      } else {
+        logger.warn("Watermark requested but file not found");
       }
     }
 

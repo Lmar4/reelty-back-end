@@ -1128,7 +1128,10 @@ export class ProductionPipeline {
         clips.map((clip) => clip.path),
         clips.map((clip) => clip.duration),
         outputPath,
-        templateConfig // Pass the full template configuration for music
+        {
+          ...templateConfig,
+          watermark: watermarkConfig
+        }
       );
 
       // Upload the stitched video to S3
