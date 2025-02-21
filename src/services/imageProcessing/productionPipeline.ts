@@ -42,12 +42,15 @@ type VideoJobWithRelations = VideoJob & {
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",
-  "wave",
+  "wave", 
   "storyteller",
   "googlezoomintro",
   "wesanderson",
-  "hyperpop",
-];
+  "hyperpop"
+] as const;
+
+// Ensure ALL_TEMPLATES includes all required templates
+const REQUIRED_TEMPLATES = ALL_TEMPLATES;
 
 // Type assertion to ensure ALL_TEMPLATES includes all TemplateKey values
 type ValidateTemplates = (typeof ALL_TEMPLATES)[number] extends TemplateKey
@@ -1316,15 +1319,43 @@ export class ProductionPipeline {
       }
     }
 
-    // Get available templates based on user's tier
-    const availableTemplates = await this.getAvailableTemplates(
-      jobId,
-      templateKeys
+    // Always use all required templates
+    const templateResults: (string | null)[] = [];
+    
+    // Process each required template, continuing even if some fail
+    for (const template of REQUIRED_TEMPLATES) {
+      try {
+        const result = await this.processTemplate(
+          template,
+          runwayVideos,
+          {
+            jobId,
+            coordinates,
+            cacheEnabled: !isRegeneration,
+            preGeneratedMapVideo: templateMapVideo,
+            isRegeneration: isRegeneration || false,
+          }
+        );
+
+        if (result.status === "SUCCESS" && result.outputPath) {
+          templateResults.push(result.outputPath);
+        } else {
+          logger.error(`[${jobId}] Template ${template} failed:`, result.error);
+          templateResults.push(null);
+        }
+      } catch (error) {
+        logger.error(`[${jobId}] Template ${template} processing failed:`, error);
+        templateResults.push(null);
+      }
+    }
+
+    // Filter out failed templates
+    const successfulTemplates = templateResults.filter((path): path is string => 
+      typeof path === "string" && path.length > 0
     );
 
-    if (availableTemplates.length === 0) {
-      logger.warn(`[${jobId}] No available templates for processing`);
-      return [];
+    if (successfulTemplates.length === 0) {
+      throw new Error("All template processing attempts failed");
     }
 
     // Filter out templates that require map video if it's not available
