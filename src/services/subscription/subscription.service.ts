@@ -4,6 +4,7 @@ import {
   User,
   SubscriptionStatus,
   Prisma,
+  SubscriptionTierId,
 } from "@prisma/client";
 import { plansService } from "../stripe/plans.service";
 import { logger } from "../../utils/logger";
@@ -15,6 +16,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
 });
 
 export interface CreateSubscriptionTierInput {
+  tierId: SubscriptionTierId;
   name: string;
   description: string;
   monthlyPrice: number;
@@ -52,17 +54,8 @@ export class SubscriptionService {
       // First create a Stripe product and price
       const { product, price } = await plansService.syncPlan(
         {
-          name: input.name,
-          description: input.description,
-          monthlyPrice: input.monthlyPrice,
-          planType: input.planType,
-          features: input.features,
-          creditsPerInterval: input.creditsPerInterval,
-          hasWatermark: input.hasWatermark,
-          maxPhotosPerListing: input.maxPhotosPerListing,
-          maxReelDownloads: input.maxReelDownloads,
-          maxActiveListings: input.maxActiveListings,
-          premiumTemplatesEnabled: input.premiumTemplatesEnabled,
+          ...input,
+          tierId: undefined, // Remove tierId from the sync data
         },
         {
           features: input.features,
@@ -79,6 +72,7 @@ export class SubscriptionService {
       // Then create the subscription tier with Stripe IDs
       const tier = await prisma.subscriptionTier.create({
         data: {
+          tierId: input.tierId,
           name: input.name,
           description: input.description,
           monthlyPrice: input.monthlyPrice,
@@ -125,7 +119,8 @@ export class SubscriptionService {
 
       if (tier) {
         // Sync updated tier with Stripe
-        await plansService.syncPlan(tier, {
+        const { tierId, ...tierData } = tier;
+        await plansService.syncPlan(tierData, {
           features: tier.features,
           maxListings: tier.maxActiveListings,
           maxPhotosPerListing: tier.maxPhotosPerListing,
@@ -235,7 +230,7 @@ export class SubscriptionService {
       return await prisma.user.update({
         where: { id: userId },
         data: {
-          currentTierId: tierId,
+          currentTierId: tier.tierId,
           subscriptionStatus: SubscriptionStatus.ACTIVE,
         },
       });
