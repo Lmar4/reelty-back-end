@@ -4,19 +4,9 @@ import { s3Service } from "../storage/s3.service";
 import { imageProcessor } from "../imageProcessing/image.service";
 import * as fs from "fs/promises";
 import { logger } from "../../utils/logger";
-
-// Our custom constraints on the SDK types
-type RunwayModel = "gen3a_turbo";
-type RunwayRatio = "768:1280";
-type RunwayDuration = 5 | 10;
-
-interface ImageToVideoCreateParams {
-  model: RunwayModel;
-  promptImage: string;
-  promptText: string;
-  duration: RunwayDuration;
-  ratio: RunwayRatio;
-}
+import { Upload } from "@aws-sdk/lib-storage";
+import { S3Client } from "@aws-sdk/client-s3";
+import { Readable } from "stream";
 
 // Retry configuration
 const RETRY_CONFIG = {
@@ -31,9 +21,24 @@ interface RunwayError {
   message?: string;
 }
 
+type TaskStatus =
+  | "RUNNING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "PENDING"
+  | "CANCELLED"
+  | "TIMEOUT"; // We'll keep this custom status for our internal use
+
+interface TaskStatusResponse {
+  status: TaskStatus;
+  error?: string;
+  progress?: number;
+}
+
 export class RunwayService {
   private static instance: RunwayService;
   private client: RunwayML;
+  private s3Client: S3Client;
 
   private constructor(apiKey: string) {
     if (!apiKey) throw new Error("RunwayML API key is required");
@@ -41,6 +46,14 @@ export class RunwayService {
       apiKey,
       maxRetries: RETRY_CONFIG.maxRetries,
       timeout: 60000, // 1 minute timeout
+    });
+
+    this.s3Client = new S3Client({
+      region: process.env.AWS_REGION || "us-east-2",
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+      },
     });
   }
 
@@ -129,8 +142,8 @@ export class RunwayService {
 
       // Poll for completion
       const status = await this.pollTaskStatus(taskId);
-      if (status !== "SUCCEEDED") {
-        throw new Error(`Video generation was ${status.toLowerCase()}`);
+      if (status.status !== "SUCCEEDED") {
+        throw new Error(`Video generation was ${status.status.toLowerCase()}`);
       }
 
       // Download result with retry
@@ -204,9 +217,10 @@ export class RunwayService {
     }
   }
 
-  private async pollTaskStatus(taskId: string): Promise<string> {
+  private async pollTaskStatus(taskId: string): Promise<TaskStatusResponse> {
     let attempts = 0;
     const maxAttempts = 30; // 5 minutes maximum (10 second intervals * 30)
+    const NON_RETRYABLE_STATUSES = [400, 401, 403, 404];
 
     while (attempts < maxAttempts) {
       await new Promise((resolve) => setTimeout(resolve, 10000));
@@ -225,30 +239,87 @@ export class RunwayService {
           maxAttempts,
         });
 
-        switch (task.status) {
-          case "FAILED":
-            throw new Error(task.failure || "Video generation failed");
-          case "CANCELLED":
-            throw new Error("Video generation was cancelled");
-          case "THROTTLED":
-            throw new Error("Video generation was throttled");
-          case "SUCCEEDED":
-            return task.status;
+        const status = task.status as TaskStatus;
+
+        if (status === "SUCCEEDED") {
+          return { status, progress: 100 };
+        }
+
+        if (status === "FAILED" || status === "CANCELLED") {
+          return {
+            status,
+            error: task.failure || `Task ${status}`,
+            progress: 0,
+          };
+        }
+
+        if (status === "TIMEOUT") {
+          logger.error("Task timed out:", {
+            taskId,
+            attempt: attempts,
+          });
+          throw new Error("Video generation timed out");
+        }
+
+        if (status === "RUNNING") {
+          logger.info("Task in progress:", {
+            taskId,
+            status: task.status,
+            attempt: attempts,
+          });
         }
       } catch (error) {
-        if (!this.isRetryableError(error)) {
+        const runwayError = error as RunwayError;
+
+        // Check for non-retryable errors
+        if (
+          runwayError.status &&
+          NON_RETRYABLE_STATUSES.includes(runwayError.status)
+        ) {
+          logger.error("Non-retryable error encountered:", {
+            taskId,
+            status: runwayError.status,
+            message: runwayError.message,
+            attempt: attempts,
+          });
+          throw new Error(
+            `Non-retryable error: ${runwayError.message || "Unknown error"}`
+          );
+        }
+
+        // For retryable errors, check if we should continue
+        if (!this.isRetryableError(error) || attempts >= maxAttempts) {
+          logger.error("Max retries reached or non-retryable error:", {
+            taskId,
+            error: error instanceof Error ? error.message : "Unknown error",
+            attempt: attempts,
+            maxAttempts,
+          });
           throw error;
         }
-        // For retryable errors, continue polling
-        logger.warn("Task status check failed, continuing polling:", {
-          error: error instanceof Error ? error.message : "Unknown error",
+
+        // Calculate backoff for retryable errors
+        const backoffTime = this.calculateBackoff(attempts);
+        logger.warn("Retryable error encountered, retrying:", {
           taskId,
+          error: error instanceof Error ? error.message : "Unknown error",
           attempt: attempts,
+          nextAttemptIn: backoffTime,
         });
+
+        await new Promise((resolve) => setTimeout(resolve, backoffTime));
       }
     }
 
-    throw new Error("Video generation timed out after 5 minutes");
+    const timeoutError = new Error(
+      "Video generation timed out after 5 minutes"
+    );
+    logger.error("Task timeout:", {
+      taskId,
+      attempts,
+      maxAttempts,
+    });
+    throw timeoutError;
   }
 
   private async downloadResult(
@@ -264,17 +335,40 @@ export class RunwayService {
     if (!videoResponse.ok)
       throw new Error(`Download failed: ${videoResponse.statusText}`);
 
-    const tempFile = await tempFileManager.createTempPath(
-      `segment_${index}.mp4`
-    );
-    const videoBuffer = Buffer.from(await videoResponse.arrayBuffer());
-    await tempFileManager.writeFile(tempFile, videoBuffer);
-
     const s3Key = `properties/${listingId}/videos/runway/${jobId}/segment_${index}.mp4`;
-    await s3Service.uploadFile(videoBuffer, s3Key);
-    logger.info("Video saved:", { taskId, localPath: tempFile.path, s3Key });
+    const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
 
-    return tempFile.path;
+    try {
+      // Create a readable stream from the response body
+      const stream = Readable.from(videoResponse.body as ReadableStream);
+
+      // Upload directly to S3 using multipart upload
+      const upload = new Upload({
+        client: this.s3Client,
+        params: {
+          Bucket: bucket,
+          Key: s3Key,
+          Body: stream,
+          ContentType: "video/mp4",
+        },
+      });
+
+      await upload.done();
+
+      const s3Url = `https://${bucket}.s3.${
+        process.env.AWS_REGION || "us-east-2"
+      }.amazonaws.com/${s3Key}`;
+      logger.info("Video uploaded to S3:", { taskId, s3Key, s3Url });
+
+      return s3Url;
+    } catch (error) {
+      logger.error("Failed to upload video to S3:", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        taskId,
+        s3Key,
+      });
+      throw error;
+    }
   }
 }
 

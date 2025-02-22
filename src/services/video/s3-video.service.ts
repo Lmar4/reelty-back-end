@@ -202,49 +202,48 @@ export class S3VideoService {
     listingId: string,
     photoId: string
   ): Promise<{ originalUrl: string; webpUrl: string }> {
-    const bucketName = process.env.AWS_BUCKET;
+    const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
     if (!bucketName)
       throw new Error("AWS_BUCKET environment variable is not set");
 
     try {
-      // Extract just the filename without the path
-      const filename = path.basename(tempKey);
-
-      // If the file is already in a user's listings directory, just return the URLs
+      // If already in users/listings, no need to move—just return the URL
       if (tempKey.includes("/users/") && tempKey.includes("/listings/")) {
         const url = this.getPublicUrl(tempKey, bucketName);
-        return {
-          originalUrl: url,
-          webpUrl: url,
-        };
+        logger.info("[S3] Using existing file without move", { tempKey, url });
+        return { originalUrl: url, webpUrl: url };
       }
 
-      // For temp files, move them to the permanent location
-      const originalKey = `properties/${listingId}/images/${photoId}/${filename}`;
-      const webpKey = `properties/${listingId}/images/${photoId}/${filename}`;
-
+      // For truly temporary files (not in users/listings), move as before
+      const filename = path.basename(tempKey);
+      const originalKey = `properties/${listingId}/images/processed/${filename}`; // Simplified path
       logger.info("[S3] Starting file move operation", {
         from: tempKey,
         to: originalKey,
         bucket: bucketName,
-        paths: {
-          tempKey,
-          originalKey,
-          webpKey,
-        },
       });
 
-      // Check if source file exists
-      const exists = await this.checkFileExists(bucketName, tempKey);
-      if (!exists) {
-        logger.error("[S3] Source file not found", {
-          tempKey,
-          bucketName,
-        });
+      // First verify source exists
+      const sourceExists = await this.checkFileExists(bucketName, tempKey);
+      if (!sourceExists) {
+        logger.error("[S3] Source file not found", { tempKey, bucketName });
         throw new Error(`Source file not found: ${tempKey}`);
       }
 
-      // Move original file
+      // Get source file metadata for verification
+      const sourceCommand = new HeadObjectCommand({
+        Bucket: bucketName,
+        Key: tempKey,
+      });
+      const sourceMetadata = await this.s3Client.send(sourceCommand);
+      const sourceSize = sourceMetadata.ContentLength;
+      const sourceETag = sourceMetadata.ETag;
+
+      if (!sourceSize) {
+        throw new Error("Source file is empty");
+      }
+
+      // Copy the file
       await this.s3Client.send(
         new CopyObjectCommand({
           Bucket: bucketName,
@@ -253,26 +252,90 @@ export class S3VideoService {
         })
       );
 
-      // Delete source file after successful copy
-      await this.s3Client.send(
-        new DeleteObjectCommand({
-          Bucket: bucketName,
-          Key: tempKey,
-        })
-      );
+      // Verify the copy was successful
+      const destCommand = new HeadObjectCommand({
+        Bucket: bucketName,
+        Key: originalKey,
+      });
 
-      return {
-        originalUrl: this.getPublicUrl(originalKey, bucketName),
-        webpUrl: this.getPublicUrl(webpKey, bucketName),
-      };
+      try {
+        const destMetadata = await this.s3Client.send(destCommand);
+        const destSize = destMetadata.ContentLength;
+        const destETag = destMetadata.ETag;
+
+        if (!destSize || destSize !== sourceSize) {
+          throw new Error(
+            `Copy size mismatch: source=${sourceSize}, dest=${destSize}`
+          );
+        }
+
+        if (destETag !== sourceETag) {
+          throw new Error(
+            `Copy ETag mismatch: source=${sourceETag}, dest=${destETag}`
+          );
+        }
+
+        logger.info("[S3] Copy verified successfully", {
+          tempKey,
+          originalKey,
+          size: destSize,
+        });
+
+        // Only delete source after successful verification
+        await this.s3Client.send(
+          new DeleteObjectCommand({
+            Bucket: bucketName,
+            Key: tempKey,
+          })
+        );
+
+        const url = this.getPublicUrl(originalKey, bucketName);
+        return { originalUrl: url, webpUrl: url };
+      } catch (verifyError) {
+        // If verification fails, try to clean up the destination
+        try {
+          await this.s3Client.send(
+            new DeleteObjectCommand({
+              Bucket: bucketName,
+              Key: originalKey,
+            })
+          );
+        } catch (cleanupError) {
+          logger.warn("[S3] Failed to cleanup failed copy", {
+            error:
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : "Unknown error",
+            originalKey,
+          });
+        }
+        throw verifyError;
+      }
     } catch (error) {
       logger.error("[S3] Error moving files:", {
         error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
-        bucketName,
         tempKey,
         listingId,
-        photoId,
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error;
+    }
+  }
+
+  public async deleteFile(bucket: string, key: string): Promise<void> {
+    try {
+      const command = new DeleteObjectCommand({
+        Bucket: bucket,
+        Key: key,
+      });
+
+      await this.s3Client.send(command);
+      logger.info("S3 file deleted successfully", { bucket, key });
+    } catch (error) {
+      logger.error("Failed to delete S3 file", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        bucket,
+        key,
       });
       throw error;
     }

@@ -1,20 +1,6 @@
-/**
- * Video Template Service
- *
- * Handles the generation of video content based on predefined templates.
- * Manages template processing, asset integration, and video composition.
- *
- * Features:
- * - Template-based video generation
- * - Asset management (images, maps, music)
- * - Video composition with ffmpeg
- * - Error handling and retry mechanisms
- *
- * @module VideoTemplateService
- */
-
-import * as fs from "fs";
+import { fileURLToPath } from "url";
 import * as path from "path";
+import * as fs from "fs/promises";
 import { logger } from "../../utils/logger";
 import {
   reelTemplates,
@@ -22,25 +8,48 @@ import {
   ReelTemplate,
 } from "../imageProcessing/templates/types";
 import { VideoClip, videoProcessingService } from "./video-processing.service";
+import { AssetManager } from "../assets/asset-manager";
+import { AssetType } from "@prisma/client";
+import { S3VideoService } from "./s3-video.service";
 
-interface MusicConfig {
-  path: string;
-  volume?: number;
-  startTime?: number;
+// Get the directory of the current module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+export interface VideoTemplate {
+  name: string;
+  description?: string;
+  colorCorrection?: {
+    ffmpegFilter: string;
+  };
+  transitions?: {
+    type: "crossfade" | "fade" | "slide";
+    duration: number;
+  }[];
+  reverseClips?: boolean;
+  music?: {
+    path: string;
+    volume?: number;
+    startTime?: number;
+  };
+  outputOptions?: string[];
 }
 
-interface WatermarkConfig {
+export interface WatermarkConfig {
   path: string;
-  position?: {
-    x: string; // Can be pixels or expressions like "(main_w-overlay_w)/2"
-    y: string; // Can be pixels or expressions like "main_h-overlay_h-20"
+  position: {
+    x: string;
+    y: string;
   };
 }
 
 export class VideoTemplateService {
   private static instance: VideoTemplateService;
 
-  private constructor() {}
+  private constructor(
+    private readonly assetManager: AssetManager = AssetManager.getInstance(),
+    private readonly s3VideoService: S3VideoService = S3VideoService.getInstance()
+  ) {}
 
   public static getInstance(): VideoTemplateService {
     if (!VideoTemplateService.instance) {
@@ -50,55 +59,109 @@ export class VideoTemplateService {
   }
 
   /**
-   * Resolves the music file path by checking multiple possible locations
-   * @param musicPath - The original music path from the template
-   * @returns The resolved absolute path if found, null otherwise
+   * Resolves asset paths using AssetManager or falls back to local filesystem
    */
   private async resolveAssetPath(
     assetPath: string,
-    type: "music" | "watermark"
+    type: "music" | "watermark",
+    isRequired: boolean = false
   ): Promise<string | null> {
-    // Define possible locations to check
-    const basePaths = [
-      path.join(process.cwd(), "public"),
-      process.cwd(),
-      path.join(process.cwd(), "assets", type),
-      path.join(__dirname, "../../../public"),
-      path.join(__dirname, "../../../"),
-      path.join(__dirname, `../../../assets/${type}`),
-    ];
+    try {
+      // Map type to AssetType enum
+      const assetType =
+        type === "music" ? AssetType.MUSIC : AssetType.WATERMARK;
+      const assetName = path.basename(assetPath);
 
-    const possiblePaths = basePaths.map((base) =>
-      path.join(base, path.basename(assetPath))
-    );
+      // Use AssetManager to fetch from S3 or local cache
+      const resolvedPath = await this.assetManager.getAssetPath(
+        assetType,
+        assetName
+      );
 
-    logger.info("Checking possible asset file locations", {
-      originalPath: assetPath,
-      searchPaths: possiblePaths,
-    });
+      if (resolvedPath) {
+        // If it's an S3 URL, verify it exists
+        if (resolvedPath.startsWith("https://")) {
+          const { bucket, key } = this.parseS3Url(resolvedPath);
+          const exists = await this.s3VideoService.checkFileExists(bucket, key);
+          if (!exists) {
+            logger.warn("Asset not found in S3", {
+              originalPath: assetPath,
+              resolvedPath,
+              type,
+            });
+            if (isRequired) {
+              throw new Error(
+                `Required ${type} asset not found in S3: ${assetPath}`
+              );
+            }
+            return null;
+          }
+        } else {
+          // If it's a local file, verify it exists
+          try {
+            await fs.access(resolvedPath, fs.constants.R_OK);
+          } catch (error) {
+            logger.warn("Local asset not accessible", {
+              originalPath: assetPath,
+              resolvedPath,
+              type,
+              error: error instanceof Error ? error.message : "Unknown error",
+            });
+            if (isRequired) {
+              throw new Error(
+                `Required ${type} asset not accessible: ${assetPath}`
+              );
+            }
+            return null;
+          }
+        }
 
-    // Try each path in sequence
-    for (const possiblePath of possiblePaths) {
-      try {
-        await fs.promises.access(possiblePath, fs.constants.R_OK);
-        logger.info("Found asset file", {
+        logger.info("Asset resolved and verified", {
           originalPath: assetPath,
-          resolvedPath: possiblePath,
+          resolvedPath,
+          type,
         });
-        return possiblePath;
-      } catch (error) {
-        logger.debug("Asset file not found at path", {
-          path: possiblePath,
-          error: error instanceof Error ? error.message : "Unknown error",
-        });
+        return resolvedPath;
       }
-    }
 
-    logger.warn("Asset file not found in any location", {
-      originalPath: assetPath,
-      searchedPaths: possiblePaths,
-    });
-    return null;
+      // Fallback to local filesystem
+      const localPath = path.join(__dirname, "../../../", assetPath);
+      try {
+        await fs.access(localPath, fs.constants.R_OK);
+        logger.info("Found asset in local filesystem", {
+          originalPath: assetPath,
+          resolvedPath: localPath,
+        });
+        return localPath;
+      } catch (fsError) {
+        logger.error("Failed to resolve asset path", {
+          assetPath,
+          type,
+          fsError: fsError instanceof Error ? fsError.message : "Unknown error",
+        });
+        if (isRequired) {
+          throw new Error(`Required ${type} asset not found: ${assetPath}`);
+        }
+        return null;
+      }
+    } catch (error) {
+      logger.error("Asset resolution failed", {
+        assetPath,
+        type,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      if (isRequired) {
+        throw error;
+      }
+      return null;
+    }
+  }
+
+  private parseS3Url(url: string): { bucket: string; key: string } {
+    const urlObj = new URL(url);
+    const bucket = urlObj.hostname.split(".")[0];
+    const key = urlObj.pathname.slice(1); // Remove leading slash
+    return { bucket, key };
   }
 
   /**
@@ -161,12 +224,10 @@ export class VideoTemplateService {
       throw new Error(`Template ${templateKey} not found`);
     }
 
-    // Validate sequence
+    // Validate sequence and durations
     if (!template.sequence.length) {
       throw new Error("Template sequence cannot be empty");
     }
-
-    // Validate durations
     if (
       !template.durations ||
       (Array.isArray(template.durations) && !template.durations.length)
@@ -174,11 +235,16 @@ export class VideoTemplateService {
       throw new Error("Template must have valid durations");
     }
 
+    // Check if music is required for this template
+    const isMusicRequired =
+      templateKey === "storyteller" || templateKey === "crescendo";
+
     // Resolve music path if present
     if (template.music?.path) {
       const resolvedMusicPath = await this.resolveAssetPath(
         template.music.path,
-        "music"
+        "music",
+        isMusicRequired
       );
       if (resolvedMusicPath) {
         template.music.path = resolvedMusicPath;
@@ -191,42 +257,57 @@ export class VideoTemplateService {
         });
       } else {
         template.music.isValid = false;
+        if (isMusicRequired) {
+          throw new Error(
+            `Required music file not found for template ${templateKey}`
+          );
+        }
         logger.warn("No valid music file found, proceeding without music", {
           originalPath: template.music.path,
+          template: templateKey,
         });
       }
+    } else if (isMusicRequired) {
+      throw new Error(
+        `Music path not specified for template ${templateKey} which requires music`
+      );
     }
 
     // Handle watermark if needed
     let watermarkConfig: WatermarkConfig | undefined;
     if (options?.watermark) {
-      const watermarkPath = await this.resolveAssetPath(
-        "reelty_watermark.png",
-        "watermark"
-      );
-
-      if (watermarkPath) {
-        watermarkConfig = {
-          path: watermarkPath,
-          position: {
-            x: "(main_w-overlay_w)/2",
-            y: "main_h-overlay_h-20",
-          },
-        };
-        logger.info("Watermark resolved and will be applied", {
-          path: watermarkPath,
+      try {
+        const watermarkPath = await this.resolveAssetPath(
+          "reelty_watermark.png",
+          "watermark",
+          true // Watermark is always required if specified
+        );
+        if (watermarkPath) {
+          watermarkConfig = {
+            path: watermarkPath,
+            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-20" },
+          };
+          logger.info("Watermark configured successfully", {
+            path: watermarkPath,
+            template: templateKey,
+          });
+        } else {
+          throw new Error("Watermark file not found");
+        }
+      } catch (error) {
+        logger.error("Failed to configure watermark", {
+          error: error instanceof Error ? error.message : "Unknown error",
+          template: templateKey,
         });
-      } else {
-        logger.warn("Watermark requested but file not found");
+        throw error;
       }
     }
 
-    // Count how many actual video slots we need (excluding map)
+    // Rest of the method remains unchanged...
     const videoSlots = template.sequence.filter((s) => s !== "map").length;
     const availableVideos = inputVideos.length;
     const hasMapRequirement = template.sequence.includes("map");
 
-    // Validate map video requirement
     if (hasMapRequirement && !mapVideoPath) {
       logger.error("Map video required but not provided", { templateKey });
       throw new Error("Map video required but not provided");
@@ -242,17 +323,13 @@ export class VideoTemplateService {
       hasMusic: !!template.music?.isValid,
     });
 
-    // Keep only map markers and indices that exist in our input videos
     const adaptedSequence = template.sequence.filter((item) => {
       if (item === "map") return true;
-
       const index = typeof item === "number" ? item : parseInt(item);
       if (isNaN(index)) {
         logger.warn("Invalid sequence item, skipping", { item });
         return false;
       }
-
-      // Only keep indices that are within our available videos
       const hasVideo = index < availableVideos;
       if (!hasVideo) {
         logger.info("Skipping out-of-range index", {
@@ -264,50 +341,24 @@ export class VideoTemplateService {
       return hasVideo;
     });
 
-    // Track which durations we'll actually use
     const usedDurations = adaptedSequence.map((_, i) => {
-      // For array-style durations, use the original sequence position
       if (Array.isArray(template.durations)) {
         return template.durations[i];
       }
-      // For object-style durations, use the sequence item itself
       return template.durations[adaptedSequence[i]];
     });
 
-    logger.info("Adapted sequence and durations", {
-      originalSequence: template.sequence,
-      adaptedSequence,
-      originalDurations: template.durations,
-      usedDurations,
-      availableVideos,
-    });
-
-    logger.info("Filtered sequence to available videos", {
-      originalLength: template.sequence.length,
-      filteredLength: adaptedSequence.length,
-      sequence: adaptedSequence,
-      availableVideos,
-    });
-
-    // Create clips with proper duration handling
     const clips: VideoClip[] = [];
     for (let i = 0; i < adaptedSequence.length; i++) {
       const sequenceItem = adaptedSequence[i];
 
       if (sequenceItem === "map") {
-        // Get map duration from template
         const mapDuration = Array.isArray(template.durations)
           ? template.durations[i]
           : template.durations["map"];
-
         if (mapDuration === undefined) {
-          logger.error("Map duration not found", {
-            position: i,
-            durations: template.durations,
-          });
           throw new Error(`Duration not found for map video at position ${i}`);
         }
-
         clips.push({
           path: mapVideoPath!,
           duration: mapDuration,
@@ -316,21 +367,9 @@ export class VideoTemplateService {
       }
 
       const index = sequenceItem as number;
-
-      // Use exact index from sequence (we've already filtered invalid ones)
-      // Get exact duration for this index from template
-      // Use the pre-calculated duration that matches our adapted sequence
       const duration = usedDurations[i];
       if (duration === undefined) {
-        logger.error("Duration not found in adapted sequence", {
-          index,
-          position: i,
-          adaptedSequence,
-          usedDurations,
-        });
-        throw new Error(
-          `Duration not found for adapted sequence position ${i}`
-        );
+        throw new Error(`Duration not found for position ${i}`);
       }
 
       clips.push({
@@ -341,12 +380,7 @@ export class VideoTemplateService {
       });
     }
 
-    // Final validation
     if (clips.length !== adaptedSequence.length) {
-      logger.error("Clip count mismatch", {
-        expected: adaptedSequence.length,
-        actual: clips.length,
-      });
       throw new Error("Failed to create all required clips");
     }
 
@@ -358,12 +392,9 @@ export class VideoTemplateService {
       process.env.TEMP_DIR || "./temp",
       `thumbnail-${Date.now()}.webp`
     );
-
-    // Extract frame and convert to WebP format
-    await videoProcessingService.extractFrame(videoPath, outputPath, 1); // Extract frame at 1 second
+    await videoProcessingService.extractFrame(videoPath, outputPath, 1);
     return outputPath;
   }
 }
 
-// Export singleton instance
 export const videoTemplateService = VideoTemplateService.getInstance();
