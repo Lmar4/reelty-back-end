@@ -3,14 +3,14 @@
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
-  "type": "commonjs",
+  "type": "module",
   "prisma": {
     "seed": "ts-node --transpile-only prisma/seed.ts"
   },
   "scripts": {
     "build": "pnpm prisma generate && tsc",
     "start": "node build/server.js",
-    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "dev": "tsx watch src/server.ts",
     "db:generate": "pnpm prisma generate",
     "db:push": "pnpm prisma db push",
     "db:migrate": "pnpm prisma migrate dev",
@@ -20,7 +20,8 @@
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:templates": "ts-node src/scripts/test-templates.ts",
-    "sync-stripe": "ts-node src/scripts/sync-stripe-plans.ts"
+    "sync-stripe": "ts-node src/scripts/sync-stripe-plans.ts",
+    "rerun-job": "ts-node src/scripts/rerunJob.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.744.0",
@@ -56,7 +57,7 @@
     "@googlemaps/js-api-loader": "^1.16.8",
     "@jest/globals": "^29.7.0",
     "@jest/types": "^29.6.3",
-    "@prisma/client": "^6.4.0",
+    "@prisma/client": "^6.4.1",
     "@testing-library/jest-dom": "^6.6.3",
     "@types/aws-lambda": "^8.10.147",
     "@types/cors": "^2.8.17",
@@ -72,11 +73,11 @@
     "eslint-plugin-unused-imports": "^4.1.4",
     "jest": "^29.7.0",
     "jest-mock": "^29.7.0",
-    "prisma": "^6.4.0",
+    "prisma": "^6.4.1",
     "ts-jest": "^29.2.5",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
-    "tsx": "^4.19.2",
+    "tsx": "^4.19.3",
     "typescript": "^5.7.3",
     "uuid": "^11.0.5",
     "zod": "^3.24.1"

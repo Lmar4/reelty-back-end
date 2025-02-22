@@ -148,7 +148,6 @@ model Template {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  // Relations
   subscriptionTiers SubscriptionTier[] @relation("TemplateToSubscriptionTier")
 
   @@map("templates")
