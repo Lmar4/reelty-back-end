@@ -1,8 +1,8 @@
 {
   "compilerOptions": {
     "target": "ES2020", // Set to a modern ECMAScript version
-    "module": "CommonJS", // Changed to CommonJS
-    "moduleResolution": "node", // You can also use 'classic' here
+    "module": "ESNext",
+    "moduleResolution": "node",
     "lib": ["ES2020"], // Include the necessary library features
     "outDir": "./build", // Output directory for compiled files
     "preserveConstEnums": true,
