@@ -161,7 +161,6 @@ const getUser = async (
 ) => {
   try {
     const { userId } = req.params;
-    console.log("1. userId received:", userId);
 
     if (!userId || typeof userId !== "string") {
       logger.error("[Users] Invalid user ID format", { userId });
@@ -174,18 +173,12 @@ const getUser = async (
 
     logger.info("[Users] Fetching user", { userId });
 
-    // Log the query we're about to make
-    console.log("2. Prisma query:", { where: { id: userId } });
-
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
         currentTier: true,
       },
     });
-
-    // Log the result
-    console.log("3. Prisma result:", user);
 
     if (!user) {
       logger.error("[Users] User not found", { userId });
@@ -197,9 +190,6 @@ const getUser = async (
     }
 
     const { password, ...safeUser } = user;
-
-    // Log the response we're sending
-    console.log("4. Sending response:", { success: true, data: safeUser });
 
     res.json({
       success: true,

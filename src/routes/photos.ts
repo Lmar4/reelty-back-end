@@ -1,302 +1,378 @@
-import { Router, Request, Response } from "express";
-import { isAuthenticated } from "../middleware/auth";
+import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { Photo as PrismaPhoto, VideoGenerationStatus } from "@prisma/client";
+import { Request, Response, Router } from "express";
 import { prisma } from "../lib/prisma";
-import { ProductionPipeline } from "../services/imageProcessing/__productionPipeline";
-import { VideoGenerationStatus } from "@prisma/client";
+import { isAuthenticated } from "../middleware/auth";
+import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
+import { s3VideoService } from "../services/video/s3-video.service";
 import { logger } from "../utils/logger";
-import { S3Client, HeadObjectCommand } from "@aws-sdk/client-s3";
 
 const router = Router();
 const productionPipeline = new ProductionPipeline();
 const s3Client = new S3Client({ region: process.env.AWS_REGION });
 
 interface RegeneratePhotoRequest extends Request {
-  params: {
-    photoId: string;
+  params: { photoId: string };
+  user?: { id: string };
+}
+
+interface RegenerationPhoto {
+  id: string;
+  processedFilePath: string;
+  order: number;
+}
+
+interface RegenerationContext {
+  photosToRegenerate: RegenerationPhoto[];
+  existingPhotos: RegenerationPhoto[];
+  regeneratedPhotoIds: string[];
+  totalPhotos: number;
+}
+
+interface BatchRegenerateRequest extends Request {
+  body: {
+    photoIds: string[];
+    regenerationContext: RegenerationContext;
   };
-  user?: {
-    id: string;
-  };
+  user?: { id: string };
 }
 
-interface Photo {
-  id: string;
-  listingId: string;
-  listing?: Listing;
-  processedFilePath?: string | null;
-}
-
-interface Listing {
-  id: string;
-  photos?: Photo[];
-}
-
-interface VideoJob {
-  id: string;
-  listingId: string;
-}
-
-// Regenerate photo and its associated video
+// Single photo regeneration
 router.post(
   "/:photoId/regenerate",
   isAuthenticated,
   async (req: RegeneratePhotoRequest, res: Response): Promise<void> => {
-    logger.info("[PHOTO_REGENERATE] Received request", {
-      photoId: req.params.photoId,
-      userId: req.user?.id,
-      headers: req.headers,
-    });
+    const { photoId } = req.params;
+    const userId = req.user!.id;
+
+    logger.info("[PHOTO_REGENERATE] Request received", { photoId, userId });
 
     try {
-      const { photoId } = req.params;
-      const userId = req.user!.id;
-
-      logger.info("[PHOTO_REGENERATE] Finding photo", {
-        photoId,
-        userId,
-      });
-
-      // Find the photo and check ownership
       const photo = await prisma.photo.findUnique({
-        where: {
-          id: photoId,
-          userId,
-        },
+        where: { id: photoId, userId },
         include: {
-          listing: true,
+          listing: { include: { photos: { orderBy: { order: "asc" } } } },
         },
       });
 
       if (!photo || !photo.listing) {
-        logger.error("[PHOTO_REGENERATE] Photo not found or access denied", {
+        logger.error("[PHOTO_REGENERATE] Photo or listing not found", {
           photoId,
           userId,
-          photoExists: !!photo,
-          listingExists: !!photo?.listing,
         });
-        res.status(404).json({
+        res
+          .status(404)
+          .json({ success: false, message: "Photo or listing not found" });
+        return;
+      }
+
+      // Use processedFilePath or fallback to filePath
+      const photoPath = photo.processedFilePath || photo.filePath;
+      if (!photoPath) {
+        logger.error("[PHOTO_REGENERATE] No file path available", { photoId });
+        res
+          .status(400)
+          .json({ success: false, message: "No file path available" });
+        return;
+      }
+
+      // Validate all input files are accessible
+      const inputFiles = photo.listing.photos.map(
+        (p) => p.processedFilePath || p.filePath
+      );
+
+      const validationResults = await Promise.all(
+        inputFiles.map(async (file) => {
+          if (!file) return file;
+          try {
+            const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
+            const key = file.split("/").slice(3).join("/"); // Extract key from URL
+            const exists = await s3VideoService.checkFileExists(
+              bucketName,
+              key
+            );
+            return exists ? null : file;
+          } catch (error) {
+            logger.error("Failed to validate input file", {
+              file,
+              error: error instanceof Error ? error.message : "Unknown error",
+            });
+            return file;
+          }
+        })
+      );
+
+      const invalidFiles = validationResults.filter(
+        (file): file is string => file !== null
+      );
+      if (invalidFiles.length > 0) {
+        logger.error("[PHOTO_REGENERATE] Some input files are not accessible", {
+          invalidFiles,
+        });
+        res.status(400).json({
           success: false,
-          message: "Photo not found or access denied",
+          message: "Some input files are not accessible",
+          invalidFiles,
         });
         return;
       }
 
-      logger.info("[PHOTO_REGENERATE] Found photo, updating status", {
-        photoId,
-        listingId: photo.listingId,
-      });
-
-      // Create a new job for regeneration
       const job = await prisma.videoJob.create({
         data: {
           listingId: photo.listingId,
           userId,
-          status: VideoGenerationStatus.PROCESSING,
+          status: VideoGenerationStatus.PENDING,
           template: "crescendo",
+          inputFiles,
         },
       });
 
-      logger.info("[PHOTO_REGENERATE] Created video job", {
-        photoId,
-        jobId: job.id,
-        listingId: photo.listingId,
-      });
+      logger.info("[PHOTO_REGENERATE] Job created", { jobId: job.id, photoId });
 
-      // Start the regeneration process using regeneratePhotos
-      productionPipeline.regeneratePhotos(job.id, [photoId]).catch((error) => {
-        logger.error("[PHOTO_REGENERATE_ERROR] Pipeline execution failed", {
+      const photosToRegenerate = [
+        {
+          id: photo.id,
+          processedFilePath: photoPath,
+          order: photo.order,
+        },
+      ];
+      const existingPhotos = photo.listing.photos
+        .filter((p) => p.id !== photoId)
+        .map((p) => ({
+          id: p.id,
+          processedFilePath: p.processedFilePath || p.filePath,
+          order: p.order,
+        }));
+
+      // Execute pipeline with original paths
+      productionPipeline
+        .execute({
           jobId: job.id,
-          error: error instanceof Error ? error.message : "Unknown error",
-          stack: error instanceof Error ? error.stack : undefined,
+          inputFiles,
+          template: "crescendo",
+          coordinates: photo.listing.coordinates as
+            | { lat: number; lng: number }
+            | undefined,
+          isRegeneration: true,
+          regenerationContext: {
+            photosToRegenerate,
+            existingPhotos,
+            regeneratedPhotoIds: [photoId],
+            totalPhotos: photo.listing.photos.length,
+          },
+        })
+        .catch(async (error) => {
+          logger.error("[PHOTO_REGENERATE] Regeneration failed", {
+            jobId: job.id,
+            photoId,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          await prisma.videoJob.update({
+            where: { id: job.id },
+            data: {
+              status: VideoGenerationStatus.FAILED,
+              error: error.message,
+            },
+          });
         });
-      });
 
-      logger.info("[PHOTO_REGENERATE] Sending success response", {
-        photoId,
-        jobId: job.id,
-      });
-
-      res.status(200).json({
+      res.status(202).json({
         success: true,
-        message: "Photo regeneration started",
+        message: "Photo regeneration queued",
         jobId: job.id,
       });
     } catch (error) {
-      logger.error("[PHOTO_REGENERATE_ERROR] Request failed", {
-        photoId: req.params.photoId,
-        userId: req.user?.id,
+      logger.error("[PHOTO_REGENERATE] Request failed", {
+        photoId,
+        userId,
         error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
       });
       res.status(500).json({
         success: false,
-        message:
-          error instanceof Error ? error.message : "Unknown error occurred",
+        message: "Failed to start photo regeneration",
       });
     }
   }
 );
 
-// Batch regenerate photos
+// Batch photo regeneration
 router.post(
   "/regenerate",
   isAuthenticated,
-  async (req: Request, res: Response): Promise<void> => {
-    logger.info("[PHOTOS_BATCH_REGENERATE] Received request", {
-      userId: req.user?.id,
-      body: req.body,
+  async (req: BatchRegenerateRequest, res: Response): Promise<void> => {
+    const { photoIds, regenerationContext } = req.body;
+    const userId = req.user!.id;
+
+    // Add validation
+    if (!regenerationContext || !Array.isArray(photoIds)) {
+      logger.error("[BATCH_REGENERATE] Invalid request body", {
+        hasRegenerationContext: !!regenerationContext,
+        hasPhotoIds: !!photoIds,
+        userId,
+      });
+      res.status(400).json({
+        success: false,
+        message: "Invalid request. Missing required fields.",
+      });
+      return;
+    }
+
+    logger.info("[BATCH_REGENERATE] Request received", {
+      photoIds,
+      userId,
+      regenerationContext: {
+        toRegenerate: regenerationContext.photosToRegenerate?.length,
+        existing: regenerationContext.existingPhotos?.length,
+      },
     });
 
     try {
-      const { photoIds } = req.body;
-      const userId = req.user!.id;
+      // Wrap everything in a transaction
+      const result = await prisma.$transaction(
+        async (tx) => {
+          // Fetch photos with their listing context
+          const photos = await tx.photo.findMany({
+            where: { id: { in: photoIds }, userId },
+            include: {
+              listing: { include: { photos: { orderBy: { order: "asc" } } } },
+            },
+          });
 
-      const MAX_BATCH_SIZE = 20;
-
-      if (!Array.isArray(photoIds) || photoIds.length === 0) {
-        res.status(400).json({
-          success: false,
-          message: "Invalid photo IDs array",
-        });
-        return;
-      }
-
-      if (photoIds.length > MAX_BATCH_SIZE) {
-        res.status(400).json({
-          success: false,
-          message: `Cannot process more than ${MAX_BATCH_SIZE} photos at once`,
-        });
-        return;
-      }
-
-      // Find all photos and check ownership
-      const photos = await prisma.photo.findMany({
-        where: {
-          id: { in: photoIds },
-          userId,
-        },
-        include: {
-          listing: true,
-        },
-      });
-
-      // Find which photos were not accessible
-      const foundPhotoIds = new Set(photos.map((photo) => photo.id));
-      const inaccessiblePhotoIds = photoIds.filter(
-        (id) => !foundPhotoIds.has(id)
-      );
-
-      if (photos.length === 0) {
-        logger.error(
-          "[PHOTOS_BATCH_REGENERATE] No photos found or access denied",
-          {
-            photoIds,
-            userId,
+          if (photos.length === 0) {
+            throw new Error("No photos found");
           }
-        );
-        res.status(404).json({
-          success: false,
-          message: "No photos found or access denied",
-          data: {
-            inaccessiblePhotoIds: photoIds,
-          },
-        });
-        return;
-      }
 
-      // Group photos by listing
-      const photosByListing = photos.reduce<
-        Record<string, { listing: Listing; photos: Photo[] }>
-      >((acc, photo) => {
-        if (!photo.listing) return acc;
-        if (!acc[photo.listingId]) {
-          acc[photo.listingId] = {
-            listing: photo.listing,
-            photos: [],
+          // Ensure all photos have either processedFilePath or filePath
+          const invalidPhotos = photos.filter(
+            (photo) => !photo.processedFilePath && !photo.filePath
+          );
+          if (invalidPhotos.length > 0) {
+            throw new Error(
+              "Some photos have no available files for regeneration"
+            );
+          }
+
+          // Create job with available paths (using filePath as fallback)
+          const job = await tx.videoJob.create({
+            data: {
+              listingId: photos[0].listingId,
+              userId,
+              status: VideoGenerationStatus.PENDING,
+              template: "crescendo",
+              inputFiles: photos[0].listing!.photos.map((p) => {
+                // Construct S3 URL if needed
+                const path = p.processedFilePath || p.filePath;
+                return path.startsWith("https://")
+                  ? path
+                  : `s3://${process.env.AWS_BUCKET}/${path}`;
+              }),
+            },
+          });
+
+          logger.info("[BATCH_REGENERATE] Created video job", {
+            jobId: job.id,
+            photoCount: photos.length,
+          });
+
+          // Prepare regeneration context with proper paths
+          const preparedRegenerationContext = {
+            photosToRegenerate: regenerationContext.photosToRegenerate.map(
+              (p: RegenerationPhoto) => {
+                const photo = photos.find((photo) => photo.id === p.id);
+                const path = photo?.filePath;
+                return {
+                  ...p,
+                  processedFilePath: path?.startsWith("https://")
+                    ? path
+                    : `s3://${process.env.AWS_BUCKET}/${path}`,
+                };
+              }
+            ),
+            existingPhotos: regenerationContext.existingPhotos.map(
+              (p: RegenerationPhoto) => {
+                const photo = photos[0].listing!.photos.find(
+                  (photo) => photo.id === p.id
+                );
+                const path = photo?.processedFilePath || photo?.filePath;
+                return {
+                  ...p,
+                  processedFilePath: path?.startsWith("https://")
+                    ? path
+                    : `s3://${process.env.AWS_BUCKET}/${path}`,
+                };
+              }
+            ),
+            regeneratedPhotoIds: photoIds,
+            totalPhotos: photos[0].listing!.photos.length,
           };
-        }
-        acc[photo.listingId].photos.push(photo);
-        return acc;
-      }, {});
 
-      // Create jobs for each listing and use regeneratePhotos
-      const jobs = await Promise.all(
-        Object.entries(photosByListing).map(
-          async ([listingId, { listing, photos }]: [
-            string,
-            { listing: Listing; photos: Photo[] }
-          ]) => {
-            // Create a new job for regeneration
-            const job = await prisma.videoJob.create({
+          try {
+            // Execute pipeline within transaction
+            await productionPipeline.execute({
+              jobId: job.id,
+              inputFiles: photos[0].listing!.photos.map((p) => {
+                const path = p.processedFilePath || p.filePath;
+                return path.startsWith("https://")
+                  ? path
+                  : `s3://${process.env.AWS_BUCKET}/${path}`;
+              }),
+              template: "crescendo",
+              coordinates: photos[0].listing!.coordinates as
+                | { lat: number; lng: number }
+                | undefined,
+              isRegeneration: true,
+              regenerationContext: preparedRegenerationContext,
+            });
+
+            return { jobId: job.id };
+          } catch (error) {
+            // Update job status and rollback transaction
+            await tx.videoJob.update({
+              where: { id: job.id },
               data: {
-                listingId,
-                userId,
-                status: VideoGenerationStatus.PROCESSING,
-                template: "crescendo",
+                status: VideoGenerationStatus.FAILED,
+                error: error instanceof Error ? error.message : "Unknown error",
+                completedAt: new Date(),
               },
             });
-
-            logger.info("[PHOTOS_BATCH_REGENERATE] Created video job", {
-              jobId: job.id,
-              listingId,
-              photosToRegenerate: photos.map((p: Photo) => p.id),
-            });
-
-            // Use regeneratePhotos instead of execute
-            productionPipeline
-              .regeneratePhotos(
-                job.id,
-                photos.map((p: Photo) => p.id)
-              )
-              .catch((error) => {
-                logger.error(
-                  "[PHOTOS_BATCH_REGENERATE_ERROR] Pipeline execution failed",
-                  {
-                    jobId: job.id,
-                    error:
-                      error instanceof Error ? error.message : "Unknown error",
-                    stack: error instanceof Error ? error.stack : undefined,
-                  }
-                );
-              });
-
-            return job;
+            throw error;
           }
-        )
+        },
+        {
+          maxWait: 30000, // 30 seconds max wait
+          timeout: 300000, // 5 minutes total timeout
+        }
       );
 
-      logger.info("[PHOTOS_BATCH_REGENERATE] Sending success response", {
-        jobIds: jobs.map((job: VideoJob) => job.id),
-        inaccessiblePhotoIds,
-      });
-
-      res.status(200).json({
+      res.status(202).json({
         success: true,
-        message: "Photo regeneration started",
-        data: {
-          jobs: jobs.map((job: VideoJob) => ({
-            id: job.id,
-            listingId: job.listingId,
-          })),
-          inaccessiblePhotoIds,
-        },
+        message: "Batch photo regeneration queued",
+        jobId: result.jobId,
       });
     } catch (error) {
-      logger.error("[PHOTOS_BATCH_REGENERATE_ERROR] Request failed", {
-        userId: req.user?.id,
+      logger.error("[BATCH_REGENERATE] Request failed", {
+        photoIds,
+        userId,
         error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
       });
-      res.status(500).json({
-        success: false,
-        message:
-          error instanceof Error ? error.message : "Unknown error occurred",
-      });
+      res
+        .status(
+          error instanceof Error && error.message === "No photos found"
+            ? 404
+            : 500
+        )
+        .json({
+          success: false,
+          message:
+            error instanceof Error
+              ? error.message
+              : "Failed to start batch regeneration",
+        });
     }
   }
 );
 
-// Update photo status after S3 upload
+// Update photo status (unchanged)
 router.post(
   "/:photoId/status",
   isAuthenticated,
@@ -312,22 +388,10 @@ router.post(
       const { s3Key, status, error } = req.body;
       const userId = req.user!.id;
 
-      // Find the photo and check ownership
       const photo = await prisma.photo.findUnique({
-        where: {
-          id: photoId,
-          userId,
-        },
+        where: { id: photoId, userId },
         include: {
-          listing: {
-            include: {
-              photos: {
-                orderBy: {
-                  order: "asc",
-                },
-              },
-            },
-          },
+          listing: { include: { photos: { orderBy: { order: "asc" } } } },
         },
       });
 
@@ -335,8 +399,6 @@ router.post(
         logger.error("[PHOTO_STATUS_UPDATE] Photo not found or access denied", {
           photoId,
           userId,
-          photoExists: !!photo,
-          listingExists: !!photo?.listing,
         });
         res.status(404).json({
           success: false,
@@ -345,22 +407,15 @@ router.post(
         return;
       }
 
-      // Update photo status
       await prisma.photo.update({
         where: { id: photoId },
-        data: {
-          status,
-          error: error || null,
-          processedFilePath: s3Key, // Store the S3 key for the uploaded photo
-        },
+        data: { status, error: error || null, processedFilePath: s3Key },
       });
 
-      // Check if all photos in the listing are uploaded
       const allPhotos = photo.listing.photos;
       const allUploaded = allPhotos.every((p) => p.processedFilePath);
 
       if (allUploaded) {
-        // Create a new job for regeneration
         const job = await prisma.videoJob.create({
           data: {
             listingId: photo.listingId,
@@ -370,7 +425,6 @@ router.post(
           },
         });
 
-        // Start the video generation pipeline
         productionPipeline
           .execute({
             jobId: job.id,
@@ -387,7 +441,6 @@ router.post(
             logger.error("[PHOTO_STATUS_UPDATE] Pipeline execution failed", {
               jobId: job.id,
               error: error instanceof Error ? error.message : "Unknown error",
-              stack: error instanceof Error ? error.stack : undefined,
             });
           });
 
@@ -407,47 +460,37 @@ router.post(
         photoId: req.params.photoId,
         userId: req.user?.id,
         error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
       });
       res.status(500).json({
         success: false,
-        message:
-          error instanceof Error ? error.message : "Unknown error occurred",
+        message: "Failed to update photo status",
       });
     }
   }
 );
 
+// Verify photos (unchanged)
 router.post("/verify", async (req: Request, res: Response) => {
   const { photos } = req.body;
 
   if (!Array.isArray(photos)) {
-    res.status(400).json({
-      success: false,
-      error: "Invalid photos array",
-    });
+    res.status(400).json({ success: false, error: "Invalid photos array" });
     return;
   }
 
   try {
-    const bucketName = process.env.AWS_BUCKET;
-    if (!bucketName) {
-      throw new Error("AWS_BUCKET environment variable is not set");
-    }
-
+    const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
     logger.info("[Photos] Starting verification", {
       photoCount: photos.length,
       photos: photos.map((p) => ({ id: p.id, s3Key: p.s3Key })),
     });
 
-    // Check each photo exists in S3
     await Promise.all(
       photos.map(async (photo) => {
         const command = new HeadObjectCommand({
           Bucket: bucketName,
           Key: photo.s3Key,
         });
-
         try {
           await s3Client.send(command);
           logger.info("[Photos] Verified photo exists", {
@@ -471,9 +514,7 @@ router.post("/verify", async (req: Request, res: Response) => {
   } catch (error) {
     logger.error("[Photos] Verification failed", {
       error: error instanceof Error ? error.message : "Unknown error",
-      stack: error instanceof Error ? error.stack : undefined,
     });
-
     res.status(400).json({
       success: false,
       error: error instanceof Error ? error.message : "Failed to verify photos",

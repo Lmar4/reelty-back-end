@@ -1,11 +1,15 @@
-import { PrismaClient } from "@prisma/client";
+import {
+  PrismaClient,
+  SubscriptionTierId as PrismaSubscriptionTierId,
+  Prisma,
+} from "@prisma/client";
 import express, { RequestHandler } from "express";
 import Stripe from "stripe";
 import { z } from "zod";
 import {
   getTierNameFromId,
   isValidTierId,
-  SubscriptionTierId,
+  SUBSCRIPTION_TIERS,
 } from "../constants/subscription-tiers";
 import { isAuthenticated } from "../middleware/auth";
 import { validateRequest } from "../middleware/validate";
@@ -75,7 +79,7 @@ const getTiers: RequestHandler = async (_req, res) => {
 
     const tiersWithNames = tiers.map((tier) => ({
       ...tier,
-      name: getTierNameFromId(tier.id as SubscriptionTierId),
+      name: tier.name,
     }));
 
     res.json({
@@ -140,15 +144,13 @@ const updateTier: RequestHandler = async (req, res) => {
 
     // Update user's tier
     const user = await prisma.user.update({
-      where: {
-        id: userId,
-      },
+      where: { id: userId },
       data: {
-        currentTierId: tierId,
+        currentTierId: tier.tierId,
       },
       select: {
         id: true,
-        currentTier: true,
+        currentTierId: true,
       },
     });
 
@@ -157,7 +159,7 @@ const updateTier: RequestHandler = async (req, res) => {
       data: {
         userId: user.id,
         oldTier: currentUser.currentTierId || tierId,
-        newTier: tierId,
+        newTier: tier.tierId,
         reason: "User initiated change",
       },
     });
@@ -166,7 +168,7 @@ const updateTier: RequestHandler = async (req, res) => {
       success: true,
       data: {
         userId: user.id,
-        tier: user.currentTier,
+        tier: user.currentTierId,
       },
     });
   } catch (error) {
@@ -381,7 +383,7 @@ const getCurrentSubscription: RequestHandler = async (req, res) => {
       where: { id: userId },
       select: {
         id: true,
-        currentTier: true,
+        currentTierId: true,
         stripeSubscriptionId: true,
         subscriptionStatus: true,
         subscriptionPeriodEnd: true,
@@ -401,7 +403,7 @@ const getCurrentSubscription: RequestHandler = async (req, res) => {
       success: true,
       data: {
         id: user.stripeSubscriptionId || user.id,
-        plan: user.currentTier?.name || "free",
+        plan: user.currentTierId,
         status: user.subscriptionStatus?.toLowerCase() || "free",
         currentPeriodEnd:
           user.subscriptionPeriodEnd?.toISOString() || new Date().toISOString(),

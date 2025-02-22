@@ -31,7 +31,7 @@ const getAssets: RequestHandler = async (_req, res) => {
   try {
     const assets = await prisma.asset.findMany({
       include: {
-        tier: true,
+        subscriptionTier: true,
       },
     });
 
@@ -53,7 +53,7 @@ const createAsset: RequestHandler = async (req, res) => {
     const asset = await prisma.asset.create({
       data: req.body,
       include: {
-        tier: true,
+        subscriptionTier: true,
       },
     });
 
@@ -77,7 +77,7 @@ const updateAsset: RequestHandler = async (req, res) => {
       where: { id: assetId },
       data: req.body,
       include: {
-        tier: true,
+        subscriptionTier: true,
       },
     });
 
@@ -137,7 +137,11 @@ const deleteAsset: RequestHandler = async (req, res) => {
 // Register routes
 router.get("/assets", getAssets);
 router.post("/assets", validateRequest(assetSchema), createAsset);
-router.patch("/assets/:assetId", validateRequest(assetUpdateSchema), updateAsset);
+router.patch(
+  "/assets/:assetId",
+  validateRequest(assetUpdateSchema),
+  updateAsset
+);
 router.delete("/assets/:assetId", deleteAsset);
 
 export default router;
