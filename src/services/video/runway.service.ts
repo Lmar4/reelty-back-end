@@ -27,12 +27,14 @@ type TaskStatus =
   | "FAILED"
   | "PENDING"
   | "CANCELLED"
-  | "TIMEOUT"; // We'll keep this custom status for our internal use
+  | "TIMEOUT"
+  | "THROTTLED"; // Add THROTTLED status
 
 interface TaskStatusResponse {
   status: TaskStatus;
   error?: string;
   progress?: number;
+  failure?: string; // Add failure field
 }
 
 export class RunwayService {
@@ -221,15 +223,34 @@ export class RunwayService {
     let attempts = 0;
     const maxAttempts = 30; // 5 minutes maximum (10 second intervals * 30)
     const NON_RETRYABLE_STATUSES = [400, 401, 403, 404];
+    const REQUEST_TIMEOUT = 30000; // 30 seconds per request timeout
 
-    while (attempts < maxAttempts) {
-      await new Promise((resolve) => setTimeout(resolve, 10000));
-
-      try {
-        const task = await this.retryWithBackoff(
+    const checkTaskWithTimeout = async (): Promise<TaskStatusResponse> => {
+      return Promise.race([
+        this.retryWithBackoff(
           () => this.client.tasks.retrieve(taskId),
           "Task status check"
-        );
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error("Request timeout")),
+            REQUEST_TIMEOUT
+          )
+        ),
+      ]);
+    };
+
+    while (attempts < maxAttempts) {
+      try {
+        // Wait 10 seconds between checks with timeout
+        await Promise.race([
+          new Promise((resolve) => setTimeout(resolve, 10000)),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Poll interval timeout")), 15000)
+          ),
+        ]);
+
+        const task = await checkTaskWithTimeout();
         attempts++;
 
         logger.info("Task status:", {
@@ -270,6 +291,20 @@ export class RunwayService {
         }
       } catch (error) {
         const runwayError = error as RunwayError;
+        const isTimeout =
+          error instanceof Error &&
+          (error.message === "Request timeout" ||
+            error.message === "Poll interval timeout");
+
+        // Handle timeouts specially
+        if (isTimeout) {
+          logger.warn("Timeout during status check:", {
+            taskId,
+            attempt: attempts,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          continue; // Skip to next attempt
+        }
 
         // Check for non-retryable errors
         if (
@@ -329,7 +364,9 @@ export class RunwayService {
     jobId: string
   ): Promise<string> {
     const task = await this.client.tasks.retrieve(taskId);
-    if (!task.output?.[0]) throw new Error("No video output URL found");
+    if (!Array.isArray(task.output) || task.output.length === 0) {
+      throw new Error("No valid video output from Runway");
+    }
 
     const videoResponse = await fetch(task.output[0]);
     if (!videoResponse.ok)
@@ -338,12 +375,13 @@ export class RunwayService {
     const s3Key = `properties/${listingId}/videos/runway/${jobId}/segment_${index}.mp4`;
     const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
 
-    try {
-      // Create a readable stream from the response body
-      const stream = Readable.from(videoResponse.body as ReadableStream);
+    // Create a readable stream from the response body
+    const stream = Readable.from(videoResponse.body as ReadableStream);
+    let upload: Upload | undefined;
 
+    try {
       // Upload directly to S3 using multipart upload
-      const upload = new Upload({
+      upload = new Upload({
         client: this.s3Client,
         params: {
           Bucket: bucket,
@@ -367,7 +405,28 @@ export class RunwayService {
         taskId,
         s3Key,
       });
+
+      // Attempt to abort the upload if it exists
+      if (upload) {
+        try {
+          await upload.abort();
+          logger.info("Aborted failed upload:", { taskId, s3Key });
+        } catch (abortError) {
+          logger.warn("Failed to abort upload:", {
+            error:
+              abortError instanceof Error
+                ? abortError.message
+                : "Unknown error",
+            taskId,
+            s3Key,
+          });
+        }
+      }
+
       throw error;
+    } finally {
+      // Cleanup stream
+      stream.destroy();
     }
   }
 }
