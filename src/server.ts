@@ -9,7 +9,6 @@ import creditsRouter from "./routes/credits";
 import jobsRouter from "./routes/job";
 import listingsRouter from "./routes/listings";
 import photosRouter from "./routes/photos";
-import queueRouter from "./routes/queue";
 import subscriptionRouter from "./routes/subscription";
 import templatesRouter from "./routes/templates";
 import usersRouter from "./routes/users";
@@ -47,7 +46,6 @@ app.use("/api/templates", templatesRouter);
 app.use("/api/jobs", jobsRouter);
 // Mount all admin routes under /api/admin
 app.use("/api/admin", adminRouter);
-app.use("/api/queue", queueRouter);
 app.use("/api/subscription", subscriptionRouter);
 app.use("/api/credits", creditsRouter);
 
