@@ -21,9 +21,12 @@ export interface S3ParsedUrl {
   originalUrl: string;
 }
 
-if (!process.env.AWS_REGION || !process.env.AWS_S3_BUCKET) {
-  throw new Error("Required AWS environment variables are not set");
+if (!process.env.AWS_REGION) {
+  throw new Error("AWS_REGION environment variable is not set");
 }
+
+// Set AWS_BUCKET with fallback value
+process.env.AWS_BUCKET = process.env.AWS_BUCKET || "reelty-prod-storage";
 
 export class S3Service {
   private readonly s3Client: S3Client;
@@ -131,22 +134,16 @@ export class S3Service {
 
   public async downloadFile(url: string, localPath: string): Promise<void> {
     try {
-      const s3Key = this.getKeyFromUrl(url);
-      if (!s3Key) {
-        throw new Error("Invalid S3 URL");
-      }
-
+      const { bucket, key } = this.parseUrl(url); // Use parseUrl
       const response = await this.s3Client.send(
         new GetObjectCommand({
-          Bucket: this.bucket,
-          Key: s3Key,
+          Bucket: bucket,
+          Key: key,
         })
       );
-
       if (!response.Body) {
         throw new Error("Empty response from S3");
       }
-
       const writeStream = fs.createWriteStream(localPath);
       await new Promise<void>((resolve, reject) => {
         if (response.Body instanceof Readable) {
@@ -157,8 +154,9 @@ export class S3Service {
           reject(new Error("Response body is not a readable stream"));
         }
       });
+      logger.info("File downloaded from S3", { url, localPath });
     } catch (error) {
-      logger.error("Failed to download file from S3:", error);
+      logger.error("Failed to download file from S3:", { error, url });
       throw error;
     }
   }
@@ -267,26 +265,26 @@ export class S3Service {
     return `properties/${listingId}/videos/runway/${filename}`;
   }
 
-  getListingImagePath(userId: string, filename: string): string {
-    const timestamp = Date.now();
-    return `properties/${userId}/listings/${timestamp}-${filename}`;
+  getListingImagePath(listingId: string, filename: string): string {
+    return `users/${listingId}/listings/${filename}`;
   }
 
-  // Remove redundant methods
-  // Deprecate moveFromTempToListing as it's no longer needed
-  /** @deprecated Use direct uploads to final location instead */
-  async moveFromTempToListing(
-    tempKey: string,
+  getListingVideoPath(
     listingId: string,
-    photoId: string,
+    jobId: string,
     filename: string
-  ): Promise<string> {
-    logger.info("moveFromTempToListing is deprecated", {
-      tempKey,
-      listingId,
-      photoId,
-    });
-    throw new Error("Method deprecated - use direct uploads instead");
+  ): string {
+    return `users/${listingId}/videos/runway/${jobId}/${filename}`;
+  }
+
+  getProcessedImagePath(listingId: string, filename: string): string {
+    return `properties/${listingId}/images/processed/${filename}`;
+  }
+
+  // Add a method to get the existing path
+  getExistingPath(url: string): string {
+    const parsed = this.parseS3Url(url);
+    return parsed.key;
   }
 }
 
