@@ -1,6 +1,7 @@
 import { promises as fsPromises } from "fs";
 import sharp from "sharp";
-import path from "path";
+import { logger } from "../../utils/logger";
+import { Logger } from "winston";
 
 export interface CropCoordinates {
   x: number;
@@ -23,6 +24,12 @@ export interface ImageOptimizationOptions {
 }
 
 export class VisionProcessor {
+  private logger: Logger;
+
+  constructor() {
+    this.logger = logger;
+  }
+
   private async validateImage(imagePath: string): Promise<void> {
     try {
       await fsPromises.access(imagePath);
@@ -32,27 +39,65 @@ export class VisionProcessor {
   }
 
   private async calculateImageStats(
-    image: sharp.Sharp,
+    imagePath: string,
     region: CropCoordinates
   ): Promise<ImageStats> {
-    const { data, info } = await image
-      .extract({
-        left: region.x,
-        top: region.y,
-        width: region.width,
-        height: region.height,
-      })
-      .greyscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+    this.logger.info("Calculating stats for region", { region });
 
-    // Calculate edge density using Sobel operator
-    const edges = this.calculateEdgeDensity(data, info.width, info.height);
+    try {
+      // Use a fresh sharp instance to avoid state issues
+      const freshImage = sharp(imagePath);
 
-    // Calculate contrast and brightness
-    const { contrast, brightness } = this.calculateContrastAndBrightness(data);
+      // Validate region dimensions before extraction
+      const metadata = await freshImage.metadata();
+      if (!metadata.width || !metadata.height) {
+        throw new Error("Unable to get image dimensions for stats calculation");
+      }
 
-    return { edges, contrast, brightness };
+      // Double check region bounds
+      if (
+        region.x < 0 ||
+        region.y < 0 ||
+        region.width <= 0 ||
+        region.height <= 0 ||
+        region.x + region.width > metadata.width ||
+        region.y + region.height > metadata.height
+      ) {
+        throw new Error("Invalid region dimensions for stats calculation");
+      }
+
+      const { data, info } = await freshImage
+        .extract({
+          left: region.x,
+          top: region.y,
+          width: region.width,
+          height: region.height,
+        })
+        .greyscale()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+      const edges = this.calculateEdgeDensity(data, info.width, info.height);
+      const { contrast, brightness } =
+        this.calculateContrastAndBrightness(data);
+
+      this.logger.info("Stats calculated successfully", {
+        edges,
+        contrast,
+        brightness,
+        region,
+        dimensions: { width: info.width, height: info.height },
+      });
+
+      return { edges, contrast, brightness };
+    } catch (error) {
+      this.logger.error("Failed to calculate image stats", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        region,
+        imagePath,
+      });
+      throw error;
+    }
   }
 
   private calculateEdgeDensity(
@@ -94,17 +139,29 @@ export class VisionProcessor {
     };
   }
 
-  async analyzeImageForCrop(imagePath: string): Promise<CropCoordinates> {
+  async analyzeImageForCrop(input: string | Buffer): Promise<CropCoordinates> {
     try {
-      await this.validateImage(imagePath);
-      const image = sharp(imagePath);
+      let image: sharp.Sharp;
+
+      if (Buffer.isBuffer(input)) {
+        image = sharp(input);
+      } else {
+        await this.validateImage(input);
+        image = sharp(input);
+      }
+
       const metadata = await image.metadata();
 
       if (!metadata.width || !metadata.height) {
         throw new Error("Unable to get image dimensions");
       }
 
-      // Target 9:16 aspect ratio
+      this.logger.info("Starting image analysis", {
+        width: metadata.width,
+        height: metadata.height,
+        format: metadata.format,
+      });
+
       const targetRatio = 9 / 16;
       const currentRatio = metadata.width / metadata.height;
 
@@ -119,10 +176,21 @@ export class VisionProcessor {
         cropHeight = Math.round(metadata.width / targetRatio);
       }
 
-      // Modified region generation to consider both horizontal and vertical positions
+      // Ensure crop dimensions don't exceed image
+      cropWidth = Math.min(cropWidth, metadata.width);
+      cropHeight = Math.min(cropHeight, metadata.height);
+
+      this.logger.debug("Calculated crop dimensions", {
+        cropWidth,
+        cropHeight,
+        originalWidth: metadata.width,
+        originalHeight: metadata.height,
+      });
+
+      // Generate regions with more conservative steps
       const regions: CropCoordinates[] = [];
-      const horizontalSteps = 5;
-      const verticalSteps = 3; // Add vertical steps
+      const horizontalSteps = 3; // Reduced from 5
+      const verticalSteps = 2; // Reduced from 3
 
       const horizontalStepSize = Math.max(
         1,
@@ -132,6 +200,13 @@ export class VisionProcessor {
         1,
         Math.floor((metadata.height - cropHeight) / verticalSteps)
       );
+
+      this.logger.debug("Region generation parameters", {
+        horizontalStepSize,
+        verticalStepSize,
+        horizontalSteps,
+        verticalSteps,
+      });
 
       // Generate regions by scanning both horizontally and vertically
       for (
@@ -144,25 +219,83 @@ export class VisionProcessor {
           x <= metadata.width - cropWidth;
           x += horizontalStepSize
         ) {
-          regions.push({
+          const region = {
             x,
             y,
             width: cropWidth,
             height: cropHeight,
-          });
+          };
+
+          // Validate region before adding
+          if (
+            x >= 0 &&
+            y >= 0 &&
+            region.width > 0 &&
+            region.height > 0 &&
+            x + region.width <= metadata.width &&
+            y + region.height <= metadata.height
+          ) {
+            regions.push(region);
+          }
         }
       }
 
-      // Analyze each region
-      const analyses = await Promise.all(
-        regions.map((region) => this.calculateImageStats(image, region))
+      this.logger.info("Generated regions for analysis", {
+        regionCount: regions.length,
+      });
+
+      // Analyze each region with error handling
+      const analyses = await Promise.allSettled(
+        regions.map(async (region) => {
+          try {
+            // Extract region
+            const { data, info } = await image
+              .extract({
+                left: region.x,
+                top: region.y,
+                width: region.width,
+                height: region.height,
+              })
+              .greyscale()
+              .raw()
+              .toBuffer({ resolveWithObject: true });
+
+            const edges = this.calculateEdgeDensity(
+              data,
+              info.width,
+              info.height
+            );
+            const { contrast, brightness } =
+              this.calculateContrastAndBrightness(data);
+
+            return { edges, contrast, brightness };
+          } catch (error) {
+            throw new Error(
+              `Failed to analyze region: ${
+                error instanceof Error ? error.message : "Unknown error"
+              }`
+            );
+          }
+        })
       );
+
+      // Filter out rejected promises and get valid results
+      const validAnalyses = analyses
+        .filter(
+          (result): result is PromiseFulfilledResult<ImageStats> =>
+            result.status === "fulfilled"
+        )
+        .map((result) => result.value);
+
+      if (validAnalyses.length === 0) {
+        throw new Error("No valid regions could be analyzed");
+      }
 
       // Find region with highest combined score
       let bestScore = -1;
       let bestRegion = regions[0];
 
-      analyses.forEach((stats, index) => {
+      validAnalyses.forEach((stats, index) => {
         const score =
           stats.edges * 0.5 + stats.contrast * 0.3 + stats.brightness * 0.2;
 
@@ -172,121 +305,47 @@ export class VisionProcessor {
         }
       });
 
+      // Final validation of best region
+      if (
+        bestRegion.x < 0 ||
+        bestRegion.y < 0 ||
+        bestRegion.width <= 0 ||
+        bestRegion.height <= 0 ||
+        bestRegion.x + bestRegion.width > metadata.width ||
+        bestRegion.y + bestRegion.height > metadata.height
+      ) {
+        this.logger.error("Invalid best region coordinates", {
+          bestRegion,
+          metadata,
+        });
+
+        // Fallback to center crop
+        bestRegion = {
+          x: Math.max(0, Math.floor((metadata.width - cropWidth) / 2)),
+          y: Math.max(0, Math.floor((metadata.height - cropHeight) / 2)),
+          width: cropWidth,
+          height: cropHeight,
+        };
+
+        this.logger.info("Using fallback center crop", { bestRegion });
+      }
+
+      this.logger.debug("Final crop coordinates", {
+        bestRegion,
+        score: bestScore,
+      });
+
       return bestRegion;
     } catch (error) {
+      this.logger.error("Failed to analyze image", {
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
       throw new Error(
         `Failed to analyze image: ${
           error instanceof Error ? error.message : "Unknown error"
         }`
       );
     }
-  }
-
-  /**
-   * Converts an image to WebP format with optimization
-   * @param inputPath Path to the input image
-   * @param outputPath Optional custom output path. If not provided, will use same name with .webp extension
-   * @param options Optimization options for the conversion
-   * @returns Path to the converted WebP image
-   */
-  async convertToWebP(
-    inputPath: string,
-    outputPath?: string,
-    options: ImageOptimizationOptions = {}
-  ): Promise<string> {
-    try {
-      await this.validateImage(inputPath);
-
-      const finalOutputPath = outputPath || this.generateWebPPath(inputPath);
-
-      let imageProcess = sharp(inputPath);
-
-      // Apply resizing if dimensions are provided
-      if (options.width || options.height) {
-        imageProcess = imageProcess.resize({
-          width: options.width,
-          height: options.height,
-          fit: options.fit || "cover",
-          withoutEnlargement: true,
-        });
-      }
-
-      // Convert to WebP with quality setting
-      await imageProcess
-        .webp({
-          quality: options.quality || 80,
-          effort: 6, // Higher compression effort
-        })
-        .toFile(finalOutputPath);
-
-      return finalOutputPath;
-    } catch (error) {
-      throw new Error(
-        `Failed to convert image to WebP: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`
-      );
-    }
-  }
-
-  /**
-   * Batch converts multiple images to WebP format
-   * @param inputPaths Array of paths to input images
-   * @param options Optimization options for the conversion
-   * @returns Array of paths to the converted WebP images
-   */
-  async batchConvertToWebP(
-    inputPaths: string[],
-    options: ImageOptimizationOptions = {}
-  ): Promise<string[]> {
-    try {
-      const conversionPromises = inputPaths.map((inputPath) =>
-        this.convertToWebP(inputPath, undefined, options)
-      );
-
-      return await Promise.all(conversionPromises);
-    } catch (error) {
-      throw new Error(
-        `Failed to batch convert images to WebP: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`
-      );
-    }
-  }
-
-  private generateWebPPath(inputPath: string): string {
-    const parsedPath = path.parse(inputPath);
-    return path.join(parsedPath.dir, `${parsedPath.name}.webp`);
-  }
-
-  async convertBufferToWebP(
-    buffer: Buffer,
-    options: {
-      quality?: number;
-      width?: number;
-      height?: number;
-      fit?: "cover" | "contain" | "fill" | "inside" | "outside";
-    }
-  ): Promise<Buffer> {
-    let imageProcess = sharp(buffer);
-
-    // Apply resizing if dimensions are provided
-    if (options.width || options.height) {
-      imageProcess = imageProcess.resize({
-        width: options.width,
-        height: options.height,
-        fit: options.fit || "cover",
-        withoutEnlargement: true,
-      });
-    }
-
-    // Convert to WebP with quality setting
-    return imageProcess
-      .webp({
-        quality: options.quality || 80,
-        effort: 6, // Higher compression effort
-      })
-      .toBuffer();
   }
 
   /**
