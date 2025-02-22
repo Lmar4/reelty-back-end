@@ -8,6 +8,8 @@ import { imageProcessor } from "../imageProcessing/image.service";
 import { runwayService } from "../video/runway.service";
 import path from "path";
 import fs from "fs";
+import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { Readable } from "stream";
 
 export class AssetCacheManager {
   private static instance: AssetCacheManager;
@@ -16,6 +18,7 @@ export class AssetCacheManager {
     Map<CacheKey, CacheEntry<ProcessingPromise<any>>>
   > = new Map();
   private readonly CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
+  private s3Client: S3Client;
 
   private constructor() {
     // Initialize separate caches for different asset types
@@ -23,6 +26,15 @@ export class AssetCacheManager {
     this.caches.set("processed-images", new Map());
     this.caches.set("video-segments", new Map());
     this.caches.set("templates", new Map());
+
+    // Initialize S3 client
+    this.s3Client = new S3Client({
+      region: process.env.AWS_REGION || "us-east-2",
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+      },
+    });
   }
 
   static getInstance(): AssetCacheManager {
@@ -74,14 +86,39 @@ export class AssetCacheManager {
     return entry.data as ProcessingPromise<T>;
   }
 
+  private async streamToBuffer(stream: Readable): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    return new Promise((resolve, reject) => {
+      stream.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      stream.on("error", (err) => reject(err));
+      stream.on("end", () => resolve(Buffer.concat(chunks)));
+    });
+  }
+
   async getFromS3(key: string): Promise<Buffer> {
     const cached = this.getCacheEntry<Buffer>("s3", key);
     if (cached) return cached;
 
-    const localPath = path.join(process.cwd(), "temp", "cache", key);
-    const promise = s3Service
-      .downloadFile(key, localPath)
-      .then(() => fs.promises.readFile(localPath));
+    const promise = (async () => {
+      try {
+        const command = new GetObjectCommand({
+          Bucket: process.env.AWS_BUCKET || "reelty-prod-storage",
+          Key: key,
+        });
+
+        const response = await this.s3Client.send(command);
+        if (!response.Body) {
+          throw new Error(`No body in S3 response for key: ${key}`);
+        }
+
+        const buffer = await this.streamToBuffer(response.Body as Readable);
+        return buffer;
+      } catch (error) {
+        console.error(`Failed to get object from S3: ${key}`, error);
+        throw error;
+      }
+    })();
+
     return this.setCacheEntry("s3", key, promise);
   }
 
