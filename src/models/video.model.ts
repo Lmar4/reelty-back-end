@@ -1,6 +1,7 @@
 import { logger } from "../services/logger.service";
-import { ProductionPipeline } from "../services/video/production-pipeline";
+import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
 import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
+import { TemplateKey } from "../services/imageProcessing/templates/types";
 
 const prisma = new PrismaClient();
 
@@ -35,7 +36,7 @@ export class VideoService {
         .execute({
           jobId: job.id,
           inputFiles: input.inputFiles,
-          template: input.template || "default",
+          template: input.template as TemplateKey,
         })
         .catch((error) => {
           logger.error("Failed to execute production pipeline", {

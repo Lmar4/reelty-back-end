@@ -26,6 +26,9 @@ import puppeteer, { Browser, Page } from "puppeteer";
 import { logger } from "../../utils/logger";
 import { tempFileManager } from "../storage/temp-file.service";
 import { MAP_CAPTURE_CONFIG } from "./map-capture.config";
+import { resourceManager, ResourceState } from "../storage/resource-manager";
+import { Upload } from "@aws-sdk/lib-storage";
+import { S3Client } from "@aws-sdk/client-s3";
 
 // Declare types for Google Maps objects
 declare global {
@@ -46,12 +49,23 @@ declare global {
   }
 }
 
+interface FrameReference {
+  path: string;
+  count: number;
+  lastAccessed: Date;
+  scheduledForDeletion?: boolean;
+}
+
 export class MapCaptureService {
   private static instance: MapCaptureService;
   private readonly CACHE_DIR: string;
   private readonly CACHE_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+  private readonly CLEANUP_DELAY = 5 * 60 * 1000; // 5 minutes
+  private readonly frameReferences: Map<string, FrameReference> = new Map();
+  private readonly cleanupTimeouts: Map<string, NodeJS.Timeout> = new Map();
   private googleMapsApiKey: string = "";
   private browser: Browser | null = null;
+  private s3Client: S3Client;
 
   /**
    * Private constructor for singleton pattern.
@@ -62,13 +76,14 @@ export class MapCaptureService {
       process.env.TEMP_OUTPUT_DIR || "./temp",
       "map-cache"
     );
-    // Ensure cache directory exists synchronously
-    try {
-      mkdirSync(this.CACHE_DIR, { recursive: true });
-    } catch (error) {
-      logger.error("Failed to create cache directory:", { error });
-      throw error;
-    }
+
+    this.s3Client = new S3Client({
+      region: process.env.AWS_REGION || "us-east-2",
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+      },
+    });
 
     this.validateEnvironment().catch((error) => {
       logger.error("Failed to validate environment:", { error });
@@ -182,21 +197,160 @@ export class MapCaptureService {
     await fsPromises.copyFile(inputPath, outputPath);
   }
 
-  /**
-   * Cleans up temporary frame files.
-   * @param {string} framesDir - Directory containing frame files
-   */
+  private async trackFrame(filePath: string): Promise<void> {
+    const ref = this.frameReferences.get(filePath);
+    if (ref) {
+      ref.count++;
+      ref.lastAccessed = new Date();
+      if (ref.scheduledForDeletion) {
+        const timeout = this.cleanupTimeouts.get(filePath);
+        if (timeout) {
+          clearTimeout(timeout);
+          this.cleanupTimeouts.delete(filePath);
+        }
+        ref.scheduledForDeletion = false;
+      }
+    } else {
+      this.frameReferences.set(filePath, {
+        path: filePath,
+        count: 1,
+        lastAccessed: new Date(),
+      });
+    }
+    logger.debug("Tracked frame:", {
+      path: filePath,
+      references: this.frameReferences.get(filePath)?.count,
+    });
+  }
+
+  private async releaseFrame(filePath: string): Promise<void> {
+    const ref = this.frameReferences.get(filePath);
+    if (ref) {
+      ref.count--;
+      ref.lastAccessed = new Date();
+      logger.debug("Released frame:", {
+        path: filePath,
+        remainingReferences: ref.count,
+      });
+
+      if (ref.count <= 0 && !ref.scheduledForDeletion) {
+        ref.scheduledForDeletion = true;
+        const timeout = setTimeout(
+          () => this.deleteFile(filePath),
+          this.CLEANUP_DELAY
+        );
+        this.cleanupTimeouts.set(filePath, timeout);
+        logger.debug("Scheduled frame for deletion:", {
+          path: filePath,
+          deleteIn: this.CLEANUP_DELAY,
+        });
+      }
+    }
+  }
+
+  private async deleteFile(filePath: string): Promise<void> {
+    try {
+      const ref = this.frameReferences.get(filePath);
+      if (!ref || ref.count > 0 || !ref.scheduledForDeletion) {
+        return;
+      }
+
+      // Double-check file is not in use
+      try {
+        const stats = await fsPromises.stat(filePath);
+        if (Date.now() - stats.mtimeMs < this.CLEANUP_DELAY) {
+          logger.debug("File recently modified, delaying deletion:", {
+            path: filePath,
+            lastModified: stats.mtime,
+          });
+          // Reschedule deletion
+          const timeout = setTimeout(
+            () => this.deleteFile(filePath),
+            this.CLEANUP_DELAY
+          );
+          this.cleanupTimeouts.set(filePath, timeout);
+          return;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
+
+      await resourceManager.updateResourceState(
+        filePath,
+        ResourceState.UPLOADED
+      );
+      await fsPromises.unlink(filePath);
+      this.frameReferences.delete(filePath);
+      this.cleanupTimeouts.delete(filePath);
+      logger.debug("Deleted file:", { filePath });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        logger.warn("Failed to delete file:", {
+          path: filePath,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+      }
+    }
+  }
+
   private async cleanupFrames(framesDir: string): Promise<void> {
     try {
+      // First check if directory exists
+      try {
+        await fsPromises.access(framesDir, constants.F_OK);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          logger.info("Frames directory does not exist, skipping cleanup", {
+            framesDir,
+          });
+          return;
+        }
+        throw error;
+      }
+
       const files = await fsPromises.readdir(framesDir);
       await Promise.all(
-        files
-          .filter((f) => f.startsWith("frame_") && f.endsWith(".jpg"))
-          .map((f) => fsPromises.unlink(path.join(framesDir, f)))
+        files.map(async (f) => {
+          if (
+            f.startsWith("frame_") ||
+            f.startsWith("temp_frame_") ||
+            f === "map.html"
+          ) {
+            const filePath = path.join(framesDir, f);
+            await this.releaseFrame(filePath);
+          }
+        })
       );
-      logger.info("Cleaned up frame files successfully", { framesDir });
+
+      // Schedule directory removal after all files are processed
+      setTimeout(async () => {
+        try {
+          // Check if directory is empty
+          const remainingFiles = await fsPromises.readdir(framesDir);
+          if (remainingFiles.length === 0) {
+            await fsPromises.rmdir(framesDir);
+            logger.info("Cleaned up frames directory successfully", {
+              framesDir,
+            });
+          } else {
+            logger.warn("Directory not empty, skipping removal:", {
+              framesDir,
+              remainingFiles: remainingFiles.length,
+            });
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+            logger.warn("Failed to remove frames directory:", {
+              framesDir,
+              error: error instanceof Error ? error.message : "Unknown error",
+            });
+          }
+        }
+      }, this.CLEANUP_DELAY);
     } catch (error) {
-      logger.error("Failed to cleanup frames:", {
+      logger.error("Error during frames cleanup:", {
         error: error instanceof Error ? error.message : "Unknown error",
         framesDir,
       });
@@ -217,11 +371,12 @@ export class MapCaptureService {
     },
     page: Page
   ): Promise<string> {
-    const cacheKey = this.generateMapCacheKey(coordinates);
-    const framesDir = path.join(this.CACHE_DIR, `frames-${cacheKey}`);
+    const tempDir = await tempFileManager.createDirectory("map_frames");
+    const framesDir = tempDir.path;
+    let tempHtmlPath: string | null = null;
+    const MIN_REQUIRED_FRAMES = 10;
 
     try {
-      // Ensure frames directory exists
       await fsPromises.mkdir(framesDir, { recursive: true });
 
       // Set viewport to match exact target dimensions
@@ -286,83 +441,99 @@ export class MapCaptureService {
       `;
 
       // Write HTML to a temporary file
-      const tempHtmlPath = path.join(framesDir, "map.html");
+      tempHtmlPath = path.join(framesDir, "map.html");
       await fsPromises.writeFile(tempHtmlPath, htmlContent);
+
+      // Track HTML file
+      await resourceManager.trackResource(tempHtmlPath, "map-html", {
+        coordinates,
+      });
+      await resourceManager.updateResourceState(
+        tempHtmlPath,
+        ResourceState.PROCESSING
+      );
 
       // Load the HTML file with proper absolute path
       const absoluteHtmlPath = path.resolve(tempHtmlPath);
       await page.goto(
         `file://${
           absoluteHtmlPath.startsWith("/") ? "" : "/"
-        }${absoluteHtmlPath}`
+        }${absoluteHtmlPath}`,
+        {
+          waitUntil: "networkidle0",
+          timeout: MAP_CAPTURE_CONFIG.TIMEOUTS.MAP_LOAD,
+        }
       );
-      await page.waitForFunction("window.mapInstance !== undefined");
 
-      console.log("Map instance created, waiting for initial load...");
+      // Wait for map to be fully loaded
+      await this.validateMapLoaded(page);
+
+      logger.info("Map instance created and loaded", { coordinates });
 
       // Set up the animation with proper loading checks
-      await page.evaluate(function (
+      await page.evaluate(async function (
         this: Window & { mapInstance: any },
         coords: { lat: number; lng: number }
       ) {
         const map = this.mapInstance;
-
-        // Center map and ensure it's loaded
         map.setCenter(coords);
         map.setZoom(4);
 
         // Wait for map to be idle (tiles loaded)
-        return new Promise<void>((resolve) => {
+        await new Promise<void>((resolve) => {
           this.google.maps.event.addListenerOnce(map, "idle", () => {
-            // Additional wait to ensure all tiles are rendered
             setTimeout(resolve, 3000);
           });
         });
       },
       coordinates);
 
-      console.log("Initial map view loaded, starting zoom sequence...");
+      logger.info("Initial map view loaded, starting zoom sequence");
 
       // Capture frames with smooth zoom transition
       const START_ZOOM = 4;
       const END_ZOOM = 19.5;
       const FRAME_COUNT = 60;
+      const capturedFrames: string[] = [];
+      const failedFrames: { index: number; error: string }[] = [];
 
       for (let i = 0; i < FRAME_COUNT; i++) {
         const progress = i / (FRAME_COUNT - 1);
         const currentZoom = START_ZOOM + (END_ZOOM - START_ZOOM) * progress;
 
-        await page.evaluate(function (
-          this: Window & { mapInstance: any },
-          zoom: number
-        ) {
-          const map = this.mapInstance;
-          map.setZoom(zoom);
-        },
-        currentZoom);
+        // Set zoom level with retry mechanism
+        let retries = 3;
+        while (retries > 0) {
+          try {
+            await page.evaluate(async function (
+              this: Window & { mapInstance: any },
+              zoom: number
+            ) {
+              const map = this.mapInstance;
+              map.setZoom(zoom);
+              await new Promise<void>((resolve) => {
+                this.google.maps.event.addListenerOnce(map, "idle", resolve);
+              });
+            },
+            currentZoom);
+            break;
+          } catch (error) {
+            retries--;
+            if (retries === 0) {
+              failedFrames.push({
+                index: i,
+                error: error instanceof Error ? error.message : "Unknown error",
+              });
+              logger.error(`Failed to set zoom for frame ${i}`, {
+                zoom: currentZoom,
+                error: error instanceof Error ? error.message : "Unknown error",
+              });
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+          }
+        }
 
-        // Quick check for map idle state
-        await page.evaluate(function (this: Window & { mapInstance: any }) {
-          const map = this.mapInstance;
-          return new Promise<void>((resolve) => {
-            this.google.maps.event.addListenerOnce(map, "idle", () =>
-              resolve()
-            );
-          });
-        });
-
-        // Shorter wait time for tiles
-        await new Promise((resolve) =>
-          setTimeout(resolve, MAP_CAPTURE_CONFIG.TIMEOUTS.FRAME_CAPTURE)
-        );
-
-        console.log(
-          `Capturing frame ${
-            i + 1
-          }/${FRAME_COUNT} at zoom level ${currentZoom.toFixed(1)}`
-        );
-
-        // Capture frame
+        // Capture frame with retry mechanism
         const tempFramePath = path.join(
           framesDir,
           `temp_frame_${i.toString().padStart(2, "0")}.jpg`
@@ -372,19 +543,97 @@ export class MapCaptureService {
           `frame_${i.toString().padStart(2, "0")}.jpg`
         );
 
-        await page.screenshot({
-          path: tempFramePath,
-          type: "jpeg",
-          quality: 90,
+        // Track frame files
+        await resourceManager.trackResource(tempFramePath, "temp-frame", {
+          frameIndex: i,
+        });
+        await resourceManager.trackResource(finalFramePath, "final-frame", {
+          frameIndex: i,
         });
 
-        // Crop to portrait and clean up temp file
-        await this.cropToPortrait(tempFramePath, finalFramePath);
-        await fsPromises.unlink(tempFramePath);
+        try {
+          await page.screenshot({
+            path: tempFramePath,
+            type: "jpeg",
+            quality: 90,
+          });
+
+          await this.cropToPortrait(tempFramePath, finalFramePath);
+          await resourceManager.updateResourceState(
+            finalFramePath,
+            ResourceState.PROCESSING
+          );
+          capturedFrames.push(finalFramePath);
+
+          // Clean up temp frame
+          await resourceManager.updateResourceState(
+            tempFramePath,
+            ResourceState.UPLOADED
+          );
+          await fsPromises.unlink(tempFramePath);
+
+          logger.debug(`Captured frame ${i + 1}/${FRAME_COUNT}`, {
+            zoom: currentZoom.toFixed(1),
+            framePath: finalFramePath,
+          });
+        } catch (error) {
+          failedFrames.push({
+            index: i,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          await resourceManager.updateResourceState(
+            tempFramePath,
+            ResourceState.FAILED
+          );
+          await resourceManager.updateResourceState(
+            finalFramePath,
+            ResourceState.FAILED
+          );
+          logger.error(`Failed to capture frame ${i + 1}`, {
+            error: error instanceof Error ? error.message : "Unknown error",
+            zoom: currentZoom,
+          });
+
+          // Try to clean up failed frame files
+          try {
+            await fsPromises.unlink(tempFramePath).catch(() => {});
+            await fsPromises.unlink(finalFramePath).catch(() => {});
+          } catch (cleanupError) {
+            logger.warn(`Failed to clean up frame files for index ${i}`, {
+              error:
+                cleanupError instanceof Error
+                  ? cleanupError.message
+                  : "Unknown error",
+            });
+          }
+        }
       }
 
-      // Only clean up after all frames are captured and processed
-      await fsPromises.unlink(tempHtmlPath);
+      // Validate frame count and quality
+      if (capturedFrames.length < MIN_REQUIRED_FRAMES) {
+        throw new Error(
+          `Insufficient frames captured (${capturedFrames.length}/${MIN_REQUIRED_FRAMES} minimum required) for viable video`
+        );
+      }
+
+      if (failedFrames.length > 0) {
+        logger.warn("Some frames failed to capture", {
+          failed: failedFrames.length,
+          total: FRAME_COUNT,
+          failures: failedFrames,
+        });
+      }
+
+      // Track each captured frame
+      const frameFiles = await fsPromises.readdir(framesDir);
+      await Promise.all(
+        frameFiles.map(async (f) => {
+          if (f.startsWith("frame_") || f.startsWith("temp_frame_")) {
+            const filePath = path.join(framesDir, f);
+            await this.trackFrame(filePath);
+          }
+        })
+      );
 
       return framesDir;
     } catch (error) {
@@ -392,10 +641,32 @@ export class MapCaptureService {
         error: error instanceof Error ? error.message : "Unknown error",
         coordinates,
       });
+
+      // Immediate cleanup of temp directory and resources
+      try {
+        const files = await fsPromises.readdir(framesDir);
+        await Promise.all(
+          files.map(async (file) => {
+            const filePath = path.join(framesDir, file);
+            await resourceManager.updateResourceState(
+              filePath,
+              ResourceState.FAILED
+            );
+            await fsPromises.unlink(filePath).catch(() => {});
+          })
+        );
+        await fsPromises.rmdir(framesDir).catch(() => {});
+      } catch (cleanupError) {
+        logger.warn("Failed to cleanup temp directory:", {
+          error:
+            cleanupError instanceof Error
+              ? cleanupError.message
+              : "Unknown error",
+          path: framesDir,
+        });
+      }
+
       throw error;
-    } finally {
-      // Move cleanup to after video creation
-      // We'll handle browser and page cleanup in generateMapVideo
     }
   }
 
@@ -411,14 +682,38 @@ export class MapCaptureService {
     browser: Browser | null,
     page: Page | null
   ): Promise<string> {
-    try {
-      const outputPath = await tempFileManager.createFile("map.mp4");
+    const s3Key = `maps/${crypto.randomUUID()}.mp4`;
+    const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
+    let outputStream: any = null;
 
-      return new Promise((resolve, reject) => {
+    try {
+      // Create a PassThrough stream for FFmpeg output
+      const { PassThrough } = await import("stream");
+      outputStream = new PassThrough();
+
+      // Start the S3 upload
+      const upload = new Upload({
+        client: this.s3Client,
+        params: {
+          Bucket: bucket,
+          Key: s3Key,
+          Body: outputStream,
+          ContentType: "video/mp4",
+        },
+      });
+
+      // Track the resource
+      await resourceManager.trackResource(s3Key, "map-video");
+      await resourceManager.updateResourceState(
+        s3Key,
+        ResourceState.PROCESSING
+      );
+
+      // Process frames with FFmpeg
+      await new Promise<void>((resolve, reject) => {
         ffmpeg()
           .input(path.join(framesDir, "frame_%02d.jpg"))
           .inputFPS(24)
-          .output(outputPath.path)
           .outputOptions([
             "-c:v",
             "libx264",
@@ -439,6 +734,7 @@ export class MapCaptureService {
             "-t",
             "3",
           ])
+          .toFormat("mp4")
           .on("progress", (progress) => {
             logger.info("FFmpeg progress", {
               frames: progress.frames,
@@ -447,50 +743,57 @@ export class MapCaptureService {
               targetSize: progress.targetSize,
             });
           })
-          .on("end", async () => {
-            try {
-              // Clean up frames first
-              await this.cleanupFrames(framesDir);
-
-              // Then clean up browser resources
-              if (page) {
-                await this.clearPageResources(page).catch((err) => {
-                  logger.warn("Error clearing page resources:", {
-                    error: err instanceof Error ? err.message : "Unknown error",
-                  });
-                });
-              }
-              if (browser) {
-                await browser.close().catch((err) => {
-                  logger.warn("Error closing browser:", {
-                    error: err instanceof Error ? err.message : "Unknown error",
-                  });
-                });
-              }
-
-              logger.info("Map video created successfully", {
-                outputPath: outputPath.path,
-              });
-              resolve(outputPath.path);
-            } catch (error) {
-              reject(error);
-            }
+          .on("error", (error) => {
+            outputStream.destroy();
+            reject(new Error(`FFmpeg error: ${error.message}`));
           })
-          .on("error", (err) => {
-            logger.error("Failed to create map video:", {
-              error: err.message,
-              framesDir,
-            });
-            reject(err);
+          .on("end", () => {
+            outputStream.end();
+            resolve();
           })
-          .run();
+          .pipe(outputStream, { end: true });
       });
+
+      // Wait for S3 upload to complete
+      await upload.done();
+      await resourceManager.updateResourceState(s3Key, ResourceState.UPLOADED);
+
+      // Add safety delay to ensure FFmpeg has fully released files
+      logger.info(
+        "FFmpeg processing complete, waiting for file system sync..."
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+
+      // Release frames after video is created and safety delay
+      await this.cleanupFrames(framesDir);
+
+      const s3Url = `https://${bucket}.s3.${
+        process.env.AWS_REGION || "us-east-2"
+      }.amazonaws.com/${s3Key}`;
+      return s3Url;
     } catch (error) {
-      logger.error("Failed to create map video:", {
+      // Clean up stream if it exists
+      if (outputStream) {
+        try {
+          outputStream.destroy();
+        } catch (streamError) {
+          logger.warn("Failed to destroy output stream:", {
+            error:
+              streamError instanceof Error
+                ? streamError.message
+                : "Unknown error",
+          });
+        }
+      }
+
+      await resourceManager.updateResourceState(s3Key, ResourceState.FAILED, {
         error: error instanceof Error ? error.message : "Unknown error",
-        framesDir,
       });
+
       throw error;
+    } finally {
+      if (page) await this.clearPageResources(page);
+      if (browser) await browser.close();
     }
   }
 

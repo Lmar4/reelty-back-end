@@ -115,7 +115,7 @@ export async function handleStripeWebhook(
         await prisma.user.update({
           where: { id: user.id },
           data: {
-            currentTierId: tier.id,
+            currentTierId: tier.tierId,
             stripeSubscriptionId: subscription.id,
             stripePriceId: priceId,
             subscriptionStatus,
@@ -129,7 +129,7 @@ export async function handleStripeWebhook(
         await prisma.subscriptionHistory.create({
           data: {
             userId: user.id,
-            tierId: tier.id,
+            tierId: tier.tierId,
             status: subscriptionStatus,
             startDate: new Date(subscription.current_period_start * 1000),
             endDate: new Date(subscription.current_period_end * 1000),
