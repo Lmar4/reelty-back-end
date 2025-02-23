@@ -181,7 +181,7 @@ router.post(
           forceRegeneration: true,
           regenerationContext: (job.metadata as unknown as JobMetadata)
             .regenerationContext,
-          skipLock: true,
+          skipLock: false,
         })
         .catch(async (error) => {
           logger.error("[PHOTO_REGENERATE] Regeneration failed", {
@@ -353,7 +353,7 @@ router.post(
             forceRegeneration: true,
             regenerationContext: (job.metadata as unknown as JobMetadata)
               .regenerationContext,
-            skipLock: true,
+            skipLock: false,
           });
         } catch (error) {
           logger.error("[BATCH_REGENERATE] Pipeline execution failed", {
