@@ -45,13 +45,50 @@ interface PhotoRecord {
   status: string;
 }
 
+// Add type definition at the top of the file
+interface Coordinates {
+  lat: number;
+  lng: number;
+}
+
 // Add this validation helper at the top of the file
 const validateUUID = (id: string | undefined): boolean => {
   if (!id) return false;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-    id
-  );
+  const uuidV4Regex =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidV4Regex.test(id);
 };
+
+// Add type guard at the top of the file
+function isCoordinates(obj: any): obj is Coordinates {
+  return (
+    obj &&
+    typeof obj === "object" &&
+    "lat" in obj &&
+    typeof obj.lat === "number" &&
+    "lng" in obj &&
+    typeof obj.lng === "number"
+  );
+}
+
+// Add this helper function at the top of the file
+function validateListingData(
+  listingId: string | undefined,
+  jobId: string | undefined
+): void {
+  if (!listingId) {
+    throw new Error("Missing listing ID");
+  }
+  if (!jobId) {
+    throw new Error("Missing job ID");
+  }
+  if (!validateUUID(listingId)) {
+    throw new Error(`Invalid listing ID format: ${listingId}`);
+  }
+  if (!validateUUID(jobId)) {
+    throw new Error(`Invalid job ID format: ${jobId}`);
+  }
+}
 
 // Get all listings
 const getListings = async (req: Request, res: Response): Promise<void> => {
@@ -136,15 +173,37 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
       body: req.body,
     });
 
-    if (
-      coordinates &&
-      (typeof coordinates.lat !== "number" ||
-        typeof coordinates.lng !== "number")
-    ) {
-      res
-        .status(400)
-        .json({ success: false, error: "Invalid coordinates format" });
+    // Validate photo limit
+    const effectivePhotoLimit = photoLimit || 10;
+    if (Array.isArray(photos) && photos.length > effectivePhotoLimit) {
+      logger.error("[Listings] Photo limit exceeded", {
+        limit: effectivePhotoLimit,
+        received: photos.length,
+      });
+      res.status(400).json({
+        success: false,
+        error: `Photo limit exceeded: ${effectivePhotoLimit}`,
+      });
       return;
+    }
+
+    // Validate coordinates more strictly
+    if (coordinates) {
+      if (
+        !Number.isFinite(coordinates.lat) ||
+        !Number.isFinite(coordinates.lng) ||
+        coordinates.lat < -90 ||
+        coordinates.lat > 90 ||
+        coordinates.lng < -180 ||
+        coordinates.lng > 180
+      ) {
+        logger.error("[Listings] Invalid coordinates format", { coordinates });
+        res.status(400).json({
+          success: false,
+          error: "Invalid coordinates format or out of range",
+        });
+        return;
+      }
     }
 
     // Validate photo URLs if provided
@@ -218,8 +277,15 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
           },
         });
 
+        // Store listing ID for later use
+        const listingId = listing.id;
+
+        if (!validateUUID(listingId)) {
+          throw new Error(`Invalid listing ID format: ${listingId}`);
+        }
+
         logger.info("[Listings] Created listing", {
-          listingId: listing.id,
+          listingId,
           userId,
         });
 
@@ -246,11 +312,7 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
             const filePath = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${s3Key}`;
 
             // Validate listing.id is a valid UUID
-            if (
-              !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-                listing.id
-              )
-            ) {
+            if (!validateUUID(listing.id)) {
               throw new Error(
                 `Invalid UUID format for listing ID: ${listing.id}`
               );
@@ -260,14 +322,24 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
               const photoRecord: PhotoRecord = await tx.photo.create({
                 data: {
                   userId,
-                  listingId: listing.id,
+                  listingId,
                   s3Key,
                   filePath,
                   order: photoRecords.length,
-                  status: "completed",
+                  status: "PENDING",
                 },
               });
               photoRecords.push(photoRecord);
+
+              logger.info(
+                "[Listings] Photo record created with PENDING status",
+                {
+                  photoId: photoRecord.id,
+                  listingId,
+                  s3Key,
+                  order: photoRecords.length,
+                }
+              );
             } catch (photoError) {
               logger.error("[Listings] Failed to create photo record", {
                 error:
@@ -275,7 +347,7 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
                     ? photoError.message
                     : "Unknown error",
                 s3Key,
-                listingId: listing.id,
+                listingId,
               });
               throw new Error(
                 `Failed to create photo record for S3 key: ${s3Key}`
@@ -286,8 +358,9 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
 
         // 3. Create video job if we have photos
         let videoJob = null;
+        let inputFiles: string[] = [];
         if (photoRecords.length > 0) {
-          const inputFiles = photoRecords.map((photo) => photo.filePath);
+          inputFiles = photoRecords.map((photo) => photo.filePath);
 
           // Validate all input files are accessible
           const validationResults = await Promise.all(
@@ -323,7 +396,7 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
 
           videoJob = await tx.videoJob.create({
             data: {
-              listingId: listing.id,
+              listingId,
               userId,
               status: VideoGenerationStatus.PENDING,
               template: "crescendo",
@@ -332,56 +405,13 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
               priority: 1,
             },
           });
-
-          // Schedule pipeline execution after transaction
-          setImmediate(async () => {
-            try {
-              if (!validateUUID(listing.id)) {
-                logger.error(
-                  "[Listings] Invalid listing ID before pipeline execution",
-                  {
-                    listingId: listing.id,
-                    jobId: videoJob!.id,
-                  }
-                );
-                throw new Error("Invalid listing ID format");
-              }
-
-              await productionPipeline.execute({
-                jobId: videoJob!.id,
-                listingId: listing.id,
-                inputFiles,
-                template: "crescendo",
-                coordinates,
-                skipRunwayIfCached: true,
-              });
-            } catch (error) {
-              logger.error(
-                `[Listings] Pipeline execution failed for job ${videoJob!.id}`,
-                {
-                  error,
-                  listingId: listing.id,
-                }
-              );
-
-              // Update job status on failure
-              await prisma.videoJob.update({
-                where: { id: videoJob!.id },
-                data: {
-                  status: VideoGenerationStatus.FAILED,
-                  error:
-                    error instanceof Error ? error.message : "Unknown error",
-                  completedAt: new Date(),
-                },
-              });
-            }
-          });
         }
 
         return {
           listing,
           photos: photoRecords,
           jobId: videoJob?.id || null,
+          inputFiles,
         };
       },
       {
@@ -389,6 +419,106 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
         timeout: 300000, // 5 minutes total timeout
       }
     );
+
+    // Add immediate validation after transaction
+    if (!result.listing?.id || !validateUUID(result.listing.id)) {
+      logger.error("[Listings] Invalid listing ID after transaction", {
+        listingId: result.listing?.id,
+        timestamp: new Date().toISOString(),
+      });
+      throw new Error(
+        `Invalid listing ID after transaction: ${result.listing?.id}`
+      );
+    }
+
+    // Schedule pipeline execution after transaction ONLY if we have a video job
+    if (result.jobId && result.inputFiles.length > 0) {
+      const listingId = result.listing.id; // Guaranteed to be valid UUID at this point
+      const jobId = result.jobId;
+      const inputFiles = [...result.inputFiles];
+      const coordinates = result.listing.coordinates;
+
+      // Log pre-execution state
+      logger.info("[Listings] Scheduling pipeline execution", {
+        listingId,
+        jobId,
+        inputFilesCount: inputFiles.length,
+        hasCoordinates: !!coordinates,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Store values in closure-safe variables
+      const executionData = {
+        listingId,
+        jobId,
+        inputFiles,
+        coordinates,
+      };
+
+      // Increased delay to 1000ms for better stability
+      setTimeout(async () => {
+        try {
+          // Double-check listing exists before executing pipeline
+          const listingCheck = await prisma.listing.findUnique({
+            where: { id: executionData.listingId },
+            select: { id: true },
+          });
+
+          if (!listingCheck) {
+            throw new Error(
+              `Listing ${executionData.listingId} not found before pipeline execution`
+            );
+          }
+
+          logger.info("[Listings] Starting pipeline execution", {
+            jobId: executionData.jobId,
+            listingId: executionData.listingId,
+            inputFilesCount: executionData.inputFiles.length,
+            timestamp: new Date().toISOString(),
+          });
+
+          await productionPipeline.execute({
+            jobId: executionData.jobId,
+            listingId: executionData.listingId,
+            inputFiles: executionData.inputFiles,
+            template: "crescendo",
+            coordinates: executionData.coordinates as any,
+            skipRunwayIfCached: true,
+          });
+
+          logger.info("[Listings] Pipeline execution initiated successfully", {
+            jobId: executionData.jobId,
+            listingId: executionData.listingId,
+            timestamp: new Date().toISOString(),
+          });
+        } catch (error) {
+          logger.error("[Listings] Pipeline execution failed", {
+            error: error instanceof Error ? error.message : "Unknown error",
+            jobId: executionData.jobId,
+            listingId: executionData.listingId,
+            timestamp: new Date().toISOString(),
+            stack: error instanceof Error ? error.stack : undefined,
+          });
+
+          await prisma.videoJob.update({
+            where: { id: executionData.jobId },
+            data: {
+              status: VideoGenerationStatus.FAILED,
+              error: error instanceof Error ? error.message : "Unknown error",
+              completedAt: new Date(),
+              metadata: {
+                errorDetails: {
+                  message:
+                    error instanceof Error ? error.message : "Unknown error",
+                  stack: error instanceof Error ? error.stack : undefined,
+                  timestamp: new Date().toISOString(),
+                },
+              } satisfies Prisma.InputJsonValue,
+            },
+          });
+        }
+      }, 1000);
+    }
 
     logger.info("[Listings] Created successfully", {
       listingId: result.listing.id,
@@ -475,6 +605,20 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
         throw new Error("Listing not found or access denied");
       }
 
+      // Check for duplicate S3 key
+      const existingPhoto = await tx.photo.findFirst({
+        where: { s3Key, listingId },
+      });
+
+      if (existingPhoto) {
+        logger.error("[Listings] Duplicate S3 key detected", {
+          s3Key,
+          listingId,
+          existingPhotoId: existingPhoto.id,
+        });
+        throw new Error(`Duplicate S3 key: ${s3Key}`);
+      }
+
       const photo = await tx.photo.create({
         data: {
           userId,
@@ -482,11 +626,11 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
           filePath,
           s3Key,
           order,
-          status: "completed",
+          status: "PENDING",
         },
       });
 
-      logger.info("[Listings] Photo record created", {
+      logger.info("[Listings] Photo record created with PENDING status", {
         photoId: photo.id,
         listingId,
         filePath,
@@ -539,9 +683,19 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
 
           // Schedule the pipeline execution AFTER the transaction
           setImmediate(() => {
+            logger.info(
+              "[Listings] Starting pipeline execution for uploaded photo",
+              {
+                jobId: job.id,
+                listingId: listingId,
+                inputFilesCount: updatedListing.photos.length,
+              }
+            );
+
             productionPipeline
               .execute({
                 jobId: job.id,
+                listingId: listingId,
                 inputFiles: updatedListing.photos.map((p) => p.filePath),
                 template: "crescendo",
                 coordinates: updatedListing.coordinates as any,
@@ -552,6 +706,7 @@ const uploadPhoto = async (req: Request, res: Response): Promise<void> => {
                   `[Listings] Pipeline execution failed for job ${job.id}`,
                   {
                     error,
+                    listingId,
                   }
                 );
               });
@@ -669,6 +824,20 @@ const processPhotos = async (req: Request, res: Response) => {
         continue;
       }
 
+      // Check for duplicate S3 key
+      const existingPhoto = await prisma.photo.findFirst({
+        where: { s3Key, listingId },
+      });
+
+      if (existingPhoto) {
+        logger.error("[Listings] Duplicate S3 key detected", {
+          s3Key,
+          listingId,
+          existingPhotoId: existingPhoto.id,
+        });
+        continue;
+      }
+
       const filePath = `https://${process.env.AWS_BUCKET}.s3.${
         process.env.AWS_REGION || "us-east-2"
       }.amazonaws.com/${s3Key}`;
@@ -681,7 +850,7 @@ const processPhotos = async (req: Request, res: Response) => {
             listingId,
             s3Key,
             filePath,
-            status: "completed",
+            status: "PENDING",
             order: processedPhotos.length,
           },
         });
@@ -872,16 +1041,17 @@ router.get(
         },
       });
 
-      logger.info("[LATEST_VIDEOS] Found videos", {
-        videoCount: videos.length,
-        videos: videos.map((v) => ({
-          id: v.id,
-          template: v.template,
-          status: v.status,
-          createdAt: v.createdAt,
-          metadata: v.metadata,
-        })),
-      });
+      // Log only essential information about found videos
+      // logger.info("[LATEST_VIDEOS] Found videos", {
+      //   videoCount: videos.length,
+      //   latestVideo: videos[0]
+      //     ? {
+      //         id: videos[0].id,
+      //         status: videos[0].status,
+      //         template: videos[0].template,
+      //       }
+      //     : null,
+      // });
 
       const processingCount = videos.filter(
         (v) => v.status === VideoGenerationStatus.PROCESSING
@@ -909,14 +1079,14 @@ router.get(
         },
       });
 
-      logger.info("[LATEST_VIDEOS] Sending response", {
-        processingCount,
-        failedCount,
-        completedCount,
-        totalCount: videos.length,
-        shouldEndPolling,
-        videoTemplates: videos.map((v) => v.template),
-      });
+      // Log only summary statistics
+      // logger.info("[LATEST_VIDEOS] Request completed", {
+      //   processingCount,
+      //   failedCount,
+      //   completedCount,
+      //   totalCount: videos.length,
+      //   shouldEndPolling,
+      // });
     } catch (error) {
       logger.error("[LATEST_VIDEOS] Error:", { error });
       res

@@ -32,7 +32,6 @@ interface RegenerationContext {
 interface BatchRegenerateRequest extends Request {
   body: {
     photoIds: string[];
-    regenerationContext: RegenerationContext;
   };
   user?: { id: string };
 }
@@ -160,6 +159,7 @@ router.post(
             regeneratedPhotoIds: [photoId],
             totalPhotos: photo.listing.photos.length,
           },
+          skipLock: true,
         })
         .catch(async (error) => {
           logger.error("[PHOTO_REGENERATE] Regeneration failed", {
@@ -189,7 +189,10 @@ router.post(
       });
       res.status(500).json({
         success: false,
-        message: "Failed to start photo regeneration",
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to start photo regeneration",
       });
     }
   }
@@ -200,154 +203,141 @@ router.post(
   "/regenerate",
   isAuthenticated,
   async (req: BatchRegenerateRequest, res: Response): Promise<void> => {
-    const { photoIds, regenerationContext } = req.body;
+    const { photoIds } = req.body;
     const userId = req.user!.id;
-
-    // Add validation
-    if (!regenerationContext || !Array.isArray(photoIds)) {
-      logger.error("[BATCH_REGENERATE] Invalid request body", {
-        hasRegenerationContext: !!regenerationContext,
-        hasPhotoIds: !!photoIds,
-        userId,
-      });
-      res.status(400).json({
-        success: false,
-        message: "Invalid request. Missing required fields.",
-      });
-      return;
-    }
 
     logger.info("[BATCH_REGENERATE] Request received", {
       photoIds,
       userId,
-      regenerationContext: {
-        toRegenerate: regenerationContext.photosToRegenerate?.length,
-        existing: regenerationContext.existingPhotos?.length,
-      },
     });
 
     try {
-      // Wrap everything in a transaction
-      const result = await prisma.$transaction(
-        async (tx) => {
-          // Fetch photos with their listing context
-          const photos = await tx.photo.findMany({
-            where: { id: { in: photoIds }, userId },
-            include: {
-              listing: { include: { photos: { orderBy: { order: "asc" } } } },
-            },
-          });
-
-          if (photos.length === 0) {
-            throw new Error("No photos found");
-          }
-
-          // Ensure all photos have either processedFilePath or filePath
-          const invalidPhotos = photos.filter(
-            (photo) => !photo.processedFilePath && !photo.filePath
-          );
-          if (invalidPhotos.length > 0) {
-            throw new Error(
-              "Some photos have no available files for regeneration"
-            );
-          }
-
-          // Create job with available paths (using filePath as fallback)
-          const job = await tx.videoJob.create({
-            data: {
-              listingId: photos[0].listingId,
-              userId,
-              status: VideoGenerationStatus.PENDING,
-              template: "crescendo",
-              inputFiles: photos[0].listing!.photos.map((p) => {
-                // Construct S3 URL if needed
-                const path = p.processedFilePath || p.filePath;
-                return path.startsWith("https://")
-                  ? path
-                  : `s3://${process.env.AWS_BUCKET}/${path}`;
-              }),
-            },
-          });
-
-          logger.info("[BATCH_REGENERATE] Created video job", {
-            jobId: job.id,
-            photoCount: photos.length,
-          });
-
-          // Prepare regeneration context with proper paths
-          const preparedRegenerationContext = {
-            photosToRegenerate: regenerationContext.photosToRegenerate.map(
-              (p: RegenerationPhoto) => {
-                const photo = photos.find((photo) => photo.id === p.id);
-                const path = photo?.filePath;
-                return {
-                  ...p,
-                  processedFilePath: path?.startsWith("https://")
-                    ? path
-                    : `s3://${process.env.AWS_BUCKET}/${path}`,
-                };
-              }
-            ),
-            existingPhotos: regenerationContext.existingPhotos.map(
-              (p: RegenerationPhoto) => {
-                const photo = photos[0].listing!.photos.find(
-                  (photo) => photo.id === p.id
-                );
-                const path = photo?.processedFilePath || photo?.filePath;
-                return {
-                  ...p,
-                  processedFilePath: path?.startsWith("https://")
-                    ? path
-                    : `s3://${process.env.AWS_BUCKET}/${path}`,
-                };
-              }
-            ),
-            regeneratedPhotoIds: photoIds,
-            totalPhotos: photos[0].listing!.photos.length,
-          };
-
-          try {
-            // Execute pipeline within transaction
-            await productionPipeline.execute({
-              jobId: job.id,
-              inputFiles: photos[0].listing!.photos.map((p) => {
-                const path = p.processedFilePath || p.filePath;
-                return path.startsWith("https://")
-                  ? path
-                  : `s3://${process.env.AWS_BUCKET}/${path}`;
-              }),
-              template: "crescendo",
-              coordinates: photos[0].listing!.coordinates as
-                | { lat: number; lng: number }
-                | undefined,
-              isRegeneration: true,
-              regenerationContext: preparedRegenerationContext,
-            });
-
-            return { jobId: job.id };
-          } catch (error) {
-            // Update job status and rollback transaction
-            await tx.videoJob.update({
-              where: { id: job.id },
-              data: {
-                status: VideoGenerationStatus.FAILED,
-                error: error instanceof Error ? error.message : "Unknown error",
-                completedAt: new Date(),
-              },
-            });
-            throw error;
-          }
+      // First fetch the photo that needs regeneration
+      const photoToRegenerate = await prisma.photo.findFirst({
+        where: {
+          id: photoIds[0],
+          userId,
         },
-        {
-          maxWait: 30000, // 30 seconds max wait
-          timeout: 300000, // 5 minutes total timeout
+        select: {
+          id: true,
+          processedFilePath: true,
+          filePath: true,
+          order: true,
+          listingId: true,
+        },
+      });
+
+      if (!photoToRegenerate) {
+        logger.error("[BATCH_REGENERATE] Photo not found", {
+          photoId: photoIds[0],
+          userId,
+        });
+        res.status(404).json({
+          success: false,
+          error: "Photo not found",
+        });
+        return;
+      }
+
+      // Get all other photos from the listing with runwayVideoPath
+      const existingPhotos = await prisma.photo.findMany({
+        where: {
+          listingId: photoToRegenerate.listingId,
+          id: { not: photoToRegenerate.id },
+          runwayVideoPath: { not: null }, // Only get photos with existing runway videos
+        },
+        select: {
+          id: true,
+          processedFilePath: true,
+          filePath: true,
+          order: true,
+          runwayVideoPath: true,
+        },
+        orderBy: { order: "asc" },
+      });
+
+      // Create video job with regeneration context
+      const job = await prisma.videoJob.create({
+        data: {
+          listingId: photoToRegenerate.listingId,
+          userId,
+          status: VideoGenerationStatus.PENDING,
+          template: "crescendo",
+          inputFiles: [
+            photoToRegenerate.processedFilePath || photoToRegenerate.filePath,
+          ],
+          metadata: {
+            isRegeneration: true,
+            regenerationContext: {
+              photosToRegenerate: [
+                {
+                  id: photoToRegenerate.id,
+                  processedFilePath:
+                    photoToRegenerate.processedFilePath ||
+                    photoToRegenerate.filePath,
+                  order: photoToRegenerate.order,
+                },
+              ],
+              existingPhotos: existingPhotos.map((p) => ({
+                id: p.id,
+                processedFilePath: p.processedFilePath || p.filePath,
+                order: p.order,
+                runwayVideoPath: p.runwayVideoPath,
+              })),
+              regeneratedPhotoIds: [photoToRegenerate.id],
+              totalPhotos: existingPhotos.length + 1,
+            },
+          },
+        },
+      });
+
+      // Execute pipeline
+      setImmediate(async () => {
+        try {
+          const listing = await prisma.listing.findUnique({
+            where: { id: photoToRegenerate.listingId },
+            select: { coordinates: true },
+          });
+
+          await productionPipeline.execute({
+            jobId: job.id,
+            inputFiles: [
+              photoToRegenerate.processedFilePath || photoToRegenerate.filePath,
+            ],
+            template: "crescendo",
+            coordinates: listing?.coordinates as
+              | { lat: number; lng: number }
+              | undefined,
+            isRegeneration: true,
+            regenerationContext: (job.metadata as any).regenerationContext,
+            skipLock: true,
+          });
+        } catch (error) {
+          logger.error("[BATCH_REGENERATE] Pipeline execution failed", {
+            jobId: job.id,
+            listingId: photoToRegenerate.listingId,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+
+          await prisma.videoJob.update({
+            where: { id: job.id },
+            data: {
+              status: VideoGenerationStatus.FAILED,
+              error: error instanceof Error ? error.message : "Unknown error",
+              completedAt: new Date(),
+            },
+          });
         }
-      );
+      });
 
       res.status(202).json({
         success: true,
-        message: "Batch photo regeneration queued",
-        jobId: result.jobId,
+        message: "Photo regeneration queued",
+        data: {
+          jobId: job.id,
+          listingId: photoToRegenerate.listingId,
+          photoCount: 1,
+        },
       });
     } catch (error) {
       logger.error("[BATCH_REGENERATE] Request failed", {
@@ -355,19 +345,13 @@ router.post(
         userId,
         error: error instanceof Error ? error.message : "Unknown error",
       });
-      res
-        .status(
-          error instanceof Error && error.message === "No photos found"
-            ? 404
-            : 500
-        )
-        .json({
-          success: false,
-          message:
-            error instanceof Error
-              ? error.message
-              : "Failed to start batch regeneration",
-        });
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Failed to start batch regeneration",
+      });
     }
   }
 );
