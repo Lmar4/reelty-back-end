@@ -1,5 +1,13 @@
-import { PrismaClient, SubscriptionTier, PlanType } from "@prisma/client";
+import {
+  PrismaClient,
+  SubscriptionTier,
+  PlanType,
+  SubscriptionStatus,
+} from "@prisma/client";
 import Stripe from "stripe";
+
+import { logger } from "../../utils/logger";
+import { ProductionPipeline } from "../imageProcessing/productionPipeline";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
   apiVersion: "2025-01-27.acacia",
@@ -326,6 +334,61 @@ export class PlansService {
       };
 
       await this.syncPlan(tierData, metadata);
+    }
+  }
+
+  async handleSubscriptionStatusChange(
+    userId: string,
+    oldStatus: SubscriptionStatus,
+    newStatus: SubscriptionStatus,
+    oldTierId?: SubscriptionTierId,
+    newTierId?: SubscriptionTierId
+  ): Promise<void> {
+    try {
+      // Check if this is a transition from free/trial to paid
+      const isUpgrade =
+        (oldStatus === "INACTIVE" || oldStatus === "TRIALING") &&
+        newStatus === "ACTIVE" &&
+        oldTierId !== newTierId;
+
+      // Check if the new tier has different watermark settings
+      const [oldTier, newTier] = await Promise.all([
+        oldTierId
+          ? prisma.subscriptionTier.findFirst({
+              where: { tierId: oldTierId },
+            })
+          : null,
+        newTierId
+          ? prisma.subscriptionTier.findFirst({
+              where: { tierId: newTierId },
+            })
+          : null,
+      ]);
+
+      const watermarkChanged = oldTier?.hasWatermark !== newTier?.hasWatermark;
+
+      // If this is an upgrade or watermark settings changed, reprocess videos
+      if (isUpgrade || watermarkChanged) {
+        await ProductionPipeline.reprocessUserVideos(userId);
+
+        logger.info("Triggered video reprocessing due to subscription change", {
+          userId,
+          oldStatus,
+          newStatus,
+          oldTierId,
+          newTierId,
+          watermarkChanged,
+          isUpgrade,
+        });
+      }
+    } catch (error) {
+      logger.error("Error handling subscription status change", {
+        userId,
+        oldStatus,
+        newStatus,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      throw error;
     }
   }
 }

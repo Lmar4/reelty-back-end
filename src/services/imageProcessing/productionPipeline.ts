@@ -943,6 +943,58 @@ export class ProductionPipeline {
     mapVideo?: string | null
   ): Promise<TemplateProcessingResult> {
     const startTime = Date.now();
+
+    // Get the user's subscription tier to check watermark settings
+    const job = await this.prisma.videoJob.findUnique({
+      where: { id: jobId },
+      select: {
+        user: {
+          select: {
+            currentTier: true,
+          },
+        },
+      },
+    });
+
+    const userTier = job?.user?.currentTier;
+    const shouldShowWatermark = userTier?.hasWatermark ?? true; // Default to showing watermark if no tier
+
+    // Resolve watermark only if the user's tier requires it
+    let watermarkConfig: WatermarkConfig | undefined;
+    if (shouldShowWatermark) {
+      const localWatermarkPath = await this.getSharedWatermarkPath(jobId);
+      if (localWatermarkPath) {
+        try {
+          await fs.access(localWatermarkPath);
+          watermarkConfig = {
+            path: localWatermarkPath,
+            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
+          };
+
+          logger.info(
+            `[${jobId}] Applying watermark based on subscription tier`,
+            {
+              tierId: userTier?.tierId,
+              hasWatermark: userTier?.hasWatermark,
+            }
+          );
+        } catch (error) {
+          logger.warn(
+            `[${jobId}] Watermark file inaccessible, proceeding without`,
+            {
+              path: localWatermarkPath,
+              error: error instanceof Error ? error.message : "Unknown error",
+            }
+          );
+        }
+      }
+    } else {
+      logger.info(`[${jobId}] Skipping watermark based on subscription tier`, {
+        tierId: userTier?.tierId,
+        hasWatermark: userTier?.hasWatermark,
+      });
+    }
+
     const tempDir = path.join(process.cwd(), "temp", `${jobId}_${template}`);
     const videoTemplateService = VideoTemplateService.getInstance();
 
@@ -978,27 +1030,6 @@ export class ProductionPipeline {
         progress: 0,
         message: `Generating ${template} template`,
       });
-
-      // Resolve watermark
-      let watermarkConfig: WatermarkConfig | undefined;
-      const localWatermarkPath = await this.getSharedWatermarkPath(jobId);
-      if (localWatermarkPath) {
-        try {
-          await fs.access(localWatermarkPath);
-          watermarkConfig = {
-            path: localWatermarkPath,
-            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
-          };
-        } catch (error) {
-          logger.warn(
-            `[${jobId}] Watermark file inaccessible, proceeding without`,
-            {
-              path: localWatermarkPath,
-              error: error instanceof Error ? error.message : "Unknown error",
-            }
-          );
-        }
-      }
 
       // Download and validate runway videos
       const localVideos = await Promise.all(
@@ -2436,5 +2467,9 @@ export class ProductionPipeline {
       outputPath,
       template
     );
+  }
+
+  public static async reprocessUserVideos(userId: string): Promise<void> {
+    // ... existing implementation ...
   }
 }
