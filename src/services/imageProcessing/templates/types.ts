@@ -182,7 +182,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
     },
     colorCorrection: {
       ffmpegFilter:
-        "eq=brightness=0.05:contrast=1.1:saturation=1.2:gamma=0.95,hue=h=2:s=1.1,colorbalance=rm=0.05:gm=-0.05:bm=-0.05,curves=master='0/0 0.5/0.55 1/1'",
+        "brightness=0.05:contrast=1.1:saturation=1.2:gamma=0.95,hue=h=2:s=1.1,colorbalance=rm=0.05:gm=-0.05:bm=-0.05,curves=master='0/0 0.5/0.55 1/1'",
     },
   },
   hyperpop: {
