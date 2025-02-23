@@ -235,44 +235,6 @@ export class VideoTemplateService {
       throw new Error("Template must have valid durations");
     }
 
-    // Check if music is required for this template
-    const isMusicRequired =
-      templateKey === "storyteller" || templateKey === "crescendo";
-
-    // Resolve music path if present
-    if (template.music?.path) {
-      const resolvedMusicPath = await this.resolveAssetPath(
-        template.music.path,
-        "music",
-        isMusicRequired
-      );
-      if (resolvedMusicPath) {
-        template.music.path = resolvedMusicPath;
-        template.music.isValid = true;
-        logger.info("Music file resolved and verified", {
-          originalPath: template.music.path,
-          resolvedPath: resolvedMusicPath,
-          volume: template.music.volume,
-          startTime: template.music.startTime,
-        });
-      } else {
-        template.music.isValid = false;
-        if (isMusicRequired) {
-          throw new Error(
-            `Required music file not found for template ${templateKey}`
-          );
-        }
-        logger.warn("No valid music file found, proceeding without music", {
-          originalPath: template.music.path,
-          template: templateKey,
-        });
-      }
-    } else if (isMusicRequired) {
-      throw new Error(
-        `Music path not specified for template ${templateKey} which requires music`
-      );
-    }
-
     // Handle watermark if needed
     let watermarkConfig: WatermarkConfig | undefined;
     if (options?.watermark) {
@@ -285,7 +247,7 @@ export class VideoTemplateService {
         if (watermarkPath) {
           watermarkConfig = {
             path: watermarkPath,
-            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-20" },
+            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-180" },
           };
           logger.info("Watermark configured successfully", {
             path: watermarkPath,
@@ -303,85 +265,83 @@ export class VideoTemplateService {
       }
     }
 
-    // Rest of the method remains unchanged...
-    const videoSlots = template.sequence.filter((s) => s !== "map").length;
-    const availableVideos = inputVideos.length;
-    const hasMapRequirement = template.sequence.includes("map");
+    const templateConfig = reelTemplates[templateKey];
+    const durations = Array.isArray(templateConfig.durations)
+      ? templateConfig.durations
+      : Object.values(templateConfig.durations);
 
-    if (hasMapRequirement && !mapVideoPath) {
-      logger.error("Map video required but not provided", { templateKey });
-      throw new Error("Map video required but not provided");
-    }
+    // Limit to available segments and ensure durations match
+    const combinedVideos: string[] = [];
+    const adjustedDurations: number[] = [];
+    let segmentCount = 0;
 
-    logger.info("Template analysis", {
-      totalSlots: template.sequence.length,
-      videoSlots,
-      availableVideos,
-      hasMapVideo: !!mapVideoPath,
-      hasMapRequirement,
-      hasTransitions: !!template.transitions?.length,
-      hasMusic: !!template.music?.isValid,
-    });
-
-    const adaptedSequence = template.sequence.filter((item) => {
-      if (item === "map") return true;
-      const index = typeof item === "number" ? item : parseInt(item);
-      if (isNaN(index)) {
-        logger.warn("Invalid sequence item, skipping", { item });
-        return false;
-      }
-      const hasVideo = index < availableVideos;
-      if (!hasVideo) {
-        logger.info("Skipping out-of-range index", {
-          index,
-          availableVideos,
-          template: templateKey,
-        });
-      }
-      return hasVideo;
-    });
-
-    const usedDurations = adaptedSequence.map((_, i) => {
-      if (Array.isArray(template.durations)) {
-        return template.durations[i];
-      }
-      return template.durations[adaptedSequence[i]];
-    });
-
-    const clips: VideoClip[] = [];
-    for (let i = 0; i < adaptedSequence.length; i++) {
-      const sequenceItem = adaptedSequence[i];
-
-      if (sequenceItem === "map") {
-        const mapDuration = Array.isArray(template.durations)
-          ? template.durations[i]
-          : template.durations["map"];
-        if (mapDuration === undefined) {
-          throw new Error(`Duration not found for map video at position ${i}`);
+    for (const item of templateConfig.sequence) {
+      if (segmentCount >= inputVideos.length) break; // Stop when we run out of videos
+      if (item === "map") {
+        if (mapVideoPath) {
+          combinedVideos.push(mapVideoPath);
+          adjustedDurations.push(
+            typeof templateConfig.durations === "object"
+              ? (templateConfig.durations as Record<string, number>).map
+              : durations[segmentCount]
+          );
         }
-        clips.push({
-          path: mapVideoPath!,
-          duration: mapDuration,
-        });
-        continue;
+      } else {
+        const videoIndex = typeof item === "string" ? parseInt(item) : item;
+        if (videoIndex < inputVideos.length) {
+          combinedVideos.push(inputVideos[videoIndex]);
+          adjustedDurations.push(durations[segmentCount]);
+          segmentCount++;
+        }
       }
-
-      const index = sequenceItem as number;
-      const duration = usedDurations[i];
-      if (duration === undefined) {
-        throw new Error(`Duration not found for position ${i}`);
-      }
-
-      clips.push({
-        path: inputVideos[index],
-        duration,
-        transition: template.transitions?.[i > 0 ? i - 1 : 0],
-        colorCorrection: template.colorCorrection,
-      });
     }
 
-    if (clips.length !== adaptedSequence.length) {
-      throw new Error("Failed to create all required clips");
+    // Log configuration for debugging
+    logger.info(`Template ${templateKey} clip configuration:`, {
+      clipCount: combinedVideos.length,
+      totalDuration: adjustedDurations.reduce((sum, d) => sum + (d || 0), 0),
+      durations: adjustedDurations,
+      sequence: templateConfig.sequence.slice(0, segmentCount),
+    });
+
+    // Create clips with proper configuration
+    const clips = combinedVideos.map((path, index) => {
+      const duration = adjustedDurations[index];
+      if (duration === undefined) {
+        throw new Error(`No duration defined for clip ${index}: ${path}`);
+      }
+      return {
+        path,
+        duration,
+        transition: templateConfig.transitions?.[index > 0 ? index - 1 : 0],
+        colorCorrection: templateConfig.colorCorrection,
+      };
+    });
+
+    if (clips.length === 0) {
+      throw new Error("No valid clips generated from template configuration");
+    }
+
+    // Resolve music path if present
+    if (template.music?.path) {
+      const resolvedMusicPath = await this.resolveAssetPath(
+        template.music.path,
+        "music",
+        true // Always require music if specified
+      );
+
+      if (!resolvedMusicPath) {
+        throw new Error(`Music file not found: ${template.music.path}`);
+      }
+
+      template.music.path = resolvedMusicPath;
+      template.music.isValid = true;
+      logger.info("Music file resolved and verified", {
+        originalPath: template.music.path,
+        resolvedPath: resolvedMusicPath,
+        volume: template.music.volume,
+        startTime: template.music.startTime,
+      });
     }
 
     return clips;

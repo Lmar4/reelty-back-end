@@ -1,35 +1,19 @@
-/**
- * Video Processing Service
- *
- * Core service for video processing operations including composition,
- * encoding, and asset management. Provides low-level video manipulation
- * capabilities used by higher-level services.
- *
- * Features:
- * - Video composition and encoding
- * - Audio integration
- * - Frame rate management
- * - Quality control
- * - Resource cleanup
- *
- * Dependencies:
- * - ffmpeg for video processing
- * - Proper codec support (libx264, etc.)
- * - Sufficient disk space for temporary files
- *
- * @module VideoProcessingService
- */
-
 import ffmpeg from "fluent-ffmpeg";
 import { promises as fs } from "fs";
 import { existsSync, mkdirSync } from "fs";
+import { createReadStream } from "fs";
 import * as path from "path";
 import { logger } from "../../utils/logger";
+import { S3Service } from "../storage/s3.service";
 import { ReelTemplate } from "../imageProcessing/templates/types";
 import {
   VideoTemplate,
   WatermarkConfig,
 } from "../video/video-template.service";
+import { exec } from "child_process";
+import { Upload } from "@aws-sdk/lib-storage";
+import { S3Client } from "@aws-sdk/client-s3";
+import { EventEmitter } from "events";
 
 interface FFmpegError extends Error {
   code?: string;
@@ -60,8 +44,8 @@ export interface VideoClip {
   watermark?: {
     path: string;
     position?: {
-      x: string; // Can be pixels or expressions like "(main_w-overlay_w)/2"
-      y: string; // Can be pixels or expressions like "main_h-overlay_h-20"
+      x: string;
+      y: string;
     };
   };
 }
@@ -81,42 +65,14 @@ export interface VideoProcessingOptions {
 export class VideoProcessingService {
   private static instance: VideoProcessingService;
   private readonly TEMP_DIR = process.env.TEMP_OUTPUT_DIR || "./temp";
+  private s3Service: S3Service;
+  private readonly FFmpeg_TIMEOUT = 60 * 60 * 1000; // 1 hour timeout
 
   private constructor() {
-    // Ensure temp directory exists
+    this.s3Service = new S3Service();
     if (!existsSync(this.TEMP_DIR)) {
       mkdirSync(this.TEMP_DIR, { recursive: true });
-    }
-
-    // Setup periodic cleanup
-    setInterval(() => this.cleanupStaleFiles(), 3600000); // Run every hour
-  }
-
-  private async cleanupStaleFiles() {
-    try {
-      const files = await fs.readdir(this.TEMP_DIR);
-      const now = Date.now();
-      const TWO_HOURS = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
-
-      for (const file of files) {
-        const filePath = path.join(this.TEMP_DIR, file);
-        try {
-          const stats = await fs.stat(filePath);
-
-          // Check if file is older than 2 hours
-          if (now - stats.mtimeMs > TWO_HOURS) {
-            // Check if it's a failed video (0 bytes) or a regular file
-            if (stats.size === 0 || path.extname(file) === ".mp4") {
-              await fs.unlink(filePath);
-              logger.info("Cleaned up stale file:", { filePath });
-            }
-          }
-        } catch (error) {
-          logger.error("Error checking file:", { file, error });
-        }
-      }
-    } catch (error) {
-      logger.error("Error during cleanup:", { error });
+      logger.info("Created TEMP_DIR", { path: this.TEMP_DIR });
     }
   }
 
@@ -127,83 +83,40 @@ export class VideoProcessingService {
     return VideoProcessingService.instance;
   }
 
-  private handleFFmpegProgress(
-    progress: FFmpegProgress,
-    context: string
-  ): void {
-    const percent = progress.percent || 0;
-    if (percent % 10 === 0) {
-      logger.info(`[${context}] Processing progress:`, {
-        percent: `${percent.toFixed(1)}%`,
-        frames: progress.frames,
-        fps: progress.currentFps,
-        bitrate: `${progress.currentKbps}kbps`,
-        timemark: progress.timemark,
+  private async checkFFmpegVersion(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      exec("ffmpeg -version", (error: Error | null, stdout: string) => {
+        if (error) {
+          logger.error("Failed to get FFmpeg version", { error });
+          reject(error);
+          return;
+        }
+
+        const versionMatch = stdout.match(/version\s+([\d.]+)/);
+        const version = versionMatch ? versionMatch[1] : "unknown";
+        const hasLibx264 = stdout.includes("--enable-libx264");
+        const hasLibmp3lame = stdout.includes("--enable-libmp3lame");
+        const hasNvenc = stdout.includes("--enable-nvenc");
+        const hasVideotoolbox = stdout.includes("--enable-videotoolbox");
+
+        logger.info("FFmpeg version check", {
+          version,
+          hasLibx264,
+          hasLibmp3lame,
+          hasNvenc,
+          hasVideotoolbox,
+        });
+
+        if (!hasLibx264 || !hasLibmp3lame) {
+          logger.warn("FFmpeg missing required codecs", {
+            missingLibx264: !hasLibx264,
+            missingLibmp3lame: !hasLibmp3lame,
+          });
+        }
+
+        resolve();
       });
-    }
-  }
-
-  private handleFFmpegError(error: FFmpegError, context: string): never {
-    let errorMessage = error.message;
-    const details: Record<string, unknown> = {
-      code: error.code,
-      exitCode: error.exitCode,
-      killed: error.killed,
-    };
-
-    if (error.ffmpegOutput) {
-      const outputLines = error.ffmpegOutput.split("\n");
-      const errorLines = outputLines.filter((line) =>
-        line.toLowerCase().includes("error")
-      );
-      if (errorLines.length > 0) {
-        details.ffmpegErrors = errorLines;
-        errorMessage = errorLines[errorLines.length - 1];
-      }
-
-      const codecLines = outputLines.filter(
-        (line) =>
-          line.includes("codec") ||
-          line.includes("encoder") ||
-          line.includes("decoder")
-      );
-      if (codecLines.length > 0) {
-        details.codecIssues = codecLines;
-      }
-
-      const fileLines = outputLines.filter(
-        (line) =>
-          line.includes("No such file") ||
-          line.includes("Invalid data") ||
-          line.includes("Error opening")
-      );
-      if (fileLines.length > 0) {
-        details.fileIssues = fileLines;
-      }
-    }
-
-    logger.error(`[${context}] FFmpeg error:`, {
-      error: errorMessage,
-      ...details,
     });
-
-    throw new Error(`FFmpeg error in ${context}: ${errorMessage}`);
-  }
-
-  private createFFmpegCommand(context: string): ffmpeg.FfmpegCommand {
-    return ffmpeg()
-      .on("start", (command) => {
-        logger.info(`[${context}] Starting FFmpeg command:`, { command });
-      })
-      .on("progress", (progress) =>
-        this.handleFFmpegProgress(progress as FFmpegProgress, context)
-      )
-      .on("end", () => {
-        logger.info(`[${context}] FFmpeg processing completed`);
-      })
-      .on("error", (error: FFmpegError) =>
-        this.handleFFmpegError(error, context)
-      );
   }
 
   private async validateFile(
@@ -214,14 +127,303 @@ export class VideoProcessingService {
       await fs.access(filePath, fs.constants.R_OK);
       const stats = await fs.stat(filePath);
       if (stats.size === 0) {
-        throw new Error(`${context} is empty: ${filePath}`);
+        throw new Error(`${context} is empty`);
       }
+      logger.debug(`Validated ${context} file`, { filePath, size: stats.size });
     } catch (error) {
-      throw new Error(
-        `${context} not accessible: ${filePath} - ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`
+      logger.error(`Failed to validate ${context} file`, {
+        filePath,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      throw error;
+    }
+  }
+
+  private async resolveAssetPath(
+    assetPath: string,
+    type: "music" | "watermark" | "video",
+    isRequired: boolean = false
+  ): Promise<string> {
+    logger.debug(`Resolving ${type} asset path`, { assetPath });
+    if (assetPath.startsWith("https://")) {
+      const localPath = path.join(
+        this.TEMP_DIR,
+        `temp_${crypto.randomUUID()}_${path.basename(assetPath)}`
       );
+      await this.s3Service.downloadFile(assetPath, localPath);
+      logger.info(`Downloaded ${type} asset from S3`, { assetPath, localPath });
+      return localPath;
+    }
+    try {
+      await fs.access(assetPath, fs.constants.R_OK);
+      logger.debug(`Local ${type} asset verified`, { assetPath });
+      return assetPath;
+    } catch (error) {
+      if (isRequired) {
+        logger.error(`Required ${type} asset not found`, { assetPath, error });
+        throw new Error(`Required ${type} asset not found: ${assetPath}`);
+      }
+      logger.warn(`Optional ${type} asset not found, skipping`, { assetPath });
+      return "";
+    }
+  }
+
+  private buildFilterGraph(
+    clips: VideoClip[],
+    watermarkConfig?: WatermarkConfig,
+    musicIndex?: number,
+    watermarkIndex?: number
+  ): ffmpeg.FilterSpecification[] | null {
+    if (!clips.length) {
+      logger.warn("No clips provided for filter graph");
+      return null;
+    }
+
+    const filterCommands: ffmpeg.FilterSpecification[] = [];
+    let lastOutput = "";
+
+    // Calculate total duration for audio trimming
+    const totalDuration = clips.reduce(
+      (sum, clip) => sum + (clip.duration || 0),
+      0
+    );
+
+    logger.info("Building filter graph", {
+      clipCount: clips.length,
+      totalDuration,
+      hasWatermark: !!watermarkConfig,
+      hasMusic: musicIndex !== undefined && musicIndex !== -1,
+    });
+
+    clips.forEach((clip, i) => {
+      const baseInput = `${i}:v`;
+      const trimmedOutput = `trim${i}`;
+
+      // First trim the clip to exact duration
+      filterCommands.push({
+        filter: "trim",
+        options: `duration=${clip.duration}`,
+        inputs: [baseInput],
+        outputs: [trimmedOutput],
+      });
+
+      // Reset timestamps after trim
+      filterCommands.push({
+        filter: "setpts",
+        options: "PTS-STARTPTS",
+        inputs: [trimmedOutput],
+        outputs: [`pts${i}`],
+      });
+
+      // Apply color correction
+      const colorOutput = `color${i}`;
+      const filterOptions =
+        clip.colorCorrection?.ffmpegFilter ||
+        "contrast=0.9:brightness=0.05:saturation=0.95";
+      filterCommands.push({
+        filter: filterOptions.startsWith("eq=")
+          ? filterOptions.substring(3)
+          : "eq",
+        options: filterOptions.startsWith("eq=")
+          ? filterOptions.substring(3)
+          : filterOptions,
+        inputs: [`pts${i}`],
+        outputs: [colorOutput],
+      });
+
+      // Handle transitions between clips
+      if (i > 0 && clip.transition) {
+        const { type, duration } = clip.transition;
+        const transitionType = type === "slide" ? "crossfade" : type;
+        filterCommands.push({
+          filter: "xfade",
+          options: `transition=${transitionType}:duration=${duration}`,
+          inputs: [lastOutput, colorOutput],
+          outputs: [`trans${i}`],
+        });
+        lastOutput = `trans${i}`;
+      } else {
+        lastOutput = colorOutput;
+      }
+    });
+
+    // Concatenate all clips
+    if (clips.length > 1) {
+      const inputs = clips.map((_, i) =>
+        i > 0 && clips[i].transition ? `trans${i}` : `color${i}`
+      );
+      filterCommands.push({
+        filter: "concat",
+        options: `n=${inputs.length}:v=1:a=0`,
+        inputs,
+        outputs: ["vconcat"],
+      });
+      lastOutput = "vconcat";
+    }
+
+    // Handle audio processing
+    if (musicIndex !== undefined && musicIndex !== -1) {
+      // Trim audio to match total video duration
+      filterCommands.push({
+        filter: "atrim",
+        options: `duration=${totalDuration}`,
+        inputs: [`${musicIndex}:a`],
+        outputs: ["atrimmed"],
+      });
+
+      // Reset audio timestamps
+      filterCommands.push({
+        filter: "asetpts",
+        options: "PTS-STARTPTS",
+        inputs: ["atrimmed"],
+        outputs: ["apts"],
+      });
+
+      filterCommands.push({
+        filter: "aformat",
+        options: "sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+        inputs: ["apts"],
+        outputs: ["aout"],
+      });
+    }
+
+    // Add watermark if configured
+    if (watermarkConfig) {
+      const position = watermarkConfig.position || {
+        x: "(main_w-overlay_w)/2",
+        y: "main_h-overlay_h-20",
+      };
+      filterCommands.push({
+        filter: "overlay",
+        options: `${position.x}:${position.y}`,
+        inputs: [lastOutput, `${watermarkIndex}:v`],
+        outputs: ["vout"],
+      });
+    } else {
+      filterCommands.push({
+        filter: "null",
+        inputs: [lastOutput],
+        outputs: ["vout"],
+      });
+    }
+
+    logger.debug("Filter graph constructed", {
+      filters: filterCommands.map((f) => ({
+        filter: f.filter,
+        options: f.options,
+      })),
+      totalDuration,
+    });
+
+    return filterCommands;
+  }
+
+  private createFFmpegCommand(): ffmpeg.FfmpegCommand {
+    return ffmpeg()
+      .on("start", (commandLine) => {
+        logger.info("FFmpeg process started", { commandLine });
+      })
+      .on("progress", (progress) =>
+        this.handleFFmpegProgress(progress, "video-processing")
+      )
+      .on("end", () => logger.info("FFmpeg process completed"))
+      .on("error", (error: FFmpegError) =>
+        this.handleFFmpegError(error, "video-processing")
+      )
+      .on("stderr", (stderrLine) => {
+        // Enhanced FFmpeg stderr logging
+        logger.debug("FFmpeg stderr output", {
+          line: stderrLine,
+          timestamp: new Date().toISOString(),
+        });
+      });
+  }
+
+  private handleFFmpegProgress(
+    progress: FFmpegProgress,
+    context: string
+  ): void {
+    const percent = progress.percent || 0;
+    if (percent % 5 === 0 || percent === 100) {
+      // Log every 5% or at completion
+      logger.info(`[${context}] Processing progress`, {
+        percent: `${percent.toFixed(1)}%`,
+        frames: progress.frames,
+        fps: progress.currentFps,
+        bitrate: `${progress.currentKbps}kbps`,
+        timemark: progress.timemark,
+      });
+    }
+  }
+
+  private handleFFmpegError(error: FFmpegError, context: string): void {
+    const details: Record<string, unknown> = {
+      code: error.code,
+      exitCode: error.exitCode,
+      killed: error.killed,
+      message: error.message,
+    };
+    if (error.ffmpegOutput) {
+      details.ffmpegOutput = error.ffmpegOutput
+        .split("\n")
+        .filter((line) => line.toLowerCase().includes("error"));
+    }
+
+    logger.error(`[${context}] FFmpeg processing failed`, details);
+    throw new Error(`FFmpeg error in ${context}: ${error.message}`);
+  }
+
+  private async uploadToS3(filePath: string, s3Key: string): Promise<string> {
+    const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
+    const region = process.env.AWS_REGION || "us-east-2";
+    const MAX_RETRIES = 3;
+
+    logger.info("Starting S3 upload", { filePath, s3Key });
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const fileStream = createReadStream(filePath);
+        const upload = new Upload({
+          client: new S3Client({
+            region,
+            credentials: {
+              accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
+              secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
+            },
+          }),
+          params: {
+            Bucket: bucket,
+            Key: s3Key,
+            Body: fileStream,
+            ContentType: "video/mp4",
+          },
+        });
+
+        await upload.done();
+        const s3Url = `https://${bucket}.s3.${region}.amazonaws.com/${s3Key}`;
+        logger.info("S3 upload completed", { filePath, s3Key, s3Url, attempt });
+        return s3Url;
+      } catch (error) {
+        logger.warn("S3 upload attempt failed", {
+          filePath,
+          s3Key,
+          attempt,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+        if (attempt === MAX_RETRIES) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      }
+    }
+    throw new Error("S3 upload failed after retries");
+  }
+
+  private getS3KeyFromUrl(url: string): string {
+    try {
+      const urlObj = new URL(url);
+      return urlObj.pathname.slice(1);
+    } catch (error) {
+      logger.warn("Failed to parse S3 URL, assuming raw key", { url });
+      return url;
     }
   }
 
@@ -229,138 +431,252 @@ export class VideoProcessingService {
     clips: VideoClip[],
     outputPath: string,
     template: VideoTemplate,
-    watermarkConfig?: WatermarkConfig
+    watermarkConfig?: WatermarkConfig,
+    progressEmitter?: EventEmitter
   ): Promise<void> {
-    const context = `stitchVideos:${path.basename(outputPath)}`;
-    const inputPaths = clips.map((clip) => clip.path);
-    const durations = clips.map((clip) => clip.duration);
+    const startTime = Date.now();
 
-    try {
-      // Validate inputs
-      if (inputPaths.length === 0) {
-        throw new Error("No input files provided");
-      }
-
-      if (inputPaths.length !== clips.length) {
-        throw new Error("Number of input files must match number of clips");
-      }
-
-      // Validate input files
-      await Promise.all(
-        inputPaths.map((filePath) => this.validateFile(filePath, "Input video"))
-      );
-
-      // Verify watermark if provided
-      if (watermarkConfig) {
+    // Validate and log detailed clip information
+    const clipsWithDuration = await Promise.all(
+      clips.map(async (clip, index) => {
         try {
-          await this.validateFile(watermarkConfig.path, "Watermark");
-        } catch (error) {
-          logger.warn(
-            "Watermark file not accessible, continuing without watermark",
-            {
-              path: watermarkConfig.path,
-              error: error instanceof Error ? error.message : "Unknown error",
-            }
+          const resolvedPath = await this.resolveAssetPath(
+            clip.path,
+            "video",
+            true
           );
-          watermarkConfig = undefined;
-        }
-      }
+          // Get video duration if not already set
+          if (clip.duration == null) {
+            const duration = await this.getVideoDuration(resolvedPath);
+            clip.duration = duration;
+          }
 
-      // Create FFmpeg command with error handling
-      const command = this.createFFmpegCommand(context);
+          logger.info(`Clip ${index} validation:`, {
+            path: clip.path,
+            resolvedPath,
+            originalDuration: clip.duration,
+            hasTransition: !!clip.transition,
+            hasColorCorrection: !!clip.colorCorrection,
+          });
 
-      // Add input clips
-      inputPaths.forEach((path) => {
-        command.input(path);
-      });
-
-      // Add music track if available
-      let musicIndex = -1;
-      if (template?.music?.path) {
-        try {
-          await fs.access(template.music.path, fs.constants.R_OK);
-          musicIndex = inputPaths.length;
-          command.input(template.music.path);
+          return clip;
         } catch (error) {
-          logger.warn("Music file not accessible:", {
-            path: template.music.path,
+          logger.error(`Failed to process clip ${index}:`, {
+            path: clip.path,
             error: error instanceof Error ? error.message : "Unknown error",
           });
+          throw error;
         }
-      }
+      })
+    );
 
-      // Add watermark if configured
-      let watermarkIndex = -1;
-      if (watermarkConfig) {
+    // Calculate total duration including transitions
+    const totalDuration = clipsWithDuration.reduce((sum, clip, index) => {
+      if (!clip.duration) {
+        throw new Error(`Clip ${index} has no duration: ${clip.path}`);
+      }
+      const transitionDuration =
+        clip.transition && index < clips.length - 1
+          ? clip.transition.duration
+          : 0;
+      return sum + clip.duration + transitionDuration;
+    }, 0);
+
+    logger.info("Starting video stitching", {
+      clipCount: clipsWithDuration.length,
+      totalDuration,
+      outputPath,
+      templateName: template.name,
+      hasWatermark: !!watermarkConfig,
+    });
+
+    return new Promise((resolve, reject) => {
+      const command = this.createFFmpegCommand();
+
+      const setupCommand = async () => {
         try {
-          await fs.access(watermarkConfig.path, fs.constants.R_OK);
-          watermarkIndex =
-            musicIndex !== -1 ? musicIndex + 1 : inputPaths.length;
-          command.input(watermarkConfig.path);
-          logger.info("Added watermark input:", {
-            path: watermarkConfig.path,
-            inputIndex: watermarkIndex,
-          });
+          await Promise.all(
+            clipsWithDuration.map(async (clip, i) => {
+              const resolvedPath = await this.resolveAssetPath(
+                clip.path,
+                "video",
+                true
+              );
+              await this.validateFile(resolvedPath, `Clip ${i}`);
+              command.input(resolvedPath);
+            })
+          );
+
+          let musicIndex = -1;
+          let musicPath = "";
+          if (template?.music?.path) {
+            musicPath = await this.resolveAssetPath(
+              template.music.path,
+              "music",
+              true
+            );
+            musicIndex = clipsWithDuration.length;
+            command.input(musicPath);
+          }
+
+          let watermarkIndex = -1;
+          let watermarkPath = "";
+          if (watermarkConfig) {
+            watermarkPath = await this.resolveAssetPath(
+              watermarkConfig.path,
+              "watermark",
+              true
+            );
+            watermarkIndex =
+              musicIndex !== -1 ? musicIndex + 1 : clipsWithDuration.length;
+            command
+              .input(watermarkPath)
+              .inputOptions(["-loop", "1", "-framerate", "24", "-f", "image2"]);
+          }
+
+          const filterGraph = this.buildFilterGraph(
+            clipsWithDuration,
+            watermarkConfig,
+            musicIndex,
+            watermarkIndex
+          );
+          if (filterGraph && filterGraph.length > 0) {
+            command.complexFilter(filterGraph);
+          } else {
+            command.outputOptions([
+              `-filter_complex`,
+              `concat=n=${clipsWithDuration.length}:v=1:a=0[vout]`,
+            ]);
+          }
+
+          const videoCodec = await this.getAvailableCodec();
+          command
+            .videoCodec(videoCodec)
+            .audioCodec("aac")
+            .outputOptions([
+              "-map [vout]",
+              ...(musicIndex !== -1 ? ["-map [aout]"] : []),
+              "-shortest",
+              "-pix_fmt yuv420p",
+              "-movflags +faststart",
+              "-preset medium",
+              "-crf 23",
+              "-r 24",
+            ]);
+
+          if (template.outputOptions) {
+            command.outputOptions(template.outputOptions);
+          }
+
+          const localOutput = outputPath.startsWith("https://")
+            ? path.join(this.TEMP_DIR, `temp_output_${crypto.randomUUID()}.mp4`)
+            : outputPath;
+
+          command
+            .on("progress", (progress) => {
+              if (progressEmitter) {
+                // Convert timemark (HH:MM:SS) to seconds
+                const timeComponents = progress.timemark.split(":");
+                const currentSeconds =
+                  parseInt(timeComponents[0]) * 3600 +
+                  parseInt(timeComponents[1]) * 60 +
+                  parseFloat(timeComponents[2]);
+
+                // Calculate actual percentage (cap at 100)
+                const percent = Math.min(
+                  100,
+                  Math.round((currentSeconds / totalDuration) * 100)
+                );
+
+                progressEmitter.emit("progress", {
+                  ...progress,
+                  percent,
+                  totalDuration,
+                  currentSeconds,
+                  estimatedTimeLeft: totalDuration - currentSeconds,
+                });
+              }
+            })
+            .on("error", (err) => {
+              logger.error("FFmpeg error:", err);
+              reject(err);
+            })
+            .on("end", async () => {
+              try {
+                await this.validateFile(localOutput, "Output video");
+                if (outputPath.startsWith("https://")) {
+                  const s3Key = this.getS3KeyFromUrl(outputPath);
+                  await this.uploadToS3(localOutput, s3Key);
+                  await fs.unlink(localOutput);
+                  logger.info("Local file cleaned up after S3 upload", {
+                    localOutput,
+                  });
+                }
+                logger.info("Video stitching completed successfully", {
+                  outputPath,
+                  durationMs: Date.now() - startTime,
+                  clipCount: clipsWithDuration.length,
+                  hasMusic: musicIndex !== -1,
+                  hasWatermark: watermarkIndex !== -1,
+                });
+                resolve();
+              } catch (error) {
+                reject(error);
+              }
+            });
+
+          await Promise.race([
+            new Promise<void>((resolve) => {
+              command.save(localOutput).on("end", () => {
+                resolve();
+              });
+            }),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error("FFmpeg processing timeout")),
+                this.FFmpeg_TIMEOUT
+              )
+            ),
+          ]);
         } catch (error) {
-          logger.warn("Watermark file not accessible:", {
-            path: watermarkConfig.path,
+          logger.error("Video stitching failed", {
+            outputPath,
             error: error instanceof Error ? error.message : "Unknown error",
+            stack: error instanceof Error ? error.stack : undefined,
+            durationMs: Date.now() - startTime,
           });
+          reject(error);
         }
-      }
+      };
 
-      // Configure output
-      command.videoCodec("libx264").outputOptions([
-        "-pix_fmt yuv420p", // Ensure compatibility
-        "-movflags +faststart", // Enable streaming
-        "-preset veryslow", // Best compression
-        "-crf 23", // High quality
-      ]);
+      // Execute the async setup function
+      setupCommand();
+    });
+  }
 
-      // Apply template-specific settings
-      if (template.outputOptions) {
-        command.outputOptions(template.outputOptions);
-      }
-
-      // Build complex filter
-      const filterGraph = this.buildFilterGraph(clips, watermarkConfig);
-      if (filterGraph) {
-        command.complexFilter(filterGraph);
-      }
-
-      // Execute FFmpeg command with proper error handling
-      await new Promise<void>((resolve, reject) => {
-        command
-          .save(outputPath)
-          .on("end", async () => {
-            try {
-              await this.validateFile(outputPath, "Output video");
-              resolve();
-            } catch (error) {
-              reject(error);
-            }
-          })
-          .on("error", (error: FFmpegError) => {
-            reject(error);
-          });
+  private async getAvailableCodec(): Promise<string> {
+    return new Promise((resolve) => {
+      exec("ffmpeg -encoders", (error, stdout) => {
+        if (error) {
+          logger.warn(
+            "Failed to check FFmpeg encoders, defaulting to libx264",
+            { error }
+          );
+          resolve("libx264");
+          return;
+        }
+        if (stdout.includes("h264_nvenc")) {
+          logger.info("Using NVENC hardware acceleration");
+          resolve("h264_nvenc");
+        } else if (stdout.includes("h264_videotoolbox")) {
+          logger.info("Using VideoToolbox hardware acceleration");
+          resolve("h264_videotoolbox");
+        } else {
+          logger.info("Using software encoding with libx264");
+          resolve("libx264");
+        }
       });
-
-      logger.info(`[${context}] Video processing completed successfully`, {
-        outputPath,
-        inputCount: inputPaths.length,
-        totalDuration: durations.reduce((sum: number, d: number) => sum + d, 0),
-        hasWatermark: !!watermarkConfig,
-      });
-    } catch (error) {
-      if (!(error instanceof Error && "ffmpegOutput" in error)) {
-        throw new Error(
-          `Failed to process video: ${
-            error instanceof Error ? error.message : "Unknown error"
-          }`
-        );
-      }
-      this.handleFFmpegError(error as FFmpegError, context);
-    }
+    });
   }
 
   public async batchProcessVideos(
@@ -368,79 +684,70 @@ export class VideoProcessingService {
     outputPath: string,
     options: VideoProcessingOptions = {}
   ): Promise<void> {
-    console.log("Starting batch video processing with:", {
+    const startTime = Date.now();
+    logger.info("Starting batch video processing", {
       videoCount: inputVideos.length,
       outputPath,
-      hasMusicTrack: !!options.music,
+      hasMusic: !!options.music,
       reverse: options.reverse,
     });
 
-    // Create a temporary directory for intermediate files
-    const tempDir = path.join(
-      process.env.TEMP_OUTPUT_DIR || "./temp",
-      "batch_" + Date.now()
-    );
+    const tempDir = path.join(this.TEMP_DIR, `batch_${Date.now()}`);
     await fs.mkdir(tempDir, { recursive: true });
 
     try {
-      // Process videos in parallel batches
-      const batchSize = 3; // Process 3 videos at a time
+      const batchSize = 3;
       const batches = [];
-
       for (let i = 0; i < inputVideos.length; i += batchSize) {
-        const batch = inputVideos.slice(i, i + batchSize);
-        batches.push(batch);
+        batches.push(inputVideos.slice(i, i + batchSize));
       }
 
-      // Process each batch
       for (const [index, batch] of batches.entries()) {
-        console.log(`Processing batch ${index + 1}/${batches.length}`);
-        await Promise.all(
+        logger.info(`Processing batch ${index + 1}/${batches.length}`, {
+          videoCount: batch.length,
+        });
+        const batchOutputs = await Promise.all(
           batch.map(async (video, idx) => {
             const outputFile = path.join(tempDir, `processed_${idx}.mp4`);
-            // Convert simple video paths to VideoClip objects
-            const processedClips = [
-              {
-                path: video,
-                duration: 5, // Default duration
-                // Add any other required VideoClip properties
-              },
-            ];
-
-            await this.stitchVideos(processedClips, outputFile, {
+            const clips = [{ path: video, duration: 5 }];
+            await this.stitchVideos(clips, outputFile, {
               music: options.music,
             } as VideoTemplate);
             return outputFile;
           })
         );
+        logger.info(`Batch ${index + 1} completed`, { outputs: batchOutputs });
       }
 
-      // Get all processed videos
       const processedFiles = await fs.readdir(tempDir);
       const processedPaths = processedFiles
         .filter((file) => file.startsWith("processed_"))
         .map((file) => path.join(tempDir, file))
-        .sort((a, b) => {
-          const aNum = parseInt(a.match(/processed_(\d+)\.mp4/)?.[1] || "0");
-          const bNum = parseInt(b.match(/processed_(\d+)\.mp4/)?.[1] || "0");
-          return aNum - bNum;
-        });
+        .sort(
+          (a, b) =>
+            parseInt(a.match(/processed_(\d+)\.mp4/)?.[1] || "0") -
+            parseInt(b.match(/processed_(\d+)\.mp4/)?.[1] || "0")
+        );
 
-      // Final concatenation of all processed videos
-      await this.stitchVideos(
-        processedPaths.map((path) => ({
-          path,
-          duration: 5, // Default duration
-        })),
+      const finalClips = processedPaths.map((path) => ({ path, duration: 5 }));
+      await this.stitchVideos(finalClips, outputPath, {
+        music: options.music,
+      } as VideoTemplate);
+
+      logger.info("Batch processing completed", {
         outputPath,
-        { music: options.music } as VideoTemplate
-      );
+        durationMs: Date.now() - startTime,
+        totalVideos: inputVideos.length,
+      });
     } finally {
-      // Cleanup temporary files
       try {
         await fs.rm(tempDir, { recursive: true, force: true });
+        logger.info("Cleaned up temporary batch directory", { tempDir });
       } catch (error) {
-        console.error("Error cleaning up temporary files:", error);
+        logger.warn("Failed to clean up temporary batch directory", {
+          tempDir,
+          error,
+        });
       }
     }
   }
@@ -450,7 +757,7 @@ export class VideoProcessingService {
     outputPath: string,
     template?: ReelTemplate
   ): Promise<void> {
-    return this.stitchVideos(clips, outputPath, {
+    await this.stitchVideos(clips, outputPath, {
       music: template,
     } as VideoTemplate);
   }
@@ -460,7 +767,7 @@ export class VideoProcessingService {
     outputPath: string,
     template?: ReelTemplate
   ): Promise<void> {
-    return this.createVideoFromClips(clips, outputPath, template);
+    await this.createVideoFromClips(clips, outputPath, template);
   }
 
   async extractFrame(
@@ -468,141 +775,45 @@ export class VideoProcessingService {
     outputPath: string,
     timestamp: number
   ): Promise<void> {
-    await ffmpeg(inputPath).screenshots({
-      timestamps: [timestamp],
-      filename: path.basename(outputPath),
-      folder: path.dirname(outputPath),
+    logger.info("Extracting frame", { inputPath, outputPath, timestamp });
+    await new Promise<void>((resolve, reject) => {
+      ffmpeg(inputPath)
+        .screenshots({
+          timestamps: [timestamp],
+          filename: path.basename(outputPath),
+          folder: path.dirname(outputPath),
+        })
+        .on("end", () => {
+          logger.info("Frame extraction completed", { outputPath });
+          resolve();
+        })
+        .on("error", (error) => {
+          logger.error("Frame extraction failed", { error: error.message });
+          reject(error);
+        });
     });
   }
 
-  private buildFilterGraph(
-    clips: VideoClip[],
-    watermarkConfig?: WatermarkConfig
-  ): ffmpeg.FilterSpecification[] | null {
-    if (!clips.length) return null;
-
-    const filterCommands: ffmpeg.FilterSpecification[] = [];
-    let lastOutput = "";
-
-    // Process each clip
-    clips.forEach((clip, i) => {
-      // Scale and pad
-      filterCommands.push({
-        filter: "scale",
-        options: "768:1280:force_original_aspect_ratio=decrease",
-        inputs: [`${i}:v`],
-        outputs: [`scaled${i}`],
-      });
-
-      filterCommands.push({
-        filter: "pad",
-        options: "768:1280:(ow-iw)/2:(oh-ih)/2",
-        inputs: [`scaled${i}`],
-        outputs: [`padded${i}`],
-      });
-
-      // Apply color correction
-      const colorFilter =
-        clip.colorCorrection?.ffmpegFilter ||
-        "eq=contrast=0.9:brightness=0.05:saturation=0.95";
-      filterCommands.push({
-        filter: colorFilter.startsWith("eq=")
-          ? colorFilter.substring(3)
-          : colorFilter,
-        inputs: [`padded${i}`],
-        outputs: [`color${i}`],
-      });
-
-      // Handle transition from previous clip if exists
-      if (i > 0 && clip.transition) {
-        const { type, duration } = clip.transition;
-        switch (type) {
-          case "crossfade":
-            filterCommands.push({
-              filter: "xfade",
-              options: `transition=fade:duration=${duration}`,
-              inputs: [lastOutput, `color${i}`],
-              outputs: [`trans${i}`],
-            });
-            lastOutput = `trans${i}`;
-            break;
-          case "fade":
-            filterCommands.push({
-              filter: "fade",
-              options: `t=out:st=${
-                clips[i - 1].duration - duration
-              }:d=${duration}`,
-              inputs: [lastOutput],
-              outputs: [`fadeout${i}`],
-            });
-            filterCommands.push({
-              filter: "fade",
-              options: `t=in:st=0:d=${duration}`,
-              inputs: [`color${i}`],
-              outputs: [`fadein${i}`],
-            });
-            filterCommands.push({
-              filter: "concat",
-              options: "n=2:v=1:a=0",
-              inputs: [`fadeout${i}`, `fadein${i}`],
-              outputs: [`trans${i}`],
-            });
-            lastOutput = `trans${i}`;
-            break;
-          case "slide":
-            // Implement slide transition
-            filterCommands.push({
-              filter: "xfade",
-              options: `transition=slideleft:duration=${duration}`,
-              inputs: [lastOutput, `color${i}`],
-              outputs: [`trans${i}`],
-            });
-            lastOutput = `trans${i}`;
-            break;
+  private async getVideoDuration(filePath: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(filePath, (err, metadata) => {
+        if (err) {
+          logger.error("Failed to get video duration:", {
+            path: filePath,
+            error: err.message,
+          });
+          reject(err);
+          return;
         }
-      } else {
-        lastOutput = `color${i}`;
-      }
+        const duration = metadata.format.duration;
+        if (!duration) {
+          reject(new Error(`No duration found for video: ${filePath}`));
+          return;
+        }
+        resolve(duration);
+      });
     });
-
-    // If we have multiple clips without transitions, concatenate them
-    if (clips.length > 1 && !clips.some((clip) => clip.transition)) {
-      filterCommands.push({
-        filter: "concat",
-        options: `n=${clips.length}:v=1:a=0`,
-        inputs: clips.map((_, i) => `color${i}`),
-        outputs: ["concat"],
-      });
-      lastOutput = "concat";
-    }
-
-    // Add watermark if provided
-    if (watermarkConfig) {
-      const position = watermarkConfig.position || {
-        x: "(main_w-overlay_w)/2",
-        y: "main_h-overlay_h-20",
-      };
-      filterCommands.push({
-        filter: "overlay",
-        options: `${position.x}:${position.y}`,
-        inputs: [lastOutput, "watermark"],
-        outputs: ["watermarked"],
-      });
-      lastOutput = "watermarked";
-    }
-
-    // Ensure we have a final output named 'outv'
-    if (lastOutput !== "outv") {
-      filterCommands.push({
-        filter: "null",
-        inputs: [lastOutput],
-        outputs: ["outv"],
-      });
-    }
-
-    return filterCommands;
   }
 }
 
-// Export singleton instance
 export const videoProcessingService = VideoProcessingService.getInstance();

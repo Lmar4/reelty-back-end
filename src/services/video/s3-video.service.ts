@@ -1,16 +1,16 @@
 import {
-  S3Client,
-  GetObjectCommand,
-  HeadObjectCommand,
   CopyObjectCommand,
   DeleteObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  S3Client,
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import * as fs from "fs";
-import { logger } from "../../utils/logger";
 import "dotenv/config";
-import * as path from "path";
+import * as fs from "fs";
+import { Readable } from "stream";
+import { logger } from "../../utils/logger";
 
 export class S3VideoService {
   private static instance: S3VideoService;
@@ -197,125 +197,116 @@ export class S3VideoService {
     }
   }
 
+  private async getObjectEtag(
+    bucket: string,
+    key: string
+  ): Promise<string | null> {
+    try {
+      const command = new HeadObjectCommand({ Bucket: bucket, Key: key });
+      const response = await this.s3Client.send(command);
+      return response.ETag ? response.ETag.replace(/"/g, "") : null; // Handle undefined case
+    } catch (error) {
+      if ((error as any)?.name === "NotFound") return null;
+      throw error;
+    }
+  }
+
+  private async downloadFileToStream(key: string): Promise<Readable> {
+    const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const response = await this.s3Client.send(command);
+    return response.Body as Readable;
+  }
+
   public async moveFromTempToListing(
-    tempKey: string,
+    sourceKey: string,
     listingId: string,
-    photoId: string
-  ): Promise<{ originalUrl: string; webpUrl: string }> {
-    const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
-    if (!bucketName)
-      throw new Error("AWS_BUCKET environment variable is not set");
+    jobId: string
+  ): Promise<void> {
+    const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
+    const destKey = `properties/${listingId}/videos/maps/${jobId}.mp4`;
+
+    logger.info(`[${jobId}] Starting S3 move from ${sourceKey} to ${destKey}`);
 
     try {
-      // If already in users/listings, no need to move—just return the URL
-      if (tempKey.includes("/users/") && tempKey.includes("/listings/")) {
-        const url = this.getPublicUrl(tempKey, bucketName);
-        logger.info("[S3] Using existing file without move", { tempKey, url });
-        return { originalUrl: url, webpUrl: url };
+      // First verify source exists and get its ETag
+      const sourceEtag = await this.getObjectEtag(bucket, sourceKey);
+      if (!sourceEtag) {
+        throw new Error(`Source file not found: ${sourceKey}`);
       }
 
-      // For truly temporary files (not in users/listings), move as before
-      const filename = path.basename(tempKey);
-      const originalKey = `properties/${listingId}/images/processed/${filename}`; // Simplified path
-      logger.info("[S3] Starting file move operation", {
-        from: tempKey,
-        to: originalKey,
-        bucket: bucketName,
+      // Attempt to copy the file
+      const copyCommand = new CopyObjectCommand({
+        Bucket: bucket,
+        CopySource: `${bucket}/${sourceKey}`,
+        Key: destKey,
       });
 
-      // First verify source exists
-      const sourceExists = await this.checkFileExists(bucketName, tempKey);
-      if (!sourceExists) {
-        logger.error("[S3] Source file not found", { tempKey, bucketName });
-        throw new Error(`Source file not found: ${tempKey}`);
-      }
+      const response = await this.s3Client.send(copyCommand);
+      const destEtag = response.CopyObjectResult?.ETag?.replace(/"/g, "");
 
-      // Get source file metadata for verification
-      const sourceCommand = new HeadObjectCommand({
-        Bucket: bucketName,
-        Key: tempKey,
-      });
-      const sourceMetadata = await this.s3Client.send(sourceCommand);
-      const sourceSize = sourceMetadata.ContentLength;
-      const sourceETag = sourceMetadata.ETag;
+      // Check if ETags match (ignoring multipart upload indicators)
+      const sourceEtagBase = sourceEtag.split("-")[0];
+      const destEtagBase = destEtag ? destEtag.split("-")[0] : null;
 
-      if (!sourceSize) {
-        throw new Error("Source file is empty");
-      }
-
-      // Copy the file
-      await this.s3Client.send(
-        new CopyObjectCommand({
-          Bucket: bucketName,
-          CopySource: `/${bucketName}/${tempKey}`,
-          Key: originalKey,
-        })
-      );
-
-      // Verify the copy was successful
-      const destCommand = new HeadObjectCommand({
-        Bucket: bucketName,
-        Key: originalKey,
-      });
-
-      try {
-        const destMetadata = await this.s3Client.send(destCommand);
-        const destSize = destMetadata.ContentLength;
-        const destETag = destMetadata.ETag;
-
-        if (!destSize || destSize !== sourceSize) {
-          throw new Error(
-            `Copy size mismatch: source=${sourceSize}, dest=${destSize}`
-          );
-        }
-
-        if (destETag !== sourceETag) {
-          throw new Error(
-            `Copy ETag mismatch: source=${sourceETag}, dest=${destETag}`
-          );
-        }
-
-        logger.info("[S3] Copy verified successfully", {
-          tempKey,
-          originalKey,
-          size: destSize,
+      if (!destEtag || sourceEtagBase !== destEtagBase) {
+        logger.warn(`[${jobId}] ETag mismatch detected, re-uploading`, {
+          sourceEtag,
+          destEtag,
+          sourceKey,
+          destKey,
         });
 
-        // Only delete source after successful verification
-        await this.s3Client.send(
-          new DeleteObjectCommand({
-            Bucket: bucketName,
-            Key: tempKey,
-          })
-        );
+        // Re-upload the file directly to the destination
+        const fileStream = await this.downloadFileToStream(sourceKey);
+        const upload = new Upload({
+          client: this.s3Client,
+          params: {
+            Bucket: bucket,
+            Key: destKey,
+            Body: fileStream,
+            ContentType: "video/mp4",
+          },
+        });
 
-        const url = this.getPublicUrl(originalKey, bucketName);
-        return { originalUrl: url, webpUrl: url };
-      } catch (verifyError) {
-        // If verification fails, try to clean up the destination
-        try {
-          await this.s3Client.send(
-            new DeleteObjectCommand({
-              Bucket: bucketName,
-              Key: originalKey,
-            })
-          );
-        } catch (cleanupError) {
-          logger.warn("[S3] Failed to cleanup failed copy", {
-            error:
-              cleanupError instanceof Error
-                ? cleanupError.message
-                : "Unknown error",
-            originalKey,
-          });
+        await upload.done();
+
+        // Verify the re-upload
+        const newDestEtag = await this.getObjectEtag(bucket, destKey);
+        if (!newDestEtag) {
+          throw new Error(`Re-uploaded file not found: ${destKey}`);
         }
-        throw verifyError;
+
+        // For multipart uploads, we can't compare ETags directly
+        // Instead, verify the file exists and has content
+        const verifyCommand = new HeadObjectCommand({
+          Bucket: bucket,
+          Key: destKey,
+        });
+        const verifyResponse = await this.s3Client.send(verifyCommand);
+        if (
+          !verifyResponse.ContentLength ||
+          verifyResponse.ContentLength === 0
+        ) {
+          throw new Error(`Re-uploaded file is empty: ${destKey}`);
+        }
+
+        logger.info(`[${jobId}] Re-upload successful`, {
+          destKey,
+          contentLength: verifyResponse.ContentLength,
+        });
       }
+
+      // Clean up the temp file only after successful copy/upload
+      await this.s3Client.send(
+        new DeleteObjectCommand({ Bucket: bucket, Key: sourceKey })
+      );
+      logger.info(`[${jobId}] Successfully moved file to ${destKey}`);
     } catch (error) {
-      logger.error("[S3] Error moving files:", {
+      logger.error(`[${jobId}] Failed to move S3 file`, {
         error: error instanceof Error ? error.message : "Unknown error",
-        tempKey,
-        listingId,
+        sourceKey,
+        destKey,
         stack: error instanceof Error ? error.stack : undefined,
       });
       throw error;

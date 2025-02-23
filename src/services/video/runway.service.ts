@@ -15,6 +15,7 @@ const RETRY_CONFIG = {
   maxDelay: 10000, // 10 seconds
   retryableStatuses: [429, 502, 503, 504],
 };
+const USE_MOCK_RUNWAY = process.env.USE_MOCK_RUNWAY === "true";
 
 interface RunwayError {
   status?: number;
