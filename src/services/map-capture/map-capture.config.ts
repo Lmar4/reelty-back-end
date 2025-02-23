@@ -33,11 +33,11 @@ export const MAP_CAPTURE_CONFIG = {
    */
   TIMEOUTS: {
     /** Maximum time to wait for map to load (ms) */
-    MAP_LOAD: 30000,
+    MAP_LOAD: 60000,
     /** Time between frame captures (ms) */
     FRAME_CAPTURE: 100,
     /** Initial wait time after map load (ms) */
-    INITIAL_LOAD: 2000,
+    INITIAL_LOAD: 5000,
   },
 
   /**
