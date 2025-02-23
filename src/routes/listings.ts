@@ -90,6 +90,42 @@ function validateListingData(
   }
 }
 
+// Add this function after the validateListingData function
+async function checkUserListingLimit(userId: string): Promise<{
+  canCreate: boolean;
+  currentCount: number;
+  maxAllowed: number;
+  currentTier: string;
+}> {
+  // Get user's current subscription tier
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      currentTier: true,
+      listings: {
+        where: {
+          status: "ACTIVE",
+        },
+      },
+    },
+  });
+
+  if (!user || !user.currentTier) {
+    throw new Error("User or subscription tier not found");
+  }
+
+  const currentCount = user.listings.length;
+  const maxAllowed = user.currentTier.maxActiveListings;
+  const currentTier = user.currentTier.name;
+
+  return {
+    canCreate: currentCount < maxAllowed,
+    currentCount,
+    maxAllowed,
+    currentTier,
+  };
+}
+
 // Get all listings
 const getListings = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -164,13 +200,33 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
     const userId = req.user!.id;
     const { address, description, coordinates, photoLimit, photos } = req.body;
 
+    // Check user's listing limit first
+    const limitCheck = await checkUserListingLimit(userId);
+    if (!limitCheck.canCreate) {
+      logger.error("[Listings] User has reached listing limit", {
+        userId,
+        currentCount: limitCheck.currentCount,
+        maxAllowed: limitCheck.maxAllowed,
+        tier: limitCheck.currentTier,
+      });
+      res.status(403).json({
+        success: false,
+        error: "Listing limit reached",
+        data: {
+          currentCount: limitCheck.currentCount,
+          maxAllowed: limitCheck.maxAllowed,
+          currentTier: limitCheck.currentTier,
+        },
+      });
+      return;
+    }
+
     logger.info("[Listings] Creating new listing", {
       userId,
       address,
       hasCoordinates: !!coordinates,
       photoLimit,
       photoCount: photos?.length || 0,
-      body: req.body,
     });
 
     // Validate photo limit
