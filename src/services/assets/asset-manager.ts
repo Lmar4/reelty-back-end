@@ -587,3 +587,4 @@ export class SharedAssetsManager {
 }
 
 export const sharedAssetsManager = SharedAssetsManager.getInstance();
+export const assetManager = AssetManager.getInstance();

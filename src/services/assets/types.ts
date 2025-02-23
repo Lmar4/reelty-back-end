@@ -43,7 +43,12 @@ export interface AssetStats {
 }
 
 // New template-specific types
-export type TemplateAssetType = "runway" | "map" | "watermark" | "music";
+export type TemplateAssetType =
+  | "runway"
+  | "map"
+  | "watermark"
+  | "music"
+  | "webp";
 
 export interface TemplateAssetMetadata {
   templateKey?: string;
