@@ -20,10 +20,16 @@ interface RegenerationPhoto {
   id: string;
   processedFilePath: string;
   order: number;
+  filePath: string;
 }
 
 interface RegenerationContext {
-  photosToRegenerate: RegenerationPhoto[];
+  photosToRegenerate: Array<{
+    id: string;
+    processedFilePath: string;
+    order: number;
+    filePath: string;
+  }>;
   existingPhotos: RegenerationPhoto[];
   regeneratedPhotoIds: string[];
   totalPhotos: number;
@@ -138,6 +144,7 @@ router.post(
                   id: photo.id,
                   processedFilePath: photoPath,
                   order: photo.order,
+                  filePath: photoPath,
                 },
               ],
               existingPhotos: photo.listing.photos
@@ -146,6 +153,7 @@ router.post(
                   id: p.id,
                   processedFilePath: p.processedFilePath || p.filePath,
                   order: p.order,
+                  filePath: p.processedFilePath || p.filePath,
                 })),
               regeneratedPhotoIds: [photoId],
               totalPhotos: photo.listing.photos.length,
@@ -279,12 +287,15 @@ router.post(
             processedFilePath:
               photoToRegenerate.processedFilePath || photoToRegenerate.filePath,
             order: photoToRegenerate.order,
+            filePath:
+              photoToRegenerate.processedFilePath || photoToRegenerate.filePath,
           },
         ],
         existingPhotos: existingPhotos.map((p) => ({
           id: p.id,
           processedFilePath: p.processedFilePath || p.filePath,
           order: p.order,
+          filePath: p.processedFilePath || p.filePath,
           runwayVideoPath: p.runwayVideoPath,
         })),
         regeneratedPhotoIds: [photoToRegenerate.id],
