@@ -9,8 +9,8 @@
   },
   "scripts": {
     "build": "pnpm prisma generate && tsc",
-    "start": "node build/server.js",
-    "dev": "tsx watch src/server.ts",
+    "start": "NODE_OPTIONS='--max-old-space-size=8192' node build/server.js",
+    "dev": "NODE_OPTIONS='--max-old-space-size=8192' tsx watch src/server.ts",
     "db:generate": "pnpm prisma generate",
     "db:push": "pnpm prisma db push",
     "db:migrate": "pnpm prisma migrate dev",
@@ -19,7 +19,7 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
-    "test:templates": "ts-node src/scripts/test-templates.ts",
+    "test:templates": "tsx src/scripts/test-template-generation.ts",
     "sync-stripe": "ts-node src/scripts/sync-stripe-plans.ts",
     "rerun-job": "ts-node src/scripts/rerunJob.ts"
   },
