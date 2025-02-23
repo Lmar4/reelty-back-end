@@ -96,7 +96,7 @@ async function processTemplate(
     },
     {
       path: watermarkPath,
-      position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-180" },
+      position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
     }
   );
 
