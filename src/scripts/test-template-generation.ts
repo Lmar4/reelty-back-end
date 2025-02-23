@@ -1,10 +1,10 @@
 import path from "path";
-import { videoProcessingService } from "../services/video/video-processing.service";
+import { videoProcessingService } from "../services/video/video-processing.service.js";
 import {
   reelTemplates,
   TemplateKey,
-} from "../services/imageProcessing/templates/types";
-import { logger } from "../utils/logger";
+} from "../services/imageProcessing/templates/types.js";
+import { logger } from "../utils/logger.js";
 import pLimit from "p-limit";
 import fs from "fs/promises";
 import { existsSync } from "fs";

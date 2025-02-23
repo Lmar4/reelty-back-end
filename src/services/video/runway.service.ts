@@ -1,9 +1,9 @@
 import RunwayML from "@runwayml/sdk";
-import { tempFileManager } from "../storage/temp-file.service";
-import { s3Service } from "../storage/s3.service";
-import { imageProcessor } from "../imageProcessing/image.service";
+import { tempFileManager } from "../storage/temp-file.service.js";
+import { s3Service } from "../storage/s3.service.js";
+import { imageProcessor } from "../imageProcessing/image.service.js";
 import * as fs from "fs/promises";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 import { Upload } from "@aws-sdk/lib-storage";
 import { S3Client } from "@aws-sdk/client-s3";
 import { Readable } from "stream";

@@ -1,6 +1,6 @@
 import { PrismaClient, Prisma } from "@prisma/client";
 import { createHash } from "crypto";
-import { TempFile } from "../storage/temp-file.service";
+import { TempFile } from "../storage/temp-file.service.js";
 
 export type AssetType = "webp" | "runway" | "ffmpeg" | "map" | "template";
 

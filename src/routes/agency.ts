@@ -1,9 +1,9 @@
 import express from "express";
 import { z } from "zod";
-import { AgencyService } from "../services/agency.service";
-import { validateRequest } from "../middleware/validate";
-import { isAuthenticated } from "../middleware/auth";
-import { isAgencyOwner } from "../middleware/roles";
+import { AgencyService } from "../services/agency.service.js";
+import { validateRequest } from "../middleware/validate.js";
+import { isAuthenticated } from "../middleware/auth.js";
+import { isAgencyOwner } from "../middleware/roles.js";
 
 const router = express.Router();
 const agencyService = new AgencyService();

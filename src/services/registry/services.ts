@@ -1,13 +1,13 @@
-import { progressTracker } from "../video/progress-tracker.service";
-import { runwayService } from "../video/runway.service";
-import { videoTemplateService } from "../video/video-template.service";
-import { videoProcessingService } from "../video/video-processing.service";
-import { mapCaptureService } from "../map-capture/map-capture.service";
-import { assetManager } from "../assets/asset-manager";
+import { progressTracker } from "../video/progress-tracker.service.js";
+import { runwayService } from "../video/runway.service.js";
+import { videoTemplateService } from "../video/video-template.service.js";
+import { videoProcessingService } from "../video/video-processing.service.js";
+import { mapCaptureService } from "../map-capture/map-capture.service.js";
+import { assetManager } from "../assets/asset-manager.js";
 
-import { retryService } from "../retry/retry.service";
-import { ServiceRegistry } from "./service.registry";
-import { resourceManager } from "../video/resource-manager.service";
+import { retryService } from "../retry/retry.service.js";
+import { ServiceRegistry } from "./service.registry.js";
+import { resourceManager } from "../video/resource-manager.service.js";
 
 export function registerServices(): void {
   const registry = ServiceRegistry.getInstance();

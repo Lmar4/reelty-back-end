@@ -1,8 +1,8 @@
 import express from "express";
 import { z } from "zod";
-import { BulkDiscountService } from "../../services/bulk-discount.service";
-import { validateRequest } from "../../middleware/validate";
-import { isAdmin } from "../../middleware/auth";
+import { BulkDiscountService } from "../../services/bulk-discount.service.js";
+import { validateRequest } from "../../middleware/validate.js";
+import { isAdmin } from "../../middleware/auth.js";
 
 const router = express.Router();
 const bulkDiscountService = new BulkDiscountService();

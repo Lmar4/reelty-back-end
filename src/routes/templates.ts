@@ -5,11 +5,11 @@ import {
   isValidTierId,
   SubscriptionTierId,
   SUBSCRIPTION_TIERS,
-} from "../constants/subscription-tiers";
-import { prisma } from "../lib/prisma";
-import { isAuthenticated } from "../middleware/auth";
-import { validateRequest } from "../middleware/validate";
-import { logger } from "../utils/logger";
+} from "../constants/subscription-tiers.js";
+import { prisma } from "../lib/prisma.js";
+import { isAuthenticated } from "../middleware/auth.js";
+import { validateRequest } from "../middleware/validate.js";
+import { logger } from "../utils/logger.js";
 
 const router = express.Router();
 

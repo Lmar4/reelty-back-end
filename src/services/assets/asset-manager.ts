@@ -2,17 +2,17 @@ import { AssetType, PrismaClient } from "@prisma/client";
 import * as crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
-import { logger } from "../../utils/logger";
-import { S3VideoService } from "../video/s3-video.service";
-import { AssetCacheService } from "../cache/asset-cache.service";
-import { TemplateKey } from "../imageProcessing/templates/types";
-import { videoProcessingService } from "../video/video-processing.service";
+import { logger } from "../../utils/logger.js";
+import { S3VideoService } from "../video/s3-video.service.js";
+import { AssetCacheService } from "../cache/asset-cache.service.js";
+import { TemplateKey } from "../imageProcessing/templates/types.js";
+import { videoProcessingService } from "../video/video-processing.service.js";
 import {
   TemplateAssetType,
   TemplateAssetMetadata,
   SharedAssets,
   AssetValidationResult,
-} from "./types";
+} from "./types.js";
 
 interface CachedAsset {
   path: string;

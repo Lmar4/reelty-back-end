@@ -1,6 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import Stripe from "stripe";
-import { plansService } from "../services/stripe/plans.service";
+import { plansService } from "../services/stripe/plans.service.js";
 import dotenv from "dotenv";
 
 // Load environment variables

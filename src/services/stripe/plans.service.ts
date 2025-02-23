@@ -6,8 +6,8 @@ import {
 } from "@prisma/client";
 import Stripe from "stripe";
 
-import { logger } from "../../utils/logger";
-import { ProductionPipeline } from "../imageProcessing/productionPipeline";
+import { logger } from "../../utils/logger.js";
+import { ProductionPipeline } from "../imageProcessing/productionPipeline.js";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
   apiVersion: "2025-01-27.acacia",

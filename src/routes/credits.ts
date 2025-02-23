@@ -5,10 +5,10 @@ import {
   getCreditHistory,
   purchaseCredits,
   getBalance,
-} from "../controllers/api/credits";
-import { isAuthenticated } from "../middleware/auth";
+} from "../controllers/api/credits.js";
+import { isAuthenticated } from "../middleware/auth.js";
 import { z } from "zod";
-import { validateRequest } from "../middleware/validate";
+import { validateRequest } from "../middleware/validate.js";
 
 const router = Router();
 

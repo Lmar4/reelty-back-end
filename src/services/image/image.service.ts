@@ -1,7 +1,7 @@
 import { PrismaClient } from "@prisma/client";
-import { s3Service } from "../storage/s3.service";
-import { assetCacheService } from "../cache/asset-cache.service";
-import { logger } from "../../utils/logger";
+import { s3Service } from "../storage/s3.service.js";
+import { assetCacheService } from "../cache/asset-cache.service.js";
+import { logger } from "../../utils/logger.js";
 
 export class ImageService {
   private static instance: ImageService;

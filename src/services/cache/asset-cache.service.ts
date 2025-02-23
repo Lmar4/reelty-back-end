@@ -1,5 +1,5 @@
 import { PrismaClient, Prisma } from "@prisma/client";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 import * as fs from "fs/promises";
 import * as crypto from "crypto";
 import * as path from "path";
@@ -7,7 +7,7 @@ import {
   TemplateAssetType,
   TemplateAssetMetadata,
   TemplateAssetOptions,
-} from "../assets/types";
+} from "../assets/types.js";
 
 interface CacheOptions {
   type: TemplateAssetType;

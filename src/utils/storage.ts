@@ -4,8 +4,8 @@ import {
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import { StoragePathParams } from "../config/storage";
-import { s3Client, AWS_CONFIG } from "../config/s3";
+import { StoragePathParams } from "../config/storage.js";
+import { s3Client, AWS_CONFIG } from "../config/s3.js";
 
 export const generateStoragePath = (
   pathTemplate: string,

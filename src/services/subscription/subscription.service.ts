@@ -6,8 +6,8 @@ import {
   Prisma,
   SubscriptionTierId,
 } from "@prisma/client";
-import { plansService } from "../stripe/plans.service";
-import { logger } from "../../utils/logger";
+import { plansService } from "../stripe/plans.service.js";
+import { logger } from "../../utils/logger.js";
 import Stripe from "stripe";
 
 const prisma = new PrismaClient();

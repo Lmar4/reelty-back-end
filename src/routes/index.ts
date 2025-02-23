@@ -1,13 +1,13 @@
 import express, { NextFunction, Request, Response } from "express";
-import { logger } from "../utils/logger";
-import creditsRouter from "./credits";
-import jobRouter from "./job";
-import listingsRouter from "./listings";
-import paymentRouter from "./payment";
-import storageRouter from "./storage";
-import subscriptionRouter from "./subscription";
-import templatesRouter from "./templates";
-import usersRouter from "./users";
+import { logger } from "../utils/logger.js";
+import creditsRouter from "./credits.js";
+import jobRouter from "./job.js";
+import listingsRouter from "./listings.js";
+import paymentRouter from "./payment.js";
+import storageRouter from "./storage.js";
+import subscriptionRouter from "./subscription.js";
+import templatesRouter from "./templates.js";
+import usersRouter from "./users.js";
 
 const router = express.Router();
 

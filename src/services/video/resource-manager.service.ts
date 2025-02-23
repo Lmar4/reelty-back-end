@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 
 class ResourceManagerService {
   private resources: Map<string, string[]>;

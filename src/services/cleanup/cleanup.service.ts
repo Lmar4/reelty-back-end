@@ -1,8 +1,8 @@
 import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import * as fs from "fs/promises";
-import { logger } from "../../utils/logger";
-import { s3Service } from "../storage/s3.service";
+import { logger } from "../../utils/logger.js";
+import { s3Service } from "../storage/s3.service.js";
 
 interface AssetMetadata {
   deletionStarted?: string;

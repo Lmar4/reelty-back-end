@@ -1,6 +1,6 @@
 import express, { RequestHandler } from "express";
 import { z } from "zod";
-import { validateRequest } from "../middleware/validate";
+import { validateRequest } from "../middleware/validate.js";
 import { getAuth } from "@clerk/express";
 import Stripe from "stripe";
 

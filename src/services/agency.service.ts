@@ -1,5 +1,5 @@
 import { PrismaClient, User, UserRole } from "@prisma/client";
-import { AgencyInput } from "../types/agency";
+import { AgencyInput } from "../types/agency.js";
 
 export class AgencyService {
   private prisma: PrismaClient;

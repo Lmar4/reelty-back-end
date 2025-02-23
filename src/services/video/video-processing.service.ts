@@ -3,13 +3,13 @@ import { promises as fs } from "fs";
 import { existsSync, mkdirSync } from "fs";
 import { createReadStream } from "fs";
 import * as path from "path";
-import { logger } from "../../utils/logger";
-import { S3Service } from "../storage/s3.service";
-import { ReelTemplate } from "../imageProcessing/templates/types";
+import { logger } from "../../utils/logger.js";
+import { S3Service } from "../storage/s3.service.js";
+import { ReelTemplate } from "../imageProcessing/templates/types.js";
 import {
   VideoTemplate,
   WatermarkConfig,
-} from "../video/video-template.service";
+} from "../video/video-template.service.js";
 import { exec } from "child_process";
 import { Upload } from "@aws-sdk/lib-storage";
 import { S3Client } from "@aws-sdk/client-s3";

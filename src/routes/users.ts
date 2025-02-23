@@ -1,8 +1,8 @@
 import express from "express";
 import { z } from "zod";
-import { prisma } from "../lib/prisma";
-import { isAuthenticated } from "../middleware/auth";
-import { logger } from "../utils/logger";
+import { prisma } from "../lib/prisma.js";
+import { isAuthenticated } from "../middleware/auth.js";
+import { logger } from "../utils/logger.js";
 
 const router = express.Router();
 

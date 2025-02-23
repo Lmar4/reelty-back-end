@@ -1,7 +1,7 @@
 import { PrismaClient, VideoGenerationStatus, SubscriptionStatus } from "@prisma/client";
 import express from "express";
 import { format, subDays } from "date-fns";
-import { isAdmin as requireAdmin } from "../../middleware/auth";
+import { isAdmin as requireAdmin } from "../../middleware/auth.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();

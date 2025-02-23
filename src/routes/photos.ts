@@ -1,11 +1,11 @@
 import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { VideoGenerationStatus } from "@prisma/client";
 import { Request, Response, Router } from "express";
-import { prisma } from "../lib/prisma";
-import { isAuthenticated } from "../middleware/auth";
-import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
-import { s3VideoService } from "../services/video/s3-video.service";
-import { logger } from "../utils/logger";
+import { prisma } from "../lib/prisma.js";
+import { isAuthenticated } from "../middleware/auth.js";
+import { ProductionPipeline } from "../services/imageProcessing/productionPipeline.js";
+import { s3VideoService } from "../services/video/s3-video.service.js";
+import { logger } from "../utils/logger.js";
 
 const router = Router();
 const productionPipeline = new ProductionPipeline();

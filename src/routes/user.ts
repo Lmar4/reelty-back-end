@@ -7,8 +7,8 @@ import {
   UserListResponse,
   createUserSchema,
   updateUserSchema,
-} from "../models/user";
-import { validateRequest } from "../middleware/validate";
+} from "../models/user.js";
+import { validateRequest } from "../middleware/validate.js";
 
 const router = Router();
 const prisma = new PrismaClient();

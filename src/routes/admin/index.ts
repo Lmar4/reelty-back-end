@@ -1,12 +1,12 @@
 import express from "express";
-import analyticsRoutes from "./analytics";
-import assetsRoutes from "./assets";
-import usersRoutes from "./users";
-import statsRoutes from "./stats";
-import bulkDiscountRoutes from "./bulk-discount";
-import agencyRoutes from "./agency";
-import subscriptionTiersRoutes from "./subscription-tiers";
-import templatesRoutes from "./templates";
+import analyticsRoutes from "./analytics.js";
+import assetsRoutes from "./assets.js";
+import usersRoutes from "./users.js";
+import statsRoutes from "./stats.js";
+import bulkDiscountRoutes from "./bulk-discount.js";
+import agencyRoutes from "./agency.js";
+import subscriptionTiersRoutes from "./subscription-tiers.js";
+import templatesRoutes from "./templates.js";
 
 const router = express.Router();
 

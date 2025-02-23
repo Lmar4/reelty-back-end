@@ -7,12 +7,12 @@ import {
   SubscriptionStatus,
   UserRole,
 } from "@prisma/client";
-import { SUBSCRIPTION_TIERS } from "../src/constants/subscription-tiers";
+import { SUBSCRIPTION_TIERS } from "../src/constants/subscription-tiers.js";
 import {
   reelTemplates,
   type TemplateKey,
   type ReelTemplate,
-} from "../src/services/imageProcessing/templates/types";
+} from "../src/services/imageProcessing/templates/types.js";
 
 const prisma = new PrismaClient();
 

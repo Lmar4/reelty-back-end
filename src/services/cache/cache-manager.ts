@@ -2,10 +2,10 @@ import {
   CacheEntry,
   CacheKey,
   ProcessingPromise,
-} from "../../types/video-processing";
-import { s3Service } from "../storage/s3.service";
-import { imageProcessor } from "../imageProcessing/image.service";
-import { runwayService } from "../video/runway.service";
+} from "../../types/video-processing.js";
+import { s3Service } from "../storage/s3.service.js";
+import { imageProcessor } from "../imageProcessing/image.service.js";
+import { runwayService } from "../video/runway.service.js";
 import path from "path";
 import fs from "fs";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";

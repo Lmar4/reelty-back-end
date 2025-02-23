@@ -1,5 +1,5 @@
 import { promises as fs } from "fs";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 
 export enum ResourceState {
   PENDING = "PENDING",

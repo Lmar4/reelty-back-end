@@ -1,5 +1,5 @@
 // src/services/retry/retry.service.ts
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 
 interface RetryOptions {
   maxRetries?: number;

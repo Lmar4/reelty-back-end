@@ -1,10 +1,10 @@
 import { Router, Request, Response } from "express";
-import { StorageService } from "../services/storage";
+import { StorageService } from "../services/storage.js";
 import { z } from "zod";
-import { validateRequest } from "../middleware/validate";
-import { isAuthenticated } from "../middleware/auth";
-import { prisma } from "../lib/prisma";
-import { logger } from "../utils/logger";
+import { validateRequest } from "../middleware/validate.js";
+import { isAuthenticated } from "../middleware/auth.js";
+import { prisma } from "../lib/prisma.js";
+import { logger } from "../utils/logger.js";
 
 const router = Router();
 const storageService = StorageService.getInstance();

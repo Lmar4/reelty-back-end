@@ -1,8 +1,8 @@
 import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { z } from "zod";
-import { ProductionPipeline } from "../../services/imageProcessing/productionPipeline";
-import { TemplateKey } from "../../services/imageProcessing/templates/types";
+import { ProductionPipeline } from "../../services/imageProcessing/productionPipeline.js";
+import { TemplateKey } from "../../services/imageProcessing/templates/types.js";
 const prisma = new PrismaClient();
 
 // Validation schemas

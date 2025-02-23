@@ -1,6 +1,8 @@
-import { logger } from "./logger.service";
-import { s3Service } from "./storage/s3.service";
-import { ProcessedImageResult, VideoService } from "../types";
+import { VideoService } from "../models/video.model.js";
+import { ProcessedImageResult } from "../types/index.js";
+import { logger } from "./logger.service.js";
+import { s3Service } from "./storage/s3.service.js";
+
 import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();

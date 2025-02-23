@@ -5,9 +5,9 @@ import {
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 import { Readable } from "stream";
-import { rateLimiter } from "./rate-limiter";
+import { rateLimiter } from "./rate-limiter.js";
 import { createReadStream } from "fs";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 import * as fs from "fs";
 import { parse as parseUrl } from "url";
 import { Upload } from "@aws-sdk/lib-storage";

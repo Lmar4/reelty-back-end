@@ -1,5 +1,5 @@
 import type { Asset as PrismaAsset, AssetType } from "@prisma/client";
-import { TemplateKey } from "../imageProcessing/templates/types";
+import { TemplateKey } from "../imageProcessing/templates/types.js";
 
 export type { AssetType, PrismaAsset as Asset };
 

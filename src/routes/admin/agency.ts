@@ -1,8 +1,8 @@
 import express from "express";
 import { z } from "zod";
-import { AgencyService } from "../../services/agency.service";
-import { validateRequest } from "../../middleware/validate";
-import { isAdmin as requireAdmin } from "../../middleware/auth";
+import { AgencyService } from "../../services/agency.service.js";
+import { validateRequest } from "../../middleware/validate.js";
+import { isAdmin as requireAdmin } from "../../middleware/auth.js";
 
 const router = express.Router();
 const agencyService = new AgencyService();

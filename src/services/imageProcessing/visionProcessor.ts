@@ -1,6 +1,6 @@
 import { promises as fsPromises } from "fs";
 import sharp from "sharp";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 import { Logger } from "winston";
 
 export interface CropCoordinates {

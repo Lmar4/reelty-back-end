@@ -19,26 +19,26 @@ import pLimit from "p-limit";
 import path from "path";
 import sharp from "sharp";
 import { Readable } from "stream";
-import { logger } from "../../utils/logger";
-import { streamToBuffer } from "../../utils/streamToBuffer";
-import { AssetManager } from "../assets/asset-manager";
-import { AssetCacheService } from "../cache/assetCache";
-import { mapCaptureService } from "../map-capture/map-capture.service";
-import { resourceManager, ResourceState } from "../storage/resource-manager";
-import { S3Service } from "../storage/s3.service";
-import { runwayService } from "../video/runway.service";
-import { S3VideoService } from "../video/s3-video.service";
-import { videoProcessingService } from "../video/video-processing.service";
-import { reelTemplates, TemplateKey } from "./templates/types";
-import { ImageOptimizationOptions, VisionProcessor } from "./visionProcessor";
+import { logger } from "../../utils/logger.js";
+import { streamToBuffer } from "../../utils/streamToBuffer.js";
+import { AssetManager } from "../assets/asset-manager.js";
+import { AssetCacheService } from "../cache/assetCache.js";
+import { mapCaptureService } from "../map-capture/map-capture.service.js";
+import { resourceManager, ResourceState } from "../storage/resource-manager.js";
+import { S3Service } from "../storage/s3.service.js";
+import { runwayService } from "../video/runway.service.js";
+import { S3VideoService } from "../video/s3-video.service.js";
+import { videoProcessingService } from "../video/video-processing.service.js";
+import { reelTemplates, TemplateKey } from "./templates/types.js";
+import { ImageOptimizationOptions, VisionProcessor } from "./visionProcessor.js";
 import {
   VideoTemplate,
   WatermarkConfig,
-} from "../video/video-template.service";
+} from "../video/video-template.service.js";
 import { existsSync } from "fs";
-import { VideoTemplateService } from "../video/video-template.service";
-import { ReelTemplate } from "./templates/types";
-import { VideoClip } from "../video/video-processing.service";
+import { VideoTemplateService } from "../video/video-template.service.js";
+import { ReelTemplate } from "./templates/types.js";
+import { VideoClip } from "../video/video-processing.service.js";
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",

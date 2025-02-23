@@ -1,6 +1,6 @@
-import { registerServices } from "./registry/services";
-import { logger } from "../utils/logger";
-import { ServiceRegistry } from "./registry/service.registry";
+import { registerServices } from "./registry/services.js";
+import { logger } from "../utils/logger.js";
+import { ServiceRegistry } from "./registry/service.registry.js";
 
 /**
  * Initialize all services in the correct order

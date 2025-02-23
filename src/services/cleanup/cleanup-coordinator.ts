@@ -1,6 +1,6 @@
-import { logger } from "../../utils/logger";
-import { ResourceManager, ResourceState } from "../storage/resource-manager";
-import { S3VideoService } from "../video/s3-video.service";
+import { logger } from "../../utils/logger.js";
+import { ResourceManager, ResourceState } from "../storage/resource-manager.js";
+import { S3VideoService } from "../video/s3-video.service.js";
 import { promises as fs } from "fs";
 
 interface CleanupTask {

@@ -1,19 +1,19 @@
 import { PutObjectCommand } from "@aws-sdk/client-s3";
-import { AWS_CONFIG, s3Client } from "../../config/s3";
+import { AWS_CONFIG, s3Client } from "../../config/s3.js";
 import {
   AllowedMimeType,
   AllowedMimeTypes,
   AssetType,
   FileType,
   StoragePathSchema,
-} from "../../config/storage";
+} from "../../config/storage.js";
 import {
   deleteFile,
   generatePresignedDownloadUrl,
   generatePresignedUploadUrl,
   generateStoragePath,
   generateUniqueFilename,
-} from "../../utils/storage";
+} from "../../utils/storage.js";
 
 export class StorageService {
   private static instance: StorageService;

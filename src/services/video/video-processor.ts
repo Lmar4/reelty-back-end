@@ -1,9 +1,9 @@
 import { VideoGenerationStatus } from "@prisma/client";
 import { v4 as uuid } from "uuid";
-import { assetCacheManager } from "../cache/cache-manager";
-import { rateLimiter } from "../utils/rate-limiter";
-import { Asset, JobStatus } from "../../types/video-processing";
-import { prisma } from "../../lib/prisma";
+import { assetCacheManager } from "../cache/cache-manager.js";
+import { rateLimiter } from "../utils/rate-limiter.js";
+import { Asset, JobStatus } from "../../types/video-processing.js";
+import { prisma } from "../../lib/prisma.js";
 
 export class VideoProcessor {
   private static instance: VideoProcessor;

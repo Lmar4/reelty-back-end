@@ -1,11 +1,11 @@
 import { Prisma, PrismaClient, VideoGenerationStatus } from "@prisma/client";
 import express, { Request, Response } from "express";
 import { z } from "zod";
-import { isAuthenticated } from "../middleware/auth";
-import { validateRequest } from "../middleware/validate";
-import { ProductionPipeline } from "../services/imageProcessing/productionPipeline";
-import { s3VideoService } from "../services/video/s3-video.service";
-import { logger } from "../utils/logger";
+import { isAuthenticated } from "../middleware/auth.js";
+import { validateRequest } from "../middleware/validate.js";
+import { ProductionPipeline } from "../services/imageProcessing/productionPipeline.js";
+import { s3VideoService } from "../services/video/s3-video.service.js";
+import { logger } from "../utils/logger.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();

@@ -15,8 +15,8 @@
 
 import { createHash } from "crypto";
 import fs from "fs";
-import { logger } from "../../utils/logger";
-import { MAP_CAPTURE_CONFIG } from "../map-capture/map-capture.config";
+import { logger } from "../../utils/logger.js";
+import { MAP_CAPTURE_CONFIG } from "../map-capture/map-capture.config.js";
 
 /**
  * Represents a cached map video entry

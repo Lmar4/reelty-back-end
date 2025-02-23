@@ -3,7 +3,7 @@ import ffmpeg from "fluent-ffmpeg";
 import { promisify } from "util";
 import * as fs from "fs";
 import * as path from "path";
-import { prisma } from "../lib/prisma";
+import { prisma } from "../lib/prisma.js";
 
 const mkdir = promisify(fs.mkdir);
 const unlink = promisify(fs.unlink);

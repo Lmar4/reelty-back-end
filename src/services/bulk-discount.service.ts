@@ -1,5 +1,5 @@
 import { PrismaClient } from "@prisma/client";
-import { BulkDiscountInput } from "../types/agency";
+import { BulkDiscountInput } from "../types/agency.js";
 
 const prisma = new PrismaClient();
 

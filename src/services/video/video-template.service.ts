@@ -1,16 +1,16 @@
 import { fileURLToPath } from "url";
 import * as path from "path";
 import * as fs from "fs/promises";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 import {
   reelTemplates,
   TemplateKey,
   ReelTemplate,
-} from "../imageProcessing/templates/types";
-import { VideoClip, videoProcessingService } from "./video-processing.service";
-import { AssetManager } from "../assets/asset-manager";
+} from "../imageProcessing/templates/types.js";
+import { VideoClip, videoProcessingService } from "./video-processing.service.js";
+import { AssetManager } from "../assets/asset-manager.js";
 import { AssetType } from "@prisma/client";
-import { S3VideoService } from "./s3-video.service";
+import { S3VideoService } from "./s3-video.service.js";
 
 // Get the directory of the current module
 const __filename = fileURLToPath(import.meta.url);

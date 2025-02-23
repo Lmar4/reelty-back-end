@@ -1,8 +1,8 @@
 import { PrismaClient, VideoGenerationStatus } from "@prisma/client";
-import { StorageService } from "../storage";
-import { ProductionPipeline } from "../imageProcessing/productionPipeline";
-import { TemplateKey } from "../imageProcessing/templates/types";
-import { logger } from "../../utils/logger";
+import { StorageService } from "../storage.js";
+import { ProductionPipeline } from "../imageProcessing/productionPipeline.js";
+import { TemplateKey } from "../imageProcessing/templates/types.js";
+import { logger } from "../../utils/logger.js";
 
 const prisma = new PrismaClient();
 

@@ -1,4 +1,4 @@
-import { cleanupTemporaryFiles } from "../utils/cleanup";
+import { cleanupTemporaryFiles } from "../utils/cleanup.js";
 import * as path from "path";
 
 const tempDir = path.join(process.cwd(), "temp");

@@ -1,8 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 import express, { RequestHandler } from "express";
 import { z } from "zod";
-import { isAdmin as requireAdmin } from "../../middleware/auth";
-import { validateRequest } from "../../middleware/validate";
+import { isAdmin as requireAdmin } from "../../middleware/auth.js";
+import { validateRequest } from "../../middleware/validate.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();

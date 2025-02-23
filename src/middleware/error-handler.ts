@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import { PrismaClientKnownRequestError } from "@prisma/client/runtime/library";
-import { logger } from "../utils/logger";
+import { logger } from "../utils/logger.js";
 
 export const errorHandler = (
   error: unknown,

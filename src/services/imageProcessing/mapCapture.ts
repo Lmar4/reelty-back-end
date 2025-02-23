@@ -3,7 +3,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import ffmpeg from "fluent-ffmpeg";
 import puppeteer, { Browser } from "puppeteer";
 import { PassThrough } from "stream";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 
 interface Coordinates {
   lat: number;

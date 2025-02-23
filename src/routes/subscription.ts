@@ -10,9 +10,9 @@ import {
   getTierNameFromId,
   isValidTierId,
   SUBSCRIPTION_TIERS,
-} from "../constants/subscription-tiers";
-import { isAuthenticated } from "../middleware/auth";
-import { validateRequest } from "../middleware/validate";
+} from "../constants/subscription-tiers.js";
+import { isAuthenticated } from "../middleware/auth.js";
+import { validateRequest } from "../middleware/validate.js";
 
 const router = express.Router();
 const prisma = new PrismaClient();

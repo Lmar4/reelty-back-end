@@ -10,7 +10,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import "dotenv/config";
 import * as fs from "fs";
 import { Readable } from "stream";
-import { logger } from "../../utils/logger";
+import { logger } from "../../utils/logger.js";
 import * as path from "path";
 import { promises as fsPromises } from "fs";
 

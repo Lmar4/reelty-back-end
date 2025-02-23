@@ -23,9 +23,9 @@ import ffmpeg from "fluent-ffmpeg";
 import { constants, promises as fsPromises, mkdirSync } from "fs";
 import * as path from "path";
 import puppeteer, { Browser, Page } from "puppeteer";
-import { logger } from "../../utils/logger";
-import { tempFileManager } from "../storage/temp-file.service";
-import { MAP_CAPTURE_CONFIG } from "./map-capture.config";
+import { logger } from "../../utils/logger.js";
+import { tempFileManager } from "../storage/temp-file.service.js";
+import { MAP_CAPTURE_CONFIG } from "./map-capture.config.js";
 
 // Declare types for Google Maps objects
 declare global {

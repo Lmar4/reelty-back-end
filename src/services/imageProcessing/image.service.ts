@@ -5,10 +5,10 @@ import * as path from "path";
 import sharp from "sharp";
 import { Readable } from "stream";
 import { v4 as uuidv4 } from "uuid";
-import { AssetCacheService, AssetType } from "../cache/assetCache";
-import { s3VideoService } from "../video/s3-video.service";
-import { TempFile } from "../storage/temp-file.service";
-import { logger } from "../../utils/logger";
+import { AssetCacheService, AssetType } from "../cache/assetCache.js";
+import { s3VideoService } from "../video/s3-video.service.js";
+import { TempFile } from "../storage/temp-file.service.js";
+import { logger } from "../../utils/logger.js";
 
 export const MAX_CONCURRENT_OPERATIONS = 10;
 export interface ImageValidation {

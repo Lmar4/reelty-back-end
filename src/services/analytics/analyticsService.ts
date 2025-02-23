@@ -1,4 +1,4 @@
-import { analytics } from "./posthog";
+import { analytics } from "./posthog.js";
 import {
   AnalyticsEvent,
   UserProperties,
@@ -6,7 +6,7 @@ import {
   SearchEvent,
   CreditEvent,
   PerformanceEvent,
-} from "./types";
+} from "./types.js";
 
 export class AnalyticsService {
   /**
