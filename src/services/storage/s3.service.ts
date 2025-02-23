@@ -11,6 +11,7 @@ import { logger } from "../../utils/logger";
 import * as fs from "fs";
 import { parse as parseUrl } from "url";
 import { Upload } from "@aws-sdk/lib-storage";
+import * as path from "path";
 
 const MAX_RETRIES = 5;
 const BASE_DELAY = 1000; // 1 second
@@ -131,31 +132,73 @@ export class S3Service {
   }
 
   public async downloadFile(url: string, localPath: string): Promise<void> {
-    try {
-      const { bucket, key } = this.parseUrl(url); // Use parseUrl
-      const response = await this.s3Client.send(
-        new GetObjectCommand({
-          Bucket: bucket,
-          Key: key,
-        })
-      );
-      if (!response.Body) {
-        throw new Error("Empty response from S3");
-      }
-      const writeStream = fs.createWriteStream(localPath);
-      await new Promise<void>((resolve, reject) => {
-        if (response.Body instanceof Readable) {
-          response.Body.pipe(writeStream)
-            .on("finish", () => resolve())
-            .on("error", (err: Error) => reject(err));
-        } else {
-          reject(new Error("Response body is not a readable stream"));
+    const MAX_RETRIES = 3;
+    const BASE_DELAY = 1000;
+
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      try {
+        // Ensure directory exists
+        await fs.promises.mkdir(path.dirname(localPath), { recursive: true });
+
+        const { bucket, key } = this.parseUrl(url);
+        const response = await this.s3Client.send(
+          new GetObjectCommand({ Bucket: bucket, Key: key })
+        );
+
+        if (!response.Body) {
+          throw new Error("Empty response from S3");
         }
-      });
-      logger.info("File downloaded from S3", { url, localPath });
-    } catch (error) {
-      logger.error("Failed to download file from S3:", { error, url });
-      throw error;
+
+        // Stream the file to disk
+        const writeStream = fs.createWriteStream(localPath);
+        await new Promise<void>((resolve, reject) => {
+          if (response.Body instanceof Readable) {
+            response.Body.pipe(writeStream)
+              .on("finish", () => {
+                writeStream.close();
+                resolve();
+              })
+              .on("error", (err: Error) => {
+                writeStream.close();
+                reject(err);
+              });
+          } else {
+            reject(new Error("Response body is not a readable stream"));
+          }
+        });
+
+        // Verify file was written successfully
+        const stats = await fs.promises.stat(localPath);
+        if (stats.size === 0) {
+          throw new Error("Downloaded file is empty");
+        }
+
+        logger.info("File downloaded from S3", {
+          url,
+          localPath,
+          size: stats.size,
+        });
+        return;
+      } catch (error) {
+        logger.warn(`Download attempt ${attempt + 1}/${MAX_RETRIES} failed`, {
+          error,
+        });
+
+        // Cleanup any partial file
+        if (fs.existsSync(localPath)) {
+          await fs.promises.unlink(localPath).catch(() => {});
+        }
+
+        if (attempt === MAX_RETRIES - 1) {
+          throw error;
+        }
+
+        // Exponential backoff with jitter
+        const delay =
+          Math.min(BASE_DELAY * Math.pow(2, attempt), 10000) *
+          (0.5 + Math.random());
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
     }
   }
 
