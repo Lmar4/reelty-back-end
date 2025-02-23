@@ -254,7 +254,7 @@ model Photo {
   // Relations
   user        User     @relation(fields: [userId], references: [id])
   listing     Listing  @relation(fields: [listingId], references: [id])
-
+@@unique([listingId, order])
   @@map("photos")
 }
 
