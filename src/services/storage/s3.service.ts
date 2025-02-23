@@ -21,9 +21,7 @@ export interface S3ParsedUrl {
   originalUrl: string;
 }
 
-if (!process.env.AWS_REGION) {
-  throw new Error("AWS_REGION environment variable is not set");
-}
+process.env.AWS_REGION = process.env.AWS_REGION || "us-east-2";
 
 // Set AWS_BUCKET with fallback value
 process.env.AWS_BUCKET = process.env.AWS_BUCKET || "reelty-prod-storage";
