@@ -3,9 +3,14 @@ import { logger } from "../../utils/logger";
 import * as fs from "fs/promises";
 import * as crypto from "crypto";
 import * as path from "path";
+import {
+  TemplateAssetType,
+  TemplateAssetMetadata,
+  TemplateAssetOptions,
+} from "../assets/types";
 
 interface CacheOptions {
-  type: "runway" | "map" | "webp" | "video";
+  type: TemplateAssetType;
   settings?: Record<string, any>;
   ttl?: number;
 }
@@ -13,6 +18,7 @@ interface CacheOptions {
 interface CacheMetadata extends Record<string, unknown> {
   type: string;
   expiresAt: string;
+  listingId?: string;
 }
 
 export class AssetCacheService {
@@ -388,6 +394,110 @@ export class AssetCacheService {
         }
       });
     }, "Cache cleanup");
+  }
+
+  private getTemplateCacheKey(
+    type: TemplateAssetType,
+    metadata: TemplateAssetMetadata
+  ): string {
+    const { jobId, templateKey, index, listingId } = metadata;
+    switch (type) {
+      case "runway":
+        return `runway_${jobId}_${index}`;
+      case "map":
+        if (!listingId) throw new Error("listingId required for map assets");
+        return `map_${jobId}_${listingId}`;
+      case "watermark":
+        return `watermark_${jobId}`;
+      case "music":
+        return `music_${templateKey}_${jobId}`;
+      default:
+        throw new Error(`Invalid template asset type: ${type}`);
+    }
+  }
+
+  async getCachedTemplateAsset(
+    type: TemplateAssetType,
+    metadata: TemplateAssetMetadata
+  ): Promise<string | null> {
+    const cacheKey = this.getTemplateCacheKey(type, metadata);
+    return this.getCachedAsset(cacheKey);
+  }
+
+  async cacheTemplateAsset(
+    filePath: string,
+    options: TemplateAssetOptions
+  ): Promise<void> {
+    const cacheKey = this.getTemplateCacheKey(options.type, options.metadata);
+    const metadata: CacheMetadata = {
+      type: options.type,
+      expiresAt: new Date(
+        Date.now() + (options.ttl || this.DEFAULT_TTL)
+      ).toISOString(),
+      listingId: options.metadata.listingId,
+    };
+
+    await this.cacheAsset(filePath, cacheKey, {
+      type: options.type,
+      settings: options.settings,
+      ttl: options.ttl || this.DEFAULT_TTL,
+    });
+  }
+
+  async cleanupTemplateAssets(jobId: string): Promise<void> {
+    return this.withRetry(async () => {
+      await this.prisma.$transaction(async (tx) => {
+        try {
+          const expiredAssets = await tx.processedAsset.findMany({
+            where: {
+              cacheKey: {
+                contains: jobId,
+              },
+            },
+          });
+
+          for (const asset of expiredAssets) {
+            const lockId = await this.acquireLock(asset.cacheKey, tx);
+            if (!lockId) {
+              logger.warn("Skipping cleanup for locked template asset", {
+                assetId: asset.id,
+                cacheKey: asset.cacheKey,
+                jobId,
+              });
+              continue;
+            }
+
+            try {
+              await fs.unlink(asset.path);
+              await tx.processedAsset.delete({
+                where: { id: asset.id },
+              });
+
+              logger.info("Cleaned up template asset", {
+                assetId: asset.id,
+                path: asset.path,
+                jobId,
+              });
+            } catch (error) {
+              logger.error("Failed to cleanup template asset", {
+                assetId: asset.id,
+                path: asset.path,
+                jobId,
+                error: error instanceof Error ? error.message : "Unknown error",
+              });
+            } finally {
+              await this.releaseLock(asset.cacheKey, lockId, tx);
+            }
+          }
+        } catch (error) {
+          logger.error("Failed to run template assets cleanup", {
+            jobId,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          throw error;
+        }
+      });
+    }, "Template assets cleanup");
   }
 }
 
