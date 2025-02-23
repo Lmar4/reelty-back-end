@@ -1,3 +1,4 @@
+import { PrismaClient } from "@prisma/client"; // Add this import
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -36,9 +37,12 @@ export class ImageProcessor {
   private readonly DEFAULT_CHUNK_SIZE = 1024 * 1024; // 1MB
   private readonly MAX_RETRIES = 3;
   private assetCache: AssetCacheService;
+  private prisma: PrismaClient; // Add PrismaClient property
 
-  constructor() {
+  constructor(prisma: PrismaClient) {
+    // Inject PrismaClient
     this.assetCache = AssetCacheService.getInstance();
+    this.prisma = prisma;
   }
 
   private generateUniqueFilename(originalName: string): string {
@@ -186,7 +190,12 @@ export class ImageProcessor {
     }
   }
 
-  public async processBatch(s3Paths: string[]): Promise<ProcessedImage[]> {
+  public async processBatch(
+    s3Paths: string[],
+    listingId: string,
+    photoOrderStart: number,
+    userId: string
+  ): Promise<ProcessedImage[]> {
     if (!Array.isArray(s3Paths) || s3Paths.length === 0) {
       throw new Error("Invalid input: s3Paths must be a non-empty array");
     }
@@ -227,7 +236,15 @@ export class ImageProcessor {
 
       try {
         const batchResults = await Promise.all(
-          batch.map((path) => this.processImage(path))
+          batch.map((path, idx) =>
+            this.processImage(
+              path, // inputPath
+              {}, // options (default)
+              listingId, // listingId
+              photoOrderStart + i + idx, // photoOrder (incremental based on batch position)
+              userId // userId
+            )
+          )
         );
         results.push(...batchResults);
 
@@ -287,18 +304,35 @@ export class ImageProcessor {
     });
   }
 
+  private getS3KeyFromUrl(url: string): string {
+    if (url.startsWith("s3://")) {
+      return url.slice(5).split("/").slice(1).join("/");
+    }
+    if (url.startsWith("http")) {
+      const urlObj = new URL(url);
+      return decodeURIComponent(urlObj.pathname.substring(1));
+    }
+    return url;
+  }
+
   public async processImage(
     inputPath: string,
-    options: ProcessingOptions = {}
+    options: ProcessingOptions = {},
+    listingId: string,
+    photoOrder: number,
+    userId: string
   ): Promise<ProcessedImage> {
-    console.log("Starting image processing:", { inputPath });
+    logger.info("Starting image processing:", {
+      inputPath,
+      listingId,
+      photoOrder,
+    });
 
     const outputPath = path.join(
       os.tmpdir(),
       this.generateUniqueFilename(path.basename(inputPath))
     );
 
-    // Create a temporary file that will be cleaned up
     const tempFile: TempFile = {
       path: outputPath,
       filename: path.basename(outputPath),
@@ -306,35 +340,69 @@ export class ImageProcessor {
         try {
           await fs.promises.unlink(outputPath);
         } catch (error) {
-          console.error("Failed to cleanup temp file:", error);
+          logger.error("Failed to cleanup temp file:", {
+            path: outputPath,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
         }
       },
     };
 
     try {
-      // Download and process the image
       let imageBuffer: Buffer;
       if (inputPath.startsWith("http") || inputPath.startsWith("s3://")) {
-        console.log("Downloading image from remote source:", inputPath);
+        logger.info("Downloading image from remote source:", { inputPath });
         imageBuffer = await this.downloadInChunks(inputPath);
       } else {
-        console.log("Reading image from local path:", inputPath);
+        logger.info("Reading image from local path:", { inputPath });
         imageBuffer = await fs.promises.readFile(inputPath);
       }
 
-      // Convert to WebP
-      console.log("Converting image to WebP:", { outputPath });
+      logger.info("Converting image to WebP:", { outputPath });
       const webpBuffer = await this.convertToWebP(imageBuffer, options);
       await fs.promises.writeFile(outputPath, webpBuffer);
 
-      // Upload to S3
-      const s3Key = `processed/${path.basename(outputPath)}`;
-      console.log("Uploading WebP to S3:", { s3Key });
+      const s3Key = `properties/${listingId}/images/processed/${path.basename(
+        outputPath
+      )}`;
+      logger.info("Uploading WebP to S3:", { s3Key });
       const fileBuffer = await fs.promises.readFile(outputPath);
       await s3VideoService.uploadFile(fileBuffer, s3Key);
       const s3Url = s3VideoService.getPublicUrl(s3Key);
 
-      // Cleanup temp file since we have it in S3
+      // Update or create Photo record
+      await this.prisma.photo.upsert({
+        where: {
+          listingId_order: {
+            listingId,
+            order: photoOrder,
+          },
+        },
+        update: {
+          processedFilePath: s3Url,
+          status: "COMPLETED",
+          updatedAt: new Date(),
+          metadata: {
+            visionProcessedAt: new Date().toISOString(),
+          },
+        },
+        create: {
+          userId,
+          listingId,
+          order: photoOrder,
+          filePath: inputPath,
+          s3Key: this.getS3KeyFromUrl(inputPath),
+          processedFilePath: s3Url,
+          status: "COMPLETED",
+        },
+      });
+
+      logger.info("Processed and stored image in Photo record", {
+        listingId,
+        photoOrder,
+        s3Url,
+      });
+
       await tempFile.cleanup();
 
       return {
@@ -343,9 +411,12 @@ export class ImageProcessor {
         uploadPromise: Promise.resolve(),
       };
     } catch (error) {
-      console.error("Failed to process image:", {
+      logger.error("Failed to process image:", {
         inputPath,
+        listingId,
+        photoOrder,
         error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
       });
       await tempFile.cleanup();
       throw error;
@@ -361,7 +432,10 @@ export class ImageProcessor {
 
   public async processWebp(
     inputPath: string,
-    options: ProcessingOptions = {}
+    options: ProcessingOptions = {},
+    listingId: string,
+    photoOrder: number,
+    userId: string
   ): Promise<ProcessedImage> {
     const cacheKey = this.assetCache.generateCacheKey("webp" as AssetType, {
       path: inputPath,
@@ -403,7 +477,13 @@ export class ImageProcessor {
 
     // Only process the original image if no cached version exists or cache is invalid
     logger.info("Processing original image:", inputPath);
-    const processedImage = await this.processImage(inputPath, options);
+    const processedImage = await this.processImage(
+      inputPath, // inputPath
+      options, // options
+      listingId, // listingId
+      photoOrder, // photoOrder
+      userId // userId
+    );
 
     // Cache the result
     await this.assetCache.cacheAsset({
@@ -429,5 +509,5 @@ export class ImageProcessor {
   }
 }
 
-// Export singleton instance
-export const imageProcessor = new ImageProcessor();
+// Export singleton instance with Prisma injection
+export const imageProcessor = new ImageProcessor(new PrismaClient());
