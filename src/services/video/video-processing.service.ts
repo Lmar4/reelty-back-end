@@ -124,11 +124,32 @@ export class VideoProcessingService {
     context: string = "file"
   ): Promise<void> {
     try {
+      // Check if file exists and is readable
       await fs.access(filePath, fs.constants.R_OK);
+
+      // Get file stats
       const stats = await fs.stat(filePath);
       if (stats.size === 0) {
         throw new Error(`${context} is empty`);
       }
+
+      // For media files, try to validate format
+      if (context === "video" || context === "music") {
+        try {
+          const duration = await this.getVideoDuration(filePath);
+          if (duration <= 0) {
+            throw new Error(`Invalid ${context} duration: ${duration}`);
+          }
+          logger.debug(`Validated ${context} duration`, { filePath, duration });
+        } catch (error) {
+          logger.error(`Failed to validate ${context} duration`, {
+            filePath,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          throw error;
+        }
+      }
+
       logger.debug(`Validated ${context} file`, { filePath, size: stats.size });
     } catch (error) {
       logger.error(`Failed to validate ${context} file`, {
@@ -435,25 +456,25 @@ export class VideoProcessingService {
     progressEmitter?: EventEmitter
   ): Promise<void> {
     const startTime = Date.now();
+    const jobId = crypto.randomUUID();
+
+    // Log clips order before processing
+    logger.info(`[${jobId}] Clips prepared for stitching`, {
+      clips: clips.map((c) => ({ path: c.path, duration: c.duration })),
+    });
 
     // Validate and log detailed clip information
     const clipsWithDuration = await Promise.all(
       clips.map(async (clip, index) => {
         try {
-          const resolvedPath = await this.resolveAssetPath(
-            clip.path,
-            "video",
-            true
-          );
           // Get video duration if not already set
           if (clip.duration == null) {
-            const duration = await this.getVideoDuration(resolvedPath);
+            const duration = await this.getVideoDuration(clip.path);
             clip.duration = duration;
           }
 
-          logger.info(`Clip ${index} validation:`, {
+          logger.info(`[${jobId}] Clip ${index} validation:`, {
             path: clip.path,
-            resolvedPath,
             originalDuration: clip.duration,
             hasTransition: !!clip.transition,
             hasColorCorrection: !!clip.colorCorrection,
@@ -461,7 +482,7 @@ export class VideoProcessingService {
 
           return clip;
         } catch (error) {
-          logger.error(`Failed to process clip ${index}:`, {
+          logger.error(`[${jobId}] Failed to process clip ${index}:`, {
             path: clip.path,
             error: error instanceof Error ? error.message : "Unknown error",
           });
@@ -495,17 +516,20 @@ export class VideoProcessingService {
 
       const setupCommand = async () => {
         try {
-          await Promise.all(
-            clipsWithDuration.map(async (clip, i) => {
-              const resolvedPath = await this.resolveAssetPath(
-                clip.path,
-                "video",
-                true
-              );
-              await this.validateFile(resolvedPath, `Clip ${i}`);
-              command.input(resolvedPath);
-            })
-          );
+          // Sequential processing of inputs to preserve order
+          for (const [i, clip] of clipsWithDuration.entries()) {
+            const resolvedPath = await this.resolveAssetPath(
+              clip.path,
+              "video",
+              true
+            );
+            await this.validateFile(resolvedPath, `Clip ${i}`);
+            command.input(resolvedPath);
+            logger.info(`[${jobId}] Added FFmpeg input ${i}`, {
+              path: resolvedPath,
+              isMap: clip.path.includes("map"),
+            });
+          }
 
           let musicIndex = -1;
           let musicPath = "";
@@ -517,6 +541,9 @@ export class VideoProcessingService {
             );
             musicIndex = clipsWithDuration.length;
             command.input(musicPath);
+            logger.info(`[${jobId}] Added music input at index ${musicIndex}`, {
+              path: musicPath,
+            });
           }
 
           let watermarkIndex = -1;
@@ -532,6 +559,10 @@ export class VideoProcessingService {
             command
               .input(watermarkPath)
               .inputOptions(["-loop", "1", "-framerate", "24", "-f", "image2"]);
+            logger.info(
+              `[${jobId}] Added watermark input at index ${watermarkIndex}`,
+              { path: watermarkPath }
+            );
           }
 
           const filterGraph = this.buildFilterGraph(
@@ -794,25 +825,89 @@ export class VideoProcessingService {
     });
   }
 
-  private async getVideoDuration(filePath: string): Promise<number> {
+  public async getVideoDuration(filePath: string): Promise<number> {
     return new Promise((resolve, reject) => {
+      // Add file existence check
+      if (!existsSync(filePath)) {
+        logger.error("File not found when getting duration:", {
+          path: filePath,
+        });
+        reject(new Error(`File not found: ${filePath}`));
+        return;
+      }
+
       ffmpeg.ffprobe(filePath, (err, metadata) => {
         if (err) {
           logger.error("Failed to get video duration:", {
             path: filePath,
             error: err.message,
+            command: err.code, // Log the ffmpeg command that failed
           });
           reject(err);
           return;
         }
-        const duration = metadata.format.duration;
-        if (!duration) {
-          reject(new Error(`No duration found for video: ${filePath}`));
+
+        // Add more robust duration extraction and ensure number type
+        const duration = Number(
+          metadata?.format?.duration || metadata?.streams?.[0]?.duration || 0
+        );
+
+        if (!duration || duration <= 0) {
+          logger.warn(`Invalid duration (${duration}) found for file:`, {
+            path: filePath,
+          });
+          reject(new Error(`Invalid duration found for file: ${filePath}`));
           return;
         }
+
+        logger.debug("Successfully got duration", { path: filePath, duration });
         resolve(duration);
       });
     });
+  }
+
+  public async validateVideoIntegrity(filePath: string): Promise<boolean> {
+    try {
+      const duration = await this.getVideoDuration(filePath);
+      if (duration <= 0) return false;
+
+      // Add additional integrity checks as needed
+      // For example, check if the file has valid video/audio streams
+
+      return true;
+    } catch (error) {
+      logger.error("Video integrity check failed", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        filePath,
+      });
+      return false;
+    }
+  }
+
+  public async validateMusicFile(filePath: string): Promise<boolean> {
+    try {
+      // First check if file exists and has content
+      await this.validateFile(filePath, "music");
+
+      // Try to get duration as additional validation
+      const duration = await this.getVideoDuration(filePath);
+
+      if (duration <= 0) {
+        logger.warn("Invalid music file duration", {
+          path: filePath,
+          duration,
+        });
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      logger.warn("Music file validation failed", {
+        path: filePath,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      return false;
+    }
   }
 }
 

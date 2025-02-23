@@ -11,6 +11,8 @@ import "dotenv/config";
 import * as fs from "fs";
 import { Readable } from "stream";
 import { logger } from "../../utils/logger";
+import * as path from "path";
+import { promises as fsPromises } from "fs";
 
 export class S3VideoService {
   private static instance: S3VideoService;
@@ -100,28 +102,52 @@ export class S3VideoService {
   public async downloadVideo(s3Path: string, localPath: string): Promise<void> {
     try {
       const { bucket, key } = this.parseS3Path(s3Path);
+
+      // Ensure the directory exists
+      const dir = path.dirname(localPath);
+      await fsPromises.mkdir(dir, { recursive: true });
+
       const command = new GetObjectCommand({
         Bucket: bucket,
         Key: key,
       });
 
       const response = await this.s3Client.send(command);
+
       if (!response.Body) {
-        throw new Error("No response body from S3");
+        throw new Error("Empty response body from S3");
       }
 
-      const stream = response.Body as any;
+      // Use streams for better memory handling
+      const writeStream = fs.createWriteStream(localPath);
+      const body = response.Body;
+      if (!body || !(body instanceof Readable)) {
+        throw new Error("Invalid response body from S3");
+      }
+
       await new Promise<void>((resolve, reject) => {
-        const writeStream = fs.createWriteStream(localPath);
-        stream.pipe(writeStream);
-        writeStream.on("finish", () => resolve());
-        writeStream.on("error", reject);
+        body
+          .pipe(writeStream)
+          .on("finish", () => resolve())
+          .on("error", reject);
+      });
+
+      // Validate the downloaded file
+      const stats = await fsPromises.stat(localPath);
+      if (stats.size === 0) {
+        throw new Error("Downloaded file is empty");
+      }
+
+      logger.info("File downloaded from S3", {
+        localPath,
+        url: s3Path,
+        size: stats.size,
       });
     } catch (error) {
-      console.error("S3 video download failed:", {
-        error: error instanceof Error ? error.message : "Unknown error",
+      logger.error("Failed to download file from S3:", {
         s3Path,
         localPath,
+        error: error instanceof Error ? error.message : "Unknown error",
       });
       throw error;
     }
@@ -222,17 +248,20 @@ export class S3VideoService {
     sourceKey: string,
     listingId: string,
     jobId: string
-  ): Promise<void> {
+  ): Promise<string> {
     const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
     const destKey = `properties/${listingId}/videos/maps/${jobId}.mp4`;
 
     logger.info(`[${jobId}] Starting S3 move from ${sourceKey} to ${destKey}`);
 
     try {
-      // First verify source exists and get its ETag
-      const sourceEtag = await this.getObjectEtag(bucket, sourceKey);
-      if (!sourceEtag) {
-        throw new Error(`Source file not found: ${sourceKey}`);
+      // First verify source exists and get its metadata
+      const sourceHead = await this.s3Client.send(
+        new HeadObjectCommand({ Bucket: bucket, Key: sourceKey })
+      );
+      const sourceEtag = sourceHead.ETag?.replace(/"/g, "") || null;
+      if (!sourceEtag || !sourceHead.ContentLength) {
+        throw new Error(`Source file not found or empty: ${sourceKey}`);
       }
 
       // Attempt to copy the file
@@ -242,66 +271,45 @@ export class S3VideoService {
         Key: destKey,
       });
 
-      const response = await this.s3Client.send(copyCommand);
-      const destEtag = response.CopyObjectResult?.ETag?.replace(/"/g, "");
+      await this.s3Client.send(copyCommand);
 
-      // Check if ETags match (ignoring multipart upload indicators)
-      const sourceEtagBase = sourceEtag.split("-")[0];
-      const destEtagBase = destEtag ? destEtag.split("-")[0] : null;
+      // Verify copy success with retries
+      const MAX_RETRIES = 3;
+      const RETRY_DELAY = 1000;
 
-      if (!destEtag || sourceEtagBase !== destEtagBase) {
-        logger.warn(`[${jobId}] ETag mismatch detected, re-uploading`, {
-          sourceEtag,
-          destEtag,
-          sourceKey,
-          destKey,
-        });
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        const destHead = await this.s3Client.send(
+          new HeadObjectCommand({ Bucket: bucket, Key: destKey })
+        );
 
-        // Re-upload the file directly to the destination
-        const fileStream = await this.downloadFileToStream(sourceKey);
-        const upload = new Upload({
-          client: this.s3Client,
-          params: {
-            Bucket: bucket,
-            Key: destKey,
-            Body: fileStream,
-            ContentType: "video/mp4",
-          },
-        });
+        if (destHead.ContentLength === sourceHead.ContentLength) {
+          // Clean up the temp file only after successful copy verification
+          await this.s3Client.send(
+            new DeleteObjectCommand({ Bucket: bucket, Key: sourceKey })
+          );
 
-        await upload.done();
+          const finalUrl = this.getPublicUrl(destKey, bucket);
+          logger.info(`[${jobId}] Successfully moved and verified file`, {
+            sourceKey,
+            destKey,
+            finalUrl,
+            contentLength: destHead.ContentLength,
+          });
 
-        // Verify the re-upload
-        const newDestEtag = await this.getObjectEtag(bucket, destKey);
-        if (!newDestEtag) {
-          throw new Error(`Re-uploaded file not found: ${destKey}`);
+          return finalUrl;
         }
 
-        // For multipart uploads, we can't compare ETags directly
-        // Instead, verify the file exists and has content
-        const verifyCommand = new HeadObjectCommand({
-          Bucket: bucket,
-          Key: destKey,
-        });
-        const verifyResponse = await this.s3Client.send(verifyCommand);
-        if (
-          !verifyResponse.ContentLength ||
-          verifyResponse.ContentLength === 0
-        ) {
-          throw new Error(`Re-uploaded file is empty: ${destKey}`);
+        if (attempt < MAX_RETRIES - 1) {
+          logger.warn(`[${jobId}] Size mismatch, retrying verification`, {
+            attempt: attempt + 1,
+            sourceSize: sourceHead.ContentLength,
+            destSize: destHead.ContentLength,
+          });
+          await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
         }
-
-        logger.info(`[${jobId}] Re-upload successful`, {
-          destKey,
-          contentLength: verifyResponse.ContentLength,
-        });
       }
 
-      // Clean up the temp file only after successful copy/upload
-      await this.s3Client.send(
-        new DeleteObjectCommand({ Bucket: bucket, Key: sourceKey })
-      );
-      logger.info(`[${jobId}] Successfully moved file to ${destKey}`);
+      throw new Error("Failed to verify copied file integrity after retries");
     } catch (error) {
       logger.error(`[${jobId}] Failed to move S3 file`, {
         error: error instanceof Error ? error.message : "Unknown error",

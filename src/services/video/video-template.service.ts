@@ -58,69 +58,84 @@ export class VideoTemplateService {
     return VideoTemplateService.instance;
   }
 
+  private async validateMusicFile(musicPath: string): Promise<boolean> {
+    try {
+      // First try with ffprobe
+      const duration = await videoProcessingService.getVideoDuration(musicPath);
+      if (duration > 0) return true;
+
+      // If ffprobe fails, try to read the file as a buffer to verify it exists
+      const buffer = await fs.readFile(musicPath);
+      if (buffer.length === 0) {
+        logger.warn("Music file is empty", { path: musicPath });
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      logger.warn("Music file validation failed", {
+        path: musicPath,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      return false;
+    }
+  }
+
   /**
    * Resolves asset paths using AssetManager or falls back to local filesystem
    */
-  private async resolveAssetPath(
+  public async resolveAssetPath(
     assetPath: string,
-    type: "music" | "watermark",
-    isRequired: boolean = false
+    assetType: "music" | "watermark",
+    download = false
   ): Promise<string | null> {
     try {
-      // Map type to AssetType enum
-      const assetType =
-        type === "music" ? AssetType.MUSIC : AssetType.WATERMARK;
       const assetName = path.basename(assetPath);
 
-      // Use AssetManager to fetch from S3 or local cache
+      // Try primary asset first
       const resolvedPath = await this.assetManager.getAssetPath(
-        assetType,
+        assetType === "music" ? AssetType.MUSIC : AssetType.WATERMARK,
         assetName
       );
 
       if (resolvedPath) {
-        // If it's an S3 URL, verify it exists
-        if (resolvedPath.startsWith("https://")) {
-          const { bucket, key } = this.parseS3Url(resolvedPath);
-          const exists = await this.s3VideoService.checkFileExists(bucket, key);
-          if (!exists) {
-            logger.warn("Asset not found in S3", {
+        // For music files, add validation
+        if (assetType === "music") {
+          const localPath = path.join(
+            process.cwd(),
+            "temp",
+            `music_${Date.now()}.mp3`
+          );
+          await this.s3VideoService.downloadVideo(resolvedPath, localPath);
+
+          const isValid = await this.validateMusicFile(localPath);
+          if (!isValid) {
+            logger.warn("Primary music file invalid, trying fallback", {
               originalPath: assetPath,
               resolvedPath,
-              type,
             });
-            if (isRequired) {
-              throw new Error(
-                `Required ${type} asset not found in S3: ${assetPath}`
-              );
+
+            // Try fallback music
+            const fallbackPath = await this.assetManager.getAssetPath(
+              AssetType.MUSIC,
+              path.basename(assetPath),
+              true // Force fallback by setting forceDownload to true
+            );
+            if (fallbackPath) {
+              await this.s3VideoService.downloadVideo(fallbackPath, localPath);
+              const fallbackValid = await this.validateMusicFile(localPath);
+              if (fallbackValid) {
+                return fallbackPath;
+              }
             }
-            return null;
-          }
-        } else {
-          // If it's a local file, verify it exists
-          try {
-            await fs.access(resolvedPath, fs.constants.R_OK);
-          } catch (error) {
-            logger.warn("Local asset not accessible", {
-              originalPath: assetPath,
-              resolvedPath,
-              type,
-              error: error instanceof Error ? error.message : "Unknown error",
-            });
-            if (isRequired) {
-              throw new Error(
-                `Required ${type} asset not accessible: ${assetPath}`
-              );
+
+            if (download) {
+              throw new Error(`No valid music file available for ${assetPath}`);
             }
             return null;
           }
         }
 
-        logger.info("Asset resolved and verified", {
-          originalPath: assetPath,
-          resolvedPath,
-          type,
-        });
         return resolvedPath;
       }
 
@@ -136,21 +151,23 @@ export class VideoTemplateService {
       } catch (fsError) {
         logger.error("Failed to resolve asset path", {
           assetPath,
-          type,
+          type: assetType,
           fsError: fsError instanceof Error ? fsError.message : "Unknown error",
         });
-        if (isRequired) {
-          throw new Error(`Required ${type} asset not found: ${assetPath}`);
+        if (download) {
+          throw new Error(
+            `Required ${assetType} asset not found: ${assetPath}`
+          );
         }
         return null;
       }
     } catch (error) {
       logger.error("Asset resolution failed", {
         assetPath,
-        type,
+        type: assetType,
         error: error instanceof Error ? error.message : "Unknown error",
       });
-      if (isRequired) {
+      if (download) {
         throw error;
       }
       return null;
@@ -240,14 +257,15 @@ export class VideoTemplateService {
     if (options?.watermark) {
       try {
         const watermarkPath = await this.resolveAssetPath(
-          "reelty_watermark.png",
+          // "reelty_watermark.png",
+          "watermark_transparent_v1.png",
           "watermark",
           true // Watermark is always required if specified
         );
         if (watermarkPath) {
           watermarkConfig = {
             path: watermarkPath,
-            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-180" },
+            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
           };
           logger.info("Watermark configured successfully", {
             path: watermarkPath,
