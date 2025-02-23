@@ -1,5 +1,5 @@
 import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { Photo as PrismaPhoto, VideoGenerationStatus } from "@prisma/client";
+import { VideoGenerationStatus } from "@prisma/client";
 import { Request, Response, Router } from "express";
 import { prisma } from "../lib/prisma";
 import { isAuthenticated } from "../middleware/auth";
@@ -34,6 +34,12 @@ interface BatchRegenerateRequest extends Request {
     photoIds: string[];
   };
   user?: { id: string };
+}
+
+interface JobMetadata {
+  isRegeneration: boolean;
+  forceRegeneration: boolean;
+  regenerationContext: RegenerationContext;
 }
 
 // Single photo regeneration
@@ -123,27 +129,38 @@ router.post(
           status: VideoGenerationStatus.PENDING,
           template: "crescendo",
           inputFiles,
+          metadata: {
+            isRegeneration: true,
+            forceRegeneration: true,
+            regenerationContext: {
+              photosToRegenerate: [
+                {
+                  id: photo.id,
+                  processedFilePath: photoPath,
+                  order: photo.order,
+                },
+              ],
+              existingPhotos: photo.listing.photos
+                .filter((p) => p.id !== photoId)
+                .map((p) => ({
+                  id: p.id,
+                  processedFilePath: p.processedFilePath || p.filePath,
+                  order: p.order,
+                })),
+              regeneratedPhotoIds: [photoId],
+              totalPhotos: photo.listing.photos.length,
+            },
+          },
         },
       });
 
-      logger.info("[PHOTO_REGENERATE] Job created", { jobId: job.id, photoId });
+      logger.info("[PHOTO_REGENERATE] Job created with metadata", {
+        jobId: job.id,
+        photoId,
+        metadata: job.metadata,
+      });
 
-      const photosToRegenerate = [
-        {
-          id: photo.id,
-          processedFilePath: photoPath,
-          order: photo.order,
-        },
-      ];
-      const existingPhotos = photo.listing.photos
-        .filter((p) => p.id !== photoId)
-        .map((p) => ({
-          id: p.id,
-          processedFilePath: p.processedFilePath || p.filePath,
-          order: p.order,
-        }));
-
-      // Execute pipeline with original paths
+      // Execute pipeline with enhanced logging
       productionPipeline
         .execute({
           jobId: job.id,
@@ -153,18 +170,16 @@ router.post(
             | { lat: number; lng: number }
             | undefined,
           isRegeneration: true,
-          regenerationContext: {
-            photosToRegenerate,
-            existingPhotos,
-            regeneratedPhotoIds: [photoId],
-            totalPhotos: photo.listing.photos.length,
-          },
+          forceRegeneration: true,
+          regenerationContext: (job.metadata as unknown as JobMetadata)
+            .regenerationContext,
           skipLock: true,
         })
         .catch(async (error) => {
           logger.error("[PHOTO_REGENERATE] Regeneration failed", {
             jobId: job.id,
             photoId,
+            metadata: job.metadata,
             error: error instanceof Error ? error.message : "Unknown error",
           });
           await prisma.videoJob.update({
@@ -172,6 +187,7 @@ router.post(
             data: {
               status: VideoGenerationStatus.FAILED,
               error: error.message,
+              completedAt: new Date(),
             },
           });
         });
@@ -256,7 +272,26 @@ router.post(
         orderBy: { order: "asc" },
       });
 
-      // Create video job with regeneration context
+      const regenerationContext = {
+        photosToRegenerate: [
+          {
+            id: photoToRegenerate.id,
+            processedFilePath:
+              photoToRegenerate.processedFilePath || photoToRegenerate.filePath,
+            order: photoToRegenerate.order,
+          },
+        ],
+        existingPhotos: existingPhotos.map((p) => ({
+          id: p.id,
+          processedFilePath: p.processedFilePath || p.filePath,
+          order: p.order,
+          runwayVideoPath: p.runwayVideoPath,
+        })),
+        regeneratedPhotoIds: [photoToRegenerate.id],
+        totalPhotos: existingPhotos.length + 1,
+      };
+
+      // Create video job with explicit metadata
       const job = await prisma.videoJob.create({
         data: {
           listingId: photoToRegenerate.listingId,
@@ -268,30 +303,19 @@ router.post(
           ],
           metadata: {
             isRegeneration: true,
-            regenerationContext: {
-              photosToRegenerate: [
-                {
-                  id: photoToRegenerate.id,
-                  processedFilePath:
-                    photoToRegenerate.processedFilePath ||
-                    photoToRegenerate.filePath,
-                  order: photoToRegenerate.order,
-                },
-              ],
-              existingPhotos: existingPhotos.map((p) => ({
-                id: p.id,
-                processedFilePath: p.processedFilePath || p.filePath,
-                order: p.order,
-                runwayVideoPath: p.runwayVideoPath,
-              })),
-              regeneratedPhotoIds: [photoToRegenerate.id],
-              totalPhotos: existingPhotos.length + 1,
-            },
+            forceRegeneration: true,
+            regenerationContext,
           },
         },
       });
 
-      // Execute pipeline
+      logger.info("[BATCH_REGENERATE] Job created with metadata", {
+        jobId: job.id,
+        listingId: photoToRegenerate.listingId,
+        metadata: job.metadata,
+      });
+
+      // Execute pipeline with enhanced logging
       setImmediate(async () => {
         try {
           const listing = await prisma.listing.findUnique({
@@ -299,17 +323,25 @@ router.post(
             select: { coordinates: true },
           });
 
+          logger.info("[BATCH_REGENERATE] Starting pipeline execution", {
+            jobId: job.id,
+            listingId: photoToRegenerate.listingId,
+            metadata: job.metadata,
+            inputFiles: job.inputFiles,
+          });
+
           await productionPipeline.execute({
             jobId: job.id,
-            inputFiles: [
-              photoToRegenerate.processedFilePath || photoToRegenerate.filePath,
-            ],
+            listingId: photoToRegenerate.listingId,
+            inputFiles: job.inputFiles as unknown as string[],
             template: "crescendo",
             coordinates: listing?.coordinates as
               | { lat: number; lng: number }
               | undefined,
             isRegeneration: true,
-            regenerationContext: (job.metadata as any).regenerationContext,
+            forceRegeneration: true,
+            regenerationContext: (job.metadata as unknown as JobMetadata)
+              .regenerationContext,
             skipLock: true,
           });
         } catch (error) {
@@ -333,11 +365,13 @@ router.post(
       res.status(202).json({
         success: true,
         message: "Photo regeneration queued",
-        data: {
-          jobId: job.id,
-          listingId: photoToRegenerate.listingId,
-          photoCount: 1,
-        },
+        jobs: [
+          {
+            id: job.id,
+            listingId: photoToRegenerate.listingId,
+          },
+        ],
+        photoCount: 1,
       });
     } catch (error) {
       logger.error("[BATCH_REGENERATE] Request failed", {
