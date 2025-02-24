@@ -30,7 +30,10 @@ import { runwayService } from "../video/runway.service.js";
 import { S3VideoService } from "../video/s3-video.service.js";
 import { videoProcessingService } from "../video/video-processing.service.js";
 import { reelTemplates, TemplateKey } from "./templates/types.js";
-import { ImageOptimizationOptions, VisionProcessor } from "./visionProcessor.js";
+import {
+  ImageOptimizationOptions,
+  VisionProcessor,
+} from "./visionProcessor.js";
 import {
   VideoTemplate,
   WatermarkConfig,
