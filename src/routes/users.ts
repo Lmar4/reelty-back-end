@@ -6,6 +6,24 @@ import { logger } from "../utils/logger.js";
 
 const router = express.Router();
 
+// Middleware to verify webhook requests
+const verifyWebhook = (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  const apiKey = req.headers["x-api-key"];
+  if (apiKey !== process.env.REELTY_API_KEY) {
+    logger.error("[Users] Invalid API key for webhook request");
+    res.status(401).json({
+      success: false,
+      error: "Unauthorized",
+    });
+    return;
+  }
+  next();
+};
+
 // Validation schema for user creation
 const createUserSchema = z.object({
   id: z.string(),
@@ -15,57 +33,60 @@ const createUserSchema = z.object({
 });
 
 // Create user from Clerk webhook
-const createUser = async (
-  req: express.Request,
-  res: express.Response,
-  next: express.NextFunction
-) => {
-  try {
-    const data = createUserSchema.parse(req.body);
+router.post(
+  "/",
+  verifyWebhook,
+  async (req: express.Request, res: express.Response) => {
+    try {
+      const data = createUserSchema.parse(req.body);
 
-    logger.info("[Users] Creating/updating user", { userId: data.id });
+      logger.info("[Users] Creating/updating user", { userId: data.id });
 
-    const user = await prisma.user.upsert({
-      where: { id: data.id },
-      update: {
-        email: data.email,
-        firstName: data.firstName,
-        lastName: data.lastName,
-      },
-      create: {
-        id: data.id,
-        email: data.email,
-        firstName: data.firstName,
-        lastName: data.lastName,
-        password: "", // Empty password since we're using Clerk for auth
-      },
-    });
-
-    res.status(201).json({
-      success: true,
-      data: user,
-    });
-  } catch (error) {
-    logger.error("[Users] Error creating user", {
-      error: error instanceof Error ? error.message : "Unknown error",
-      stack: error instanceof Error ? error.stack : undefined,
-    });
-
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: "Invalid user data",
-        details: error.errors,
+      const user = await prisma.user.upsert({
+        where: { id: data.id },
+        update: {
+          email: data.email,
+          firstName: data.firstName || null,
+          lastName: data.lastName || null,
+        },
+        create: {
+          id: data.id,
+          email: data.email,
+          firstName: data.firstName || null,
+          lastName: data.lastName || null,
+          password: "", // Empty password since we're using Clerk for auth
+          role: "USER", // Default role
+          subscriptionStatus: "INACTIVE", // Default status
+        },
       });
-      return;
-    }
 
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+      res.status(201).json({
+        success: true,
+        data: user,
+      });
+    } catch (error) {
+      logger.error("[Users] Error creating user", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+
+      if (error instanceof z.ZodError) {
+        res.status(400).json({
+          success: false,
+          error: "Invalid user data",
+          details: error.errors,
+        });
+        return;
+      }
+
+      res.status(500).json({
+        success: false,
+        error:
+          error instanceof Error ? error.message : "Unknown error occurred",
+      });
+    }
   }
-};
+);
 
 // Delete user and all associated data
 const deleteUser = async (
@@ -211,7 +232,6 @@ const getUser = async (
 };
 
 // Route handlers
-router.post("/", createUser);
 router.get("/:userId", isAuthenticated, getUser);
 router.delete("/:userId", isAuthenticated, deleteUser);
 
