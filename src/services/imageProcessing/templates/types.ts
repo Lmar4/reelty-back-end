@@ -74,7 +74,12 @@ export interface ReelTemplate {
     /** FFmpeg filter string for color grading */
     ffmpegFilter: string;
   };
+  /** Access level required for this template */
+  accessLevel: TemplateAccessLevel;
 }
+
+// Add new type for template access level
+export type TemplateAccessLevel = "free" | "premium";
 
 export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
   crescendo: {
@@ -91,6 +96,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       path: "assets/music/crescendo.mp3",
       volume: 0.85,
     },
+    accessLevel: "free",
   },
   wave: {
     name: "Wave",
@@ -107,6 +113,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       path: "assets/music/wave.mp3",
       volume: 0.8,
     },
+    accessLevel: "free",
   },
   storyteller: {
     name: "Storyteller",
@@ -122,6 +129,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       path: "assets/music/storyteller.mp3",
       volume: 0.75,
     },
+    accessLevel: "free",
   },
   googlezoomintro: {
     name: "Google Zoom Intro",
@@ -167,6 +175,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       path: "assets/music/googlezoomintro.mp3",
       volume: 0.8,
     },
+    accessLevel: "premium",
   },
   wesanderson: {
     name: "Wes Anderson",
@@ -184,6 +193,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       ffmpegFilter:
         "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95,hue=h=5:s=1.2,colorbalance=rm=0.1:gm=-0.05:bm=-0.1,curves=master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1',unsharp=5:5:1.5:5:5:0.0",
     },
+    accessLevel: "premium",
   },
   hyperpop: {
     name: "Hyperpop",
@@ -200,5 +210,6 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       path: "assets/music/hyperpop.mp3",
       volume: 0.9,
     },
+    accessLevel: "premium",
   },
 } as const;
