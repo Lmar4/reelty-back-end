@@ -72,6 +72,10 @@ model User {
   createdAt           DateTime    @default(now())
   updatedAt           DateTime    @updatedAt
   
+  // Notification settings
+  notificationReelsReady Boolean @default(true) @map("notification_reels_ready")
+  notificationProductUpdates Boolean @default(true) @map("notification_product_updates")
+  
   // Agency related fields
   agencyId           String?     // For agency_users
   agencyOwnerId      String?     // For agency users
