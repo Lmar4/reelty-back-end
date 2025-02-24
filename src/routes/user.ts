@@ -25,7 +25,12 @@ router.post(
     try {
       const userData = req.body;
       const user = await prisma.user.create({
-        data: userData,
+        data: {
+          ...userData,
+          password: userData.password || "",
+          role: "USER",
+          subscriptionStatus: "TRIALING",
+        },
         include: {
           currentTier: true,
         },
