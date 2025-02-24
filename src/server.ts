@@ -12,6 +12,7 @@ import photosRouter from "./routes/photos.js";
 import subscriptionRouter from "./routes/subscription.js";
 import templatesRouter from "./routes/templates.js";
 import usersRouter from "./routes/users.js";
+import clerkWebhookRouter from "./routes/webhooks/clerk.js";
 import { logger } from "./utils/logger.js";
 
 const app = express();
@@ -51,6 +52,8 @@ app.use("/api/jobs", jobsRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/subscription", subscriptionRouter);
 app.use("/api/credits", creditsRouter);
+// Add Clerk webhook route
+app.use("/webhooks/clerk", clerkWebhookRouter);
 
 // Error handling middleware
 app.use((err: Error, _req: Request, res: Response, _next: Function) => {
