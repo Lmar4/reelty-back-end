@@ -11,6 +11,7 @@ declare global {
   namespace Express {
     interface Request {
       webhookEvent?: WebhookEvent;
+      rawBody?: string;
     }
   }
 }
@@ -21,6 +22,22 @@ const validateClerkWebhook = async (
   res: express.Response,
   next: express.NextFunction
 ) => {
+  // Log complete request details
+  logger.info("[Clerk Webhook] Received webhook request", {
+    headers: {
+      ...req.headers,
+      // Log specific headers we care about
+      "svix-id": req.headers["svix-id"],
+      "svix-timestamp": req.headers["svix-timestamp"],
+      "svix-signature": req.headers["svix-signature"],
+      "content-type": req.headers["content-type"],
+    },
+    path: req.path,
+    method: req.method,
+    body: req.body, // Parsed JSON body
+    rawBody: (req as any).rawBody, // Raw body string
+  });
+
   const CLERK_WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
 
   if (!CLERK_WEBHOOK_SECRET) {
@@ -37,9 +54,19 @@ const validateClerkWebhook = async (
   const svix_timestamp = req.headers["svix-timestamp"] as string;
   const svix_signature = req.headers["svix-signature"] as string;
 
+  logger.info("[Clerk Webhook] Validating headers", {
+    svix_id: svix_id ? "present" : "missing",
+    svix_timestamp: svix_timestamp ? "present" : "missing",
+    svix_signature: svix_signature ? "present" : "missing",
+  });
+
   // If there are no headers, error out
   if (!svix_id || !svix_timestamp || !svix_signature) {
-    logger.error("[Clerk Webhook] Missing svix headers");
+    logger.error("[Clerk Webhook] Missing svix headers", {
+      svix_id,
+      svix_timestamp,
+      svix_signature,
+    });
     res.status(400).json({
       success: false,
       error: "Missing svix headers",
@@ -49,7 +76,30 @@ const validateClerkWebhook = async (
 
   try {
     const wh = new Webhook(CLERK_WEBHOOK_SECRET);
-    const payload = JSON.stringify(req.body);
+
+    // Use the raw body for verification
+    const payload = (req as any).rawBody;
+
+    logger.info("[Clerk Webhook] Verification attempt details", {
+      payloadLength: payload?.length,
+      payloadSample: payload?.substring(0, 100), // Log first 100 chars
+      headers: {
+        svix_id,
+        svix_timestamp,
+        svix_signature,
+      },
+      secretLength: CLERK_WEBHOOK_SECRET.length,
+      secretPrefix: CLERK_WEBHOOK_SECRET.substring(0, 5) + "...", // Log first 5 chars for verification
+    });
+
+    if (!payload) {
+      logger.error("[Clerk Webhook] Missing request body");
+      res.status(400).json({
+        success: false,
+        error: "Missing request body",
+      });
+      return;
+    }
 
     // Verify the webhook payload
     req.webhookEvent = wh.verify(payload, {
@@ -58,9 +108,24 @@ const validateClerkWebhook = async (
       "svix-signature": svix_signature,
     }) as WebhookEvent;
 
+    logger.info("[Clerk Webhook] Payload verified successfully", {
+      eventType: (req.webhookEvent as WebhookEvent).type,
+      userId: (req.webhookEvent as WebhookEvent).data.id,
+    });
+
     next();
   } catch (err) {
-    logger.error("[Clerk Webhook] Verification failed", err);
+    logger.error("[Clerk Webhook] Verification failed", {
+      error: err instanceof Error ? err.message : "Unknown error",
+      stack: err instanceof Error ? err.stack : undefined,
+      bodyType: typeof req.body,
+      bodyKeys: Object.keys(req.body || {}),
+      headers: {
+        svix_id,
+        svix_timestamp,
+        svix_signature,
+      },
+    });
     res.status(400).json({
       success: false,
       error: "Webhook verification failed",

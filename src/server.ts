@@ -25,9 +25,35 @@ app.set("trust proxy", 1);
 app.use(helmet());
 app.use(compression());
 app.use(cors());
-app.use(express.json());
 
-// Add Clerk middleware before routes
+// Parse JSON bodies with raw body access for webhooks
+app.use(
+  express.json({
+    verify: (req: Request, _res, buf) => {
+      // Store the raw body for webhook verification
+      const rawBody = buf.toString();
+      (req as any).rawBody = rawBody;
+
+      // Debug log for webhook requests
+      if (req.path.includes("/webhooks/")) {
+        logger.info("[Express JSON Parser]", {
+          path: req.path,
+          method: req.method,
+          contentType: req.headers["content-type"],
+          contentLength: req.headers["content-length"],
+          rawBodyLength: rawBody.length,
+        });
+      }
+    },
+    limit: "10mb", // Increase payload size limit
+  })
+);
+
+// Add Clerk webhook route (before Clerk middleware to keep it public)
+app.use("/webhooks/clerk", clerkWebhookRouter);
+logger.info("Registered Clerk webhook route at /webhooks/clerk");
+
+// Add Clerk middleware before other routes
 app.use(clerkMiddleware());
 
 // Rate limiting
@@ -52,8 +78,6 @@ app.use("/api/jobs", jobsRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/subscription", subscriptionRouter);
 app.use("/api/credits", creditsRouter);
-// Add Clerk webhook route
-app.use("/webhooks/clerk", clerkWebhookRouter);
 
 // Error handling middleware
 app.use((err: Error, _req: Request, res: Response, _next: Function) => {
