@@ -53,7 +53,7 @@ app.use(
 app.use("/webhooks/clerk", clerkWebhookRouter);
 logger.info("Registered Clerk webhook route at /webhooks/clerk");
 
-// Add Clerk middleware before other routes
+// Add Clerk middleware for all other routes
 app.use(clerkMiddleware());
 
 // Rate limiting
