@@ -124,7 +124,7 @@ model SubscriptionTier {
   hasWatermark         Boolean  @default(true)   @map("has_watermark")
   maxPhotosPerListing  Int      @default(20)     @map("max_photos_per_listing")
   maxReelDownloads     Int?                      @map("max_reel_downloads")  // null means unlimited
-  maxActiveListings    Int      @default(15)      @map("max_active_listings")
+  maxActiveListings    Int      @default(1)      @map("max_active_listings")
   premiumTemplatesEnabled Boolean @default(false) @map("premium_templates_enabled")
   metadata             Json?     @default("{}")
   createdAt            DateTime @default(now())
