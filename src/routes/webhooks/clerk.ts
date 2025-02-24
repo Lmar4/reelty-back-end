@@ -39,6 +39,10 @@ const validateClerkWebhook = async (
   });
 
   const CLERK_WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
+  logger.info("[Clerk Webhook] Secret check", {
+    exists: !!CLERK_WEBHOOK_SECRET,
+    length: CLERK_WEBHOOK_SECRET?.length,
+  });
 
   if (!CLERK_WEBHOOK_SECRET) {
     logger.error("[Clerk Webhook] Missing CLERK_WEBHOOK_SECRET");
