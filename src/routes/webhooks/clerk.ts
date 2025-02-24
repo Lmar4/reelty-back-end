@@ -161,14 +161,43 @@ router.post(
       const evt = req.webhookEvent as WebhookEvent;
       const eventType = evt.type;
 
-      logger.info(`[Clerk Webhook] Processing ${eventType} event`);
+      logger.info("[Clerk Webhook] Processing event", {
+        type: eventType,
+        userId: evt.data.id,
+      });
 
       if (eventType === "user.created" || eventType === "user.updated") {
         const { id, email_addresses, first_name, last_name } = evt.data;
-        const email = email_addresses?.[0]?.email_address;
+
+        // Log the raw user data
+        logger.info("[Clerk Webhook] Raw user data", {
+          id,
+          emailAddresses: email_addresses,
+          firstName: first_name,
+          lastName: last_name,
+        });
+
+        // Get the primary email
+        const primaryEmailObj =
+          email_addresses?.find(
+            (email) => email.id === evt.data.primary_email_address_id
+          ) || email_addresses?.[0];
+
+        const email = primaryEmailObj?.email_address;
+
+        logger.info("[Clerk Webhook] Extracted user data", {
+          id,
+          email,
+          firstName: first_name,
+          lastName: last_name,
+          primaryEmailId: evt.data.primary_email_address_id,
+          foundEmail: !!email,
+        });
 
         if (!email) {
-          logger.error("[Clerk Webhook] No email address found in user data");
+          logger.error("[Clerk Webhook] No email address found", {
+            availableEmails: email_addresses?.map((e) => e.email_address),
+          });
           res.status(400).json({
             success: false,
             error: "No email address found",
@@ -176,34 +205,44 @@ router.post(
           return;
         }
 
-        const user = await prisma.user.upsert({
-          where: { id: id as string },
-          update: {
-            email,
-            firstName: first_name || null,
-            lastName: last_name || null,
-          },
-          create: {
-            id: id as string,
-            email,
-            firstName: first_name || null,
-            lastName: last_name || null,
-            password: "", // Empty password since we're using Clerk
-            role: "USER",
-            subscriptionStatus: "TRIALING",
-          },
-        });
+        try {
+          const user = await prisma.user.upsert({
+            where: { id: id as string },
+            update: {
+              email,
+              firstName: first_name || null,
+              lastName: last_name || null,
+            },
+            create: {
+              id: id as string,
+              email,
+              firstName: first_name || null,
+              lastName: last_name || null,
+              password: "", // Empty password since we're using Clerk
+              role: "USER",
+              subscriptionStatus: "TRIALING",
+            },
+          });
 
-        logger.info("[Clerk Webhook] User processed successfully", {
-          userId: user.id,
-          event: eventType,
-        });
+          logger.info("[Clerk Webhook] User upsert successful", {
+            userId: user.id,
+            email: user.email,
+            operation: id ? "update" : "create",
+          });
 
-        res.status(200).json({
-          success: true,
-          data: user,
-        });
-        return;
+          res.status(200).json({
+            success: true,
+            data: user,
+          });
+          return;
+        } catch (error) {
+          logger.error("[Clerk Webhook] Database operation failed", {
+            error: error instanceof Error ? error.message : "Unknown error",
+            stack: error instanceof Error ? error.stack : undefined,
+            userData: { id, email, firstName: first_name, lastName: last_name },
+          });
+          throw error;
+        }
       } else if (eventType === "user.deleted") {
         const { id } = evt.data;
 
@@ -227,15 +266,16 @@ router.post(
         success: true,
         message: "Event processed",
       });
-      return;
     } catch (error) {
-      logger.error("[Clerk Webhook] Error processing webhook", error);
+      logger.error("[Clerk Webhook] Error processing webhook", {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       res.status(500).json({
         success: false,
         error:
           error instanceof Error ? error.message : "Unknown error occurred",
       });
-      return;
     }
   }
 );
