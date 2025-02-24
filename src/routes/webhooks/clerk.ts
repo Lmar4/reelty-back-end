@@ -23,6 +23,20 @@ const validateClerkWebhook = async (
   next: express.NextFunction
 ) => {
   // Log complete request details
+  console.log("[Clerk Webhook] Received webhook request", {
+    headers: {
+      ...req.headers,
+      // Log specific headers we care about
+      "svix-id": req.headers["svix-id"],
+      "svix-timestamp": req.headers["svix-timestamp"],
+      "svix-signature": req.headers["svix-signature"],
+      "content-type": req.headers["content-type"],
+    },
+    path: req.path,
+    method: req.method,
+    body: req.body, // Parsed JSON body
+    rawBody: (req as any).rawBody, // Raw body string
+  });
   logger.info("[Clerk Webhook] Received webhook request", {
     headers: {
       ...req.headers,
