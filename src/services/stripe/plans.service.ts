@@ -210,13 +210,29 @@ export class PlansService {
 
   async createPricingPlans() {
     const plans = [
+      // Free Trial Plan
+      {
+        name: "Free Trial",
+        type: "PAY_AS_YOU_GO" as PlanType,
+        price: 0,
+        credits: 1,
+        tierId: SubscriptionTierId.FREE,
+        features: {
+          maxPhotosPerListing: 20,
+          unlimitedDownloads: false,
+          noWatermark: false,
+          premiumTemplates: false,
+          prioritySupport: false,
+          maxDownloads: 1,
+        },
+      },
       // Pay As You Go Plans
       {
         name: "1 Credit",
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 59,
         credits: 1,
-        tierId: SubscriptionTierId.FREE,
+        tierId: SubscriptionTierId.REELTY,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -304,9 +320,9 @@ export class PlansService {
     for (const plan of plans) {
       const metadata: PlanMetadata = {
         features: Object.entries(plan.features)
-          .filter(([_, value]) => value === true)
+          .filter(([key, value]) => value === true && key !== "maxDownloads")
           .map(([key]) => key),
-        maxListings: 10,
+        maxListings: plan.tierId === SubscriptionTierId.FREE ? 1 : 10,
         maxPhotosPerListing: plan.features.maxPhotosPerListing,
         maxVideosPerMonth: plan.type === "MONTHLY" ? 30 : 10,
         customBranding: !plan.features.noWatermark,
