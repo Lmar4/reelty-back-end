@@ -56,7 +56,7 @@ router.post(
           lastName: data.lastName || null,
           password: "", // Empty password since we're using Clerk for auth
           role: "USER", // Default role
-          subscriptionStatus: "INACTIVE", // Default status
+          subscriptionStatus: "TRIALING", // Default status
         },
       });
 
