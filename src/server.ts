@@ -17,6 +17,9 @@ import { logger } from "./utils/logger.js";
 const app = express();
 const port = Number(process.env.PORT) || 3001;
 
+// Trust proxy settings
+app.set("trust proxy", 1);
+
 // Security and performance middleware
 app.use(helmet());
 app.use(compression());
