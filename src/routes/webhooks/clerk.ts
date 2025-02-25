@@ -275,19 +275,45 @@ router.post(
       } else if (eventType === "user.deleted") {
         const { id } = evt.data;
 
-        await prisma.user.delete({
-          where: { id: id as string },
-        });
+        try {
+          // First check if the user exists
+          const user = await prisma.user.findUnique({
+            where: { id: id as string },
+          });
 
-        logger.info("[Clerk Webhook] User deleted successfully", {
-          userId: id,
-        });
+          if (!user) {
+            logger.info("[Clerk Webhook] User already deleted or not found", {
+              userId: id,
+            });
+            res.status(200).json({
+              success: true,
+              message: "User already deleted or not found",
+            });
+            return;
+          }
 
-        res.status(200).json({
-          success: true,
-          message: "User deleted successfully",
-        });
-        return;
+          // If user exists, delete them
+          await prisma.user.delete({
+            where: { id: id as string },
+          });
+
+          logger.info("[Clerk Webhook] User deleted successfully", {
+            userId: id,
+          });
+
+          res.status(200).json({
+            success: true,
+            message: "User deleted successfully",
+          });
+          return;
+        } catch (error) {
+          logger.error("[Clerk Webhook] Error deleting user", {
+            error: error instanceof Error ? error.message : "Unknown error",
+            stack: error instanceof Error ? error.stack : undefined,
+            userId: id,
+          });
+          throw error;
+        }
       }
 
       // Handle other event types if needed

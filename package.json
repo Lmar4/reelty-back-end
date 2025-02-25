@@ -5,7 +5,7 @@
   "main": "index.js",
   "type": "module",
   "prisma": {
-    "seed": "ts-node --transpile-only prisma/seed.ts"
+    "seed": "tsx prisma/seed.ts"
   },
   "scripts": {
     "build": "pnpm prisma generate && tsc",
@@ -15,6 +15,7 @@
     "db:push": "pnpm prisma db push",
     "db:migrate": "pnpm prisma migrate dev",
     "db:seed": "pnpm prisma db seed",
+    "db:seed:plans": "tsx prisma/seed.ts",
     "lint": "eslint \"src/**/*.ts\" --fix",
     "test": "jest",
     "test:watch": "jest --watch",
