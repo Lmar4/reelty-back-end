@@ -195,6 +195,15 @@ router.post(
 
         try {
           const result = await prisma.$transaction(async (tx) => {
+            // Get the FREE tier details first
+            const freeTier = await tx.subscriptionTier.findUnique({
+              where: { tierId: SubscriptionTierId.FREE },
+            });
+
+            if (!freeTier) {
+              throw new Error("Free tier not found");
+            }
+
             const user = await tx.user.upsert({
               where: { id: id as string },
               update: {
@@ -219,7 +228,7 @@ router.post(
               await tx.listingCredit.create({
                 data: {
                   userId: user.id,
-                  creditsRemaining: 1,
+                  creditsRemaining: freeTier.creditsPerInterval,
                 },
               });
 
@@ -227,8 +236,8 @@ router.post(
               await tx.creditLog.create({
                 data: {
                   userId: user.id,
-                  amount: 1,
-                  reason: "Initial trial credit",
+                  amount: freeTier.creditsPerInterval,
+                  reason: `Initial trial credit (${freeTier.name})`,
                 },
               });
 
