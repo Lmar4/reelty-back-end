@@ -216,10 +216,13 @@ router.post(
                 email,
                 firstName: first_name || null,
                 lastName: last_name || null,
-                password: "", // Empty password since we're using Clerk
+                password: "",
                 role: "USER",
                 subscriptionStatus: "TRIALING",
                 currentTierId: SubscriptionTierId.FREE,
+              },
+              include: {
+                currentTier: true,
               },
             });
 
