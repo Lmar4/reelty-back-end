@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { logger } from "../utils/logger.js";
+import { PrismaClient, SubscriptionTierId } from "@prisma/client";
 
 const router = express.Router();
 
@@ -42,27 +43,43 @@ router.post(
 
       logger.info("[Users] Creating/updating user", { userId: data.id });
 
-      const user = await prisma.user.upsert({
-        where: { id: data.id },
-        update: {
-          email: data.email,
-          firstName: data.firstName || null,
-          lastName: data.lastName || null,
-        },
-        create: {
-          id: data.id,
-          email: data.email,
-          firstName: data.firstName || null,
-          lastName: data.lastName || null,
-          password: "", // Empty password since we're using Clerk for auth
-          role: "USER", // Default role
-          subscriptionStatus: "TRIALING", // Default status
-        },
+      const result = await prisma.$transaction(async (tx) => {
+        const user = await tx.user.upsert({
+          where: { id: data.id },
+          update: {
+            email: data.email,
+            firstName: data.firstName || null,
+            lastName: data.lastName || null,
+          },
+          create: {
+            id: data.id,
+            email: data.email,
+            firstName: data.firstName || null,
+            lastName: data.lastName || null,
+            password: "", // Empty password since we're using Clerk for auth
+            role: "USER", // Default role
+            subscriptionStatus: "TRIALING", // Default status
+            currentTierId: SubscriptionTierId.FREE, // Set initial tier
+          },
+        });
+
+        // Create initial listing credit for new user
+        if (!req.body.update) {
+          // Only for new users, not updates
+          await tx.listingCredit.create({
+            data: {
+              userId: user.id,
+              creditsRemaining: 1,
+            },
+          });
+        }
+
+        return user;
       });
 
       res.status(201).json({
         success: true,
-        data: user,
+        data: result,
       });
     } catch (error) {
       logger.error("[Users] Error creating user", {
