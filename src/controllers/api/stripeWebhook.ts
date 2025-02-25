@@ -1,5 +1,6 @@
 import { PrismaClient, SubscriptionStatus } from "@prisma/client";
 import Stripe from "stripe";
+import { logger } from "../../utils/logger.js";
 
 const prisma = new PrismaClient();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
@@ -149,6 +150,29 @@ export async function handleStripeWebhook(
           },
         });
 
+        // Add initial credits for new subscriptions
+        if (
+          stripeEvent.type === "customer.subscription.created" &&
+          tier.planType === "MONTHLY" &&
+          tier.creditsPerInterval > 0
+        ) {
+          await prisma.$transaction(async (tx) => {
+            await tx.listingCredit.create({
+              data: {
+                userId: user.id,
+                creditsRemaining: tier.creditsPerInterval,
+              },
+            });
+            await tx.creditLog.create({
+              data: {
+                userId: user.id,
+                amount: tier.creditsPerInterval,
+                reason: `Initial credits from ${tier.name} subscription`,
+              },
+            });
+          });
+        }
+
         break;
       }
 
@@ -214,9 +238,40 @@ export async function handleStripeWebhook(
 
         const user = await prisma.user.findFirst({
           where: { stripeCustomerId: invoice.customer as string },
+          include: { currentTier: true },
         });
 
-        if (!user) break;
+        if (!user || !user.currentTier) break;
+
+        const currentTier = user.currentTier; // Store tier reference to avoid null checks
+
+        // Only add credits for monthly subscriptions
+        if (
+          currentTier.planType === "MONTHLY" &&
+          currentTier.creditsPerInterval > 0
+        ) {
+          await prisma.$transaction(async (tx) => {
+            const creditsToAdd = currentTier.creditsPerInterval;
+            const tierName = currentTier.name;
+
+            // Add new credits
+            await tx.listingCredit.create({
+              data: {
+                userId: user.id,
+                creditsRemaining: creditsToAdd,
+              },
+            });
+
+            // Log the credit addition
+            await tx.creditLog.create({
+              data: {
+                userId: user.id,
+                amount: creditsToAdd,
+                reason: `Monthly credits from ${tierName} subscription`,
+              },
+            });
+          });
+        }
 
         // Log the successful payment
         await prisma.subscriptionLog.create({
@@ -259,6 +314,64 @@ export async function handleStripeWebhook(
             status: "PAST_DUE",
             periodEnd: user.subscriptionPeriodEnd,
           },
+        });
+
+        break;
+      }
+
+      case "checkout.session.completed": {
+        const session = stripeEvent.data.object as Stripe.Checkout.Session;
+
+        // Only process credit purchases
+        if (session.mode !== "payment") break;
+
+        const customerId = session.customer as string;
+        const user = await prisma.user.findFirst({
+          where: { stripeCustomerId: customerId },
+        });
+
+        if (!user) break;
+
+        // Get the price ID from the session
+        const lineItems = await stripe.checkout.sessions.listLineItems(
+          session.id
+        );
+        const priceId = lineItems.data[0]?.price?.id;
+
+        if (!priceId) break;
+
+        // Find the tier/plan that was purchased
+        const tier = await prisma.subscriptionTier.findFirst({
+          where: { stripePriceId: priceId },
+        });
+
+        if (!tier || tier.planType !== "PAY_AS_YOU_GO") break;
+
+        const creditAmount = tier.creditsPerInterval; // Pay-as-you-go plans store credits in creditsPerInterval
+
+        await prisma.$transaction(async (tx) => {
+          // Add credits based on the plan
+          await tx.listingCredit.create({
+            data: {
+              userId: user.id,
+              creditsRemaining: creditAmount,
+            },
+          });
+
+          // Log the credit addition
+          await tx.creditLog.create({
+            data: {
+              userId: user.id,
+              amount: creditAmount,
+              reason: `Credits purchased from ${tier.name} plan`,
+            },
+          });
+
+          logger.info("[Stripe Webhook] Added pay-as-you-go credits", {
+            userId: user.id,
+            tierName: tier.name,
+            credits: creditAmount,
+          });
         });
 
         break;
