@@ -3,6 +3,7 @@ import { Webhook } from "svix";
 import { WebhookEvent } from "@clerk/backend";
 import { prisma } from "../../lib/prisma.js";
 import { logger } from "../../utils/logger.js";
+import { PrismaClient, SubscriptionTierId } from "@prisma/client";
 
 const router = express.Router();
 
@@ -23,20 +24,7 @@ const validateClerkWebhook = async (
   next: express.NextFunction
 ) => {
   // Log complete request details
-  console.log("[Clerk Webhook] Received webhook request", {
-    headers: {
-      ...req.headers,
-      // Log specific headers we care about
-      "svix-id": req.headers["svix-id"],
-      "svix-timestamp": req.headers["svix-timestamp"],
-      "svix-signature": req.headers["svix-signature"],
-      "content-type": req.headers["content-type"],
-    },
-    path: req.path,
-    method: req.method,
-    body: req.body, // Parsed JSON body
-    rawBody: (req as any).rawBody, // Raw body string
-  });
+
   logger.info("[Clerk Webhook] Received webhook request", {
     headers: {
       ...req.headers,
@@ -206,33 +194,65 @@ router.post(
         }
 
         try {
-          const user = await prisma.user.upsert({
-            where: { id: id as string },
-            update: {
-              email,
-              firstName: first_name || null,
-              lastName: last_name || null,
-            },
-            create: {
-              id: id as string,
-              email,
-              firstName: first_name || null,
-              lastName: last_name || null,
-              password: "", // Empty password since we're using Clerk
-              role: "USER",
-              subscriptionStatus: "TRIALING",
-            },
+          const result = await prisma.$transaction(async (tx) => {
+            const user = await tx.user.upsert({
+              where: { id: id as string },
+              update: {
+                email,
+                firstName: first_name || null,
+                lastName: last_name || null,
+              },
+              create: {
+                id: id as string,
+                email,
+                firstName: first_name || null,
+                lastName: last_name || null,
+                password: "", // Empty password since we're using Clerk
+                role: "USER",
+                subscriptionStatus: "TRIALING",
+                currentTierId: SubscriptionTierId.FREE,
+              },
+            });
+
+            // Only create initial credit for new users (not updates)
+            if (eventType === "user.created") {
+              await tx.listingCredit.create({
+                data: {
+                  userId: user.id,
+                  creditsRemaining: 1,
+                },
+              });
+
+              // Log the credit creation
+              await tx.creditLog.create({
+                data: {
+                  userId: user.id,
+                  amount: 1,
+                  reason: "Initial trial credit",
+                },
+              });
+
+              logger.info(
+                "[Clerk Webhook] Created initial credit for new user",
+                {
+                  userId: user.id,
+                  email: user.email,
+                }
+              );
+            }
+
+            return user;
           });
 
           logger.info("[Clerk Webhook] User upsert successful", {
-            userId: user.id,
-            email: user.email,
-            operation: id ? "update" : "create",
+            userId: result.id,
+            email: result.email,
+            operation: eventType === "user.created" ? "create" : "update",
           });
 
           res.status(200).json({
             success: true,
-            data: user,
+            data: result,
           });
           return;
         } catch (error) {
