@@ -510,12 +510,11 @@ const processPhotos = async (req: Request, res: Response) => {
 
     const processedPhotos: PhotoRecord[] = [];
     for (const photo of photos) {
-      const { id, s3Key } = photo;
-      if (!id || !s3Key) {
+      const { s3Key } = photo;
+      if (!s3Key) {
         logger.error("[Listings] Missing required photo data", {
-          photoId: id,
           listingId,
-          hasS3Key: !!s3Key,
+          hasS3Key: false,
         });
         continue;
       }
@@ -539,9 +538,9 @@ const processPhotos = async (req: Request, res: Response) => {
       }.amazonaws.com/${s3Key}`;
 
       try {
+        // Let Prisma generate the ID automatically
         const photoRecord = await prisma.photo.create({
           data: {
-            id,
             userId,
             listingId,
             s3Key,
@@ -553,14 +552,13 @@ const processPhotos = async (req: Request, res: Response) => {
         processedPhotos.push(photoRecord as PhotoRecord);
 
         logger.info("[Listings] Photo processed successfully", {
-          photoId: id,
+          photoId: photoRecord.id,
           listingId: listing.id,
           filePath,
         });
       } catch (photoError) {
         logger.error("[Listings] Failed to create photo record", {
           error: photoError,
-          photoId: id,
           listingId: listing.id,
         });
       }
