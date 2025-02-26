@@ -261,10 +261,20 @@ const createListing = async (req: Request, res: Response): Promise<void> => {
   } catch (error) {
     console.error("[CREATE_LISTING_ERROR]", error);
     if (error instanceof Error && error.message === "Insufficient credits") {
-      res.status(400).json({ error: "Insufficient credits to create listing" });
+      res.status(400).json({
+        success: false,
+        error: "Insufficient credits to create listing",
+        details: {
+          message: "You need to purchase more credits to create a new listing.",
+        },
+      });
       return;
     }
-    res.status(500).json({ error: "Failed to create listing" });
+    res.status(500).json({
+      success: false,
+      error: "Failed to create listing",
+      message: error instanceof Error ? error.message : "Unknown error",
+    });
   }
 };
 
