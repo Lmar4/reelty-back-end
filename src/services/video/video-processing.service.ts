@@ -278,21 +278,83 @@ export class VideoProcessingService {
         outputs: [`pts${i}`],
       });
 
-      // Apply color correction
-      const colorOutput = `color${i}`;
-      const filterOptions =
-        clip.colorCorrection?.ffmpegFilter ||
-        "contrast=0.9:brightness=0.05:saturation=0.95";
-      filterCommands.push({
-        filter: filterOptions.startsWith("eq=")
-          ? filterOptions.substring(3)
-          : "eq",
-        options: filterOptions.startsWith("eq=")
-          ? filterOptions.substring(3)
-          : filterOptions,
-        inputs: [`pts${i}`],
-        outputs: [colorOutput],
-      });
+      // Apply color correction - MODIFIED to handle complex filters
+      let currentInput = `pts${i}`;
+      let currentOutput = `color${i}`;
+
+      if (clip.colorCorrection?.ffmpegFilter) {
+        // Check if it's the wesanderson template (has curves filter)
+        if (clip.colorCorrection.ffmpegFilter.includes("curves=master")) {
+          // Split into individual filters for wesanderson template
+          // Apply eq filter
+          filterCommands.push({
+            filter: "eq",
+            options: "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
+            inputs: [currentInput],
+            outputs: [`eq${i}`],
+          });
+          currentInput = `eq${i}`;
+
+          // Apply hue filter
+          filterCommands.push({
+            filter: "hue",
+            options: "h=5:s=1.2",
+            inputs: [currentInput],
+            outputs: [`hue${i}`],
+          });
+          currentInput = `hue${i}`;
+
+          // Apply colorbalance filter
+          filterCommands.push({
+            filter: "colorbalance",
+            options: "rm=0.1:gm=-0.05:bm=-0.1",
+            inputs: [currentInput],
+            outputs: [`cb${i}`],
+          });
+          currentInput = `cb${i}`;
+
+          // Apply curves filter (without problematic quotes)
+          filterCommands.push({
+            filter: "curves",
+            options: "master=0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1",
+            inputs: [currentInput],
+            outputs: [`curves${i}`],
+          });
+          currentInput = `curves${i}`;
+
+          // Apply unsharp filter
+          filterCommands.push({
+            filter: "unsharp",
+            options: "5:5:1.5:5:5:0.0",
+            inputs: [currentInput],
+            outputs: [currentOutput],
+          });
+        } else {
+          // For other templates, use the standard approach with eq filter
+          const filterOptions = clip.colorCorrection.ffmpegFilter.startsWith(
+            "eq="
+          )
+            ? clip.colorCorrection.ffmpegFilter.substring(3)
+            : clip.colorCorrection.ffmpegFilter;
+
+          filterCommands.push({
+            filter: filterOptions.startsWith("eq=") ? "eq" : "eq",
+            options: filterOptions.startsWith("eq=")
+              ? filterOptions.substring(3)
+              : filterOptions,
+            inputs: [currentInput],
+            outputs: [currentOutput],
+          });
+        }
+      } else {
+        // Default color correction for clips without specific settings
+        filterCommands.push({
+          filter: "eq",
+          options: "contrast=0.9:brightness=0.05:saturation=0.95",
+          inputs: [currentInput],
+          outputs: [currentOutput],
+        });
+      }
 
       // Handle transitions between clips
       if (i > 0 && clip.transition) {
@@ -301,12 +363,12 @@ export class VideoProcessingService {
         filterCommands.push({
           filter: "xfade",
           options: `transition=${transitionType}:duration=${duration}`,
-          inputs: [lastOutput, colorOutput],
+          inputs: [lastOutput, currentOutput],
           outputs: [`trans${i}`],
         });
         lastOutput = `trans${i}`;
       } else {
-        lastOutput = colorOutput;
+        lastOutput = currentOutput;
       }
     });
 
