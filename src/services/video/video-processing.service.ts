@@ -696,14 +696,74 @@ export class VideoProcessingService {
           resolve("libx264");
           return;
         }
+
+        // First try to detect hardware encoders
         if (stdout.includes("h264_nvenc")) {
-          logger.info("Using NVENC hardware acceleration");
-          resolve("h264_nvenc");
+          try {
+            // Test if NVENC is actually working by running a simple command
+            exec(
+              "ffmpeg -f lavfi -i color=c=black:s=32x32 -t 1 -c:v h264_nvenc -f null -",
+              (nvencError) => {
+                if (!nvencError) {
+                  logger.info("Using NVENC hardware acceleration");
+                  resolve("h264_nvenc");
+                } else {
+                  logger.warn(
+                    "NVENC detected but not working, falling back to libx264",
+                    {
+                      error: nvencError.message,
+                    }
+                  );
+                  resolve("libx264");
+                }
+              }
+            );
+          } catch (testError) {
+            logger.warn("Failed to test NVENC, falling back to libx264", {
+              error:
+                testError instanceof Error
+                  ? testError.message
+                  : "Unknown error",
+            });
+            resolve("libx264");
+          }
         } else if (stdout.includes("h264_videotoolbox")) {
-          logger.info("Using VideoToolbox hardware acceleration");
-          resolve("h264_videotoolbox");
+          try {
+            // Test if VideoToolbox is actually working
+            exec(
+              "ffmpeg -f lavfi -i color=c=black:s=32x32 -t 1 -c:v h264_videotoolbox -f null -",
+              (vtError) => {
+                if (!vtError) {
+                  logger.info("Using VideoToolbox hardware acceleration");
+                  resolve("h264_videotoolbox");
+                } else {
+                  logger.warn(
+                    "VideoToolbox detected but not working, falling back to libx264",
+                    {
+                      error: vtError.message,
+                    }
+                  );
+                  resolve("libx264");
+                }
+              }
+            );
+          } catch (testError) {
+            logger.warn(
+              "Failed to test VideoToolbox, falling back to libx264",
+              {
+                error:
+                  testError instanceof Error
+                    ? testError.message
+                    : "Unknown error",
+              }
+            );
+            resolve("libx264");
+          }
         } else {
-          logger.info("Using software encoding with libx264");
+          // No hardware acceleration available
+          logger.info(
+            "No hardware acceleration available, using software encoding with libx264"
+          );
           resolve("libx264");
         }
       });

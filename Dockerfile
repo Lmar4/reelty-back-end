@@ -2,9 +2,12 @@ FROM node:20-bookworm
 
 WORKDIR /app
 
-# Install ffmpeg at the OS level first
+# Install ffmpeg and puppeteer dependencies 
 RUN apt-get update && \
-    apt-get install -y ffmpeg libavcodec-extra && \
+    apt-get install -y ffmpeg libavcodec-extra \
+    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
+    libpango-1.0-0 libcairo2 && \
     rm -rf /var/lib/apt/lists/*
 
 # Set ffmpeg environment variables
