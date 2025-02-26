@@ -3,7 +3,7 @@ import { z } from "zod";
 import { validateRequest } from "../middleware/validate.js";
 import { getAuth } from "@clerk/express";
 import Stripe from "stripe";
-
+import { createApiResponse } from "../types/api.js";
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
   apiVersion: "2025-01-27.acacia",
@@ -55,18 +55,24 @@ const createSetupIntent: RequestHandler = async (req, res) => {
       usage: "off_session", // Allow using this payment method for future payments
     });
 
-    res.json({
-      success: true,
-      data: {
+    res.json(
+      createApiResponse(true, {
         clientSecret: setupIntent.client_secret,
-      },
-    });
+      })
+    );
   } catch (error) {
-    console.error("Setup intent error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error
+            ? error.message
+            : "Failed to create setup intent"
+        )
+      );
   }
 };
 
@@ -134,16 +140,22 @@ const deletePaymentMethod: RequestHandler = async (req, res) => {
 
     await stripe.paymentMethods.detach(paymentMethodId);
 
-    res.json({
-      success: true,
-      message: "Payment method deleted successfully",
-    });
+    res.json(
+      createApiResponse(true, null, "Payment method deleted successfully")
+    );
   } catch (error) {
-    console.error("Delete payment method error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error
+            ? error.message
+            : "Failed to delete payment method"
+        )
+      );
   }
 };
 

@@ -6,7 +6,7 @@ import { isAuthenticated } from "../middleware/auth.js";
 import { ProductionPipeline } from "../services/imageProcessing/productionPipeline.js";
 import { s3VideoService } from "../services/video/s3-video.service.js";
 import { logger } from "../utils/logger.js";
-
+import { createApiResponse } from "../types/api.js";
 const router = Router();
 const productionPipeline = new ProductionPipeline();
 const s3Client = new S3Client({ region: process.env.AWS_REGION });
@@ -401,7 +401,7 @@ router.post(
   }
 );
 
-// Update photo status (unchanged)
+// Update photo status
 router.post(
   "/:photoId/status",
   isAuthenticated,
@@ -473,16 +473,19 @@ router.post(
             });
           });
 
-        res.status(200).json({
-          success: true,
-          message: "Photo status updated and video generation started",
-          jobId: job.id,
-        });
+        res
+          .status(200)
+          .json(
+            createApiResponse(
+              true,
+              { jobId: job.id },
+              "Photo status updated and video generation started"
+            )
+          );
       } else {
-        res.status(200).json({
-          success: true,
-          message: "Photo status updated",
-        });
+        res
+          .status(200)
+          .json(createApiResponse(true, undefined, "Photo status updated"));
       }
     } catch (error) {
       logger.error("[PHOTO_STATUS_UPDATE] Request failed", {
@@ -490,10 +493,16 @@ router.post(
         userId: req.user?.id,
         error: error instanceof Error ? error.message : "Unknown error",
       });
-      res.status(500).json({
-        success: false,
-        message: "Failed to update photo status",
-      });
+      res
+        .status(500)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "Failed to update photo status"
+          )
+        );
     }
   }
 );
@@ -503,7 +512,11 @@ router.post("/verify", async (req: Request, res: Response) => {
   const { photos } = req.body;
 
   if (!Array.isArray(photos)) {
-    res.status(400).json({ success: false, error: "Invalid photos array" });
+    res
+      .status(400)
+      .json(
+        createApiResponse(false, undefined, undefined, "Invalid photos array")
+      );
     return;
   }
 
@@ -539,7 +552,9 @@ router.post("/verify", async (req: Request, res: Response) => {
       })
     );
 
-    res.json({ success: true });
+    res.json(
+      createApiResponse(true, undefined, "Photos verified successfully")
+    );
   } catch (error) {
     logger.error("[Photos] Verification failed", {
       error: error instanceof Error ? error.message : "Unknown error",

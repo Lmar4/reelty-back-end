@@ -1,19 +1,11 @@
-import {
-  PrismaClient,
-  SubscriptionTierId as PrismaSubscriptionTierId,
-  Prisma,
-} from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 import express, { RequestHandler } from "express";
 import Stripe from "stripe";
 import { z } from "zod";
-import {
-  getTierNameFromId,
-  isValidTierId,
-  SUBSCRIPTION_TIERS,
-} from "../constants/subscription-tiers.js";
+import { isValidTierId } from "../constants/subscription-tiers.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { validateRequest } from "../middleware/validate.js";
-
+import { createApiResponse } from "../types/api.js";
 const router = express.Router();
 const prisma = new PrismaClient();
 
@@ -70,11 +62,7 @@ interface ListingWithCounts {
 const getTiers: RequestHandler = async (_req, res) => {
   try {
     const tiers = await prisma.subscriptionTier.findMany({
-      orderBy: [
-        {
-          createdAt: "asc",
-        },
-      ],
+      orderBy: [{ createdAt: "asc" }],
     });
 
     const tiersWithNames = tiers.map((tier) => ({
@@ -82,16 +70,18 @@ const getTiers: RequestHandler = async (_req, res) => {
       name: tier.name,
     }));
 
-    res.json({
-      success: true,
-      data: tiersWithNames,
-    });
+    res.json(createApiResponse(true, tiersWithNames));
   } catch (error) {
-    console.error("Get tiers error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error ? error.message : "Failed to get tiers"
+        )
+      );
   }
 };
 
@@ -361,10 +351,13 @@ const cancelSubscription: RequestHandler = async (req, res) => {
       },
     });
 
-    res.json({
-      success: true,
-      data: updatedUser,
-    });
+    res.json(
+      createApiResponse(
+        true,
+        updatedUser,
+        "Subscription cancelled successfully"
+      )
+    );
   } catch (error) {
     console.error("Cancel subscription error:", error);
     res.status(500).json({
@@ -378,7 +371,6 @@ const cancelSubscription: RequestHandler = async (req, res) => {
 const getCurrentSubscription: RequestHandler = async (req, res) => {
   try {
     const userId = req.user!.id;
-
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -392,30 +384,33 @@ const getCurrentSubscription: RequestHandler = async (req, res) => {
     });
 
     if (!user) {
-      res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
+      res
+        .status(404)
+        .json(createApiResponse(false, undefined, undefined, "User not found"));
       return;
     }
 
-    res.json({
-      success: true,
-      data: {
+    res.json(
+      createApiResponse(true, {
         id: user.stripeSubscriptionId || user.id,
         plan: user.currentTierId,
         status: user.subscriptionStatus?.toLowerCase() || "free",
         currentPeriodEnd:
           user.subscriptionPeriodEnd?.toISOString() || new Date().toISOString(),
         cancelAtPeriodEnd: user.subscriptionStatus === "CANCELED",
-      },
-    });
+      })
+    );
   } catch (error) {
-    console.error("Get current subscription error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error ? error.message : "Failed to get subscription"
+        )
+      );
   }
 };
 

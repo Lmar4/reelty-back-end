@@ -23,7 +23,7 @@ const deductCreditsSchema = z.object({
 const purchaseCreditsSchema = z.object({
   body: z.object({
     amount: z.number().min(1),
-    paymentMethodId: z.string().optional(),
+    priceId: z.string(),
   }),
 });
 

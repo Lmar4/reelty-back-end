@@ -4,7 +4,7 @@ import { AgencyService } from "../services/agency.service.js";
 import { validateRequest } from "../middleware/validate.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { isAgencyOwner } from "../middleware/roles.js";
-
+import { createApiResponse } from "../types/api.js";
 const router = express.Router();
 const agencyService = new AgencyService();
 
@@ -41,17 +41,18 @@ router.post(
   async (req, res) => {
     try {
       const agency = await agencyService.createAgency(req.body);
-      res.json({
-        success: true,
-        data: agency,
-      });
+      res.json(createApiResponse(true, agency));
     } catch (error) {
-      console.error("Create agency error:", error);
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error ? error.message : "Unknown error occurred",
-      });
+      res
+        .status(500)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            error instanceof Error ? error.message : "Failed to create agency"
+          )
+        );
     }
   }
 );
@@ -92,9 +93,7 @@ router.delete(
   async (req, res) => {
     try {
       await agencyService.removeUserFromAgency(req.body.userId);
-      res.json({
-        success: true,
-      });
+      res.json(createApiResponse(true, undefined, "User removed from agency"));
     } catch (error) {
       console.error("Remove agency user error:", error);
       res.status(500).json({
@@ -112,18 +111,20 @@ router.get("/stats", isAuthenticated, isAgencyOwner, async (req, res) => {
     const agency = await agencyService.getAgencies();
     const stats = {
       totalUsers: agency[0]?.agencyCurrentUsers || 0,
-      maxUsers: agency[0]?.agencyMaxUsers || 0
+      maxUsers: agency[0]?.agencyMaxUsers || 0,
     };
-    res.json({
-      success: true,
-      data: stats,
-    });
+    res.json(createApiResponse(true, stats));
   } catch (error) {
-    console.error("Get agency stats error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error ? error.message : "Failed to get agency stats"
+        )
+      );
   }
 });
 

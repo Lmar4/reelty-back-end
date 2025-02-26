@@ -5,7 +5,7 @@ import { isAuthenticated } from "../middleware/auth.js";
 import { validateRequest } from "../middleware/validate.js";
 import { ProductionPipeline } from "../services/imageProcessing/productionPipeline.js";
 import { TemplateKey } from "../services/imageProcessing/templates/types.js";
-
+import { createApiResponse } from "../types/api.js";
 const router = express.Router();
 const prisma = new PrismaClient();
 
@@ -241,19 +241,18 @@ const createJob: RequestHandler = async (req, res) => {
         });
       });
 
-    res.status(201).json({
-      success: true,
-      data: job,
-    });
+    res.status(201).json(createApiResponse(true, job));
   } catch (error) {
-    console.error("[CREATE_JOB] Error creating job:", {
-      error: error instanceof Error ? error.message : "Unknown error",
-      body: req.body,
-    });
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error ? error.message : "Failed to create job"
+        )
+      );
   }
 };
 
@@ -339,25 +338,22 @@ const deleteJob: RequestHandler = async (req, res) => {
       },
     });
 
-    res.json({
-      success: true,
-      message: "Job deleted successfully",
-    });
+    res.json(createApiResponse(true, null, "Job deleted successfully"));
   } catch (error) {
     if (
       error instanceof Error &&
       error.message.includes("Record to delete does not exist")
     ) {
-      res.status(404).json({
-        success: false,
-        error: "Job not found",
-      });
+      res
+        .status(404)
+        .json(createApiResponse(false, undefined, undefined, "Job not found"));
       return;
     }
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(false, undefined, undefined, "Failed to delete job")
+      );
   }
 };
 

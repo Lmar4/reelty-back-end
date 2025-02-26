@@ -10,7 +10,7 @@ import { prisma } from "../lib/prisma.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { validateRequest } from "../middleware/validate.js";
 import { logger } from "../utils/logger.js";
-
+import { createApiResponse } from "../types/api.js";
 const router = express.Router();
 
 // Validation schemas
@@ -69,23 +69,56 @@ const getTemplates: RequestHandler = async (req, res) => {
       },
     });
 
-    res.json({
-      success: true,
-      data: templates,
-    });
+    if (!isValidTierId(tierId)) {
+      res
+        .status(400)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "Invalid subscription tier ID"
+          )
+        );
+      return;
+    }
+
+    res.json(
+      createApiResponse(true, {
+        templates,
+        pagination: {
+          total: templates.length,
+          page: 1,
+          limit: templates.length,
+        },
+      })
+    );
   } catch (error) {
-    logger.error("Get templates error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error ? error.message : "Failed to fetch templates"
+        )
+      );
   }
 };
 
 // Create template
 const createTemplate: RequestHandler = async (req, res) => {
   try {
-    const { name, description, order, subscriptionTierIds, key, sequence, durations } = req.body;
+    const {
+      name,
+      description,
+      order,
+      subscriptionTierIds,
+      key,
+      sequence,
+      durations,
+    } = req.body;
 
     // Validate subscription tier IDs
     if (!subscriptionTierIds.every(isValidTierId)) {

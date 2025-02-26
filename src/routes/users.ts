@@ -4,7 +4,7 @@ import { prisma } from "../lib/prisma.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { logger } from "../utils/logger.js";
 import { PrismaClient, SubscriptionTierId } from "@prisma/client";
-
+import { createApiResponse } from "../types/api.js";
 const router = express.Router();
 
 // Middleware to verify webhook requests
@@ -90,30 +90,27 @@ router.post(
         return user;
       });
 
-      res.status(201).json({
-        success: true,
-        data: result,
-      });
+      res.status(201).json(createApiResponse(true, result));
     } catch (error) {
-      logger.error("[Users] Error creating user", {
-        error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-
       if (error instanceof z.ZodError) {
-        res.status(400).json({
-          success: false,
-          error: "Invalid user data",
-          details: error.errors,
-        });
+        res
+          .status(400)
+          .json(
+            createApiResponse(false, undefined, undefined, "Invalid user data")
+          );
         return;
       }
 
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error ? error.message : "Unknown error occurred",
-      });
+      res
+        .status(500)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            error instanceof Error ? error.message : "Failed to create user"
+          )
+        );
     }
   }
 );
@@ -212,16 +209,24 @@ const getUserData = async (
   try {
     const userId = req.user?.id;
     if (!userId) {
-      res.status(401).json({ error: "User not authenticated" });
+      res
+        .status(401)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "User not authenticated"
+          )
+        );
       return;
     }
 
-    // Fetch user with related data including listing credits
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
         currentTier: true,
-        listingCredits: true, // Include listing credits
+        listingCredits: true,
         listings: {
           select: {
             id: true,
@@ -232,17 +237,33 @@ const getUserData = async (
     });
 
     if (!user) {
-      res.status(404).json({ error: "User not found" });
+      res
+        .status(404)
+        .json(createApiResponse(false, undefined, undefined, "User not found"));
       return;
     }
 
-    res.status(200).json({
-      success: true,
-      data: user,
-    });
+    res.status(200).json(createApiResponse(true, user));
   } catch (error) {
-    console.error("Error fetching user data:", error);
-    res.status(500).json({ error: "Failed to fetch user data" });
+    if (error instanceof z.ZodError) {
+      res
+        .status(400)
+        .json(
+          createApiResponse(false, undefined, undefined, "Invalid user data")
+        );
+      return;
+    }
+
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error ? error.message : "Failed to fetch user data"
+        )
+      );
   }
 };
 

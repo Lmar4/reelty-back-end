@@ -5,6 +5,7 @@ import { validateRequest } from "../middleware/validate.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { prisma } from "../lib/prisma.js";
 import { logger } from "../utils/logger.js";
+import { createApiResponse } from "../types/api.js";
 
 const router = Router();
 const storageService = StorageService.getInstance();
@@ -42,10 +43,16 @@ router.post(
           propertyId,
           userId,
         });
-        res.status(404).json({
-          success: false,
-          error: "Property not found or access denied",
-        });
+        res
+          .status(404)
+          .json(
+            createApiResponse(
+              false,
+              undefined,
+              undefined,
+              "Property not found or access denied"
+            )
+          );
         return;
       }
 
@@ -61,20 +68,22 @@ router.post(
         type,
       });
 
-      res.status(200).json({
-        success: true,
-        data: result,
-      });
+      res.status(200).json(createApiResponse(true, result));
     } catch (error) {
       logger.error("[Storage] Upload URL generation error", {
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,
       });
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error ? error.message : "Unknown error occurred",
-      });
+      res
+        .status(500)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            error instanceof Error ? error.message : "Upload failed"
+          )
+        );
     }
   }
 );
@@ -156,10 +165,16 @@ router.delete(
           propertyId,
           userId,
         });
-        res.status(404).json({
-          success: false,
-          error: "Property not found or access denied",
-        });
+        res
+          .status(404)
+          .json(
+            createApiResponse(
+              false,
+              undefined,
+              undefined,
+              "Property not found or access denied"
+            )
+          );
         return;
       }
 
@@ -171,10 +186,9 @@ router.delete(
         fileKey,
       });
 
-      res.status(200).json({
-        success: true,
-        message: "File deleted successfully",
-      });
+      res
+        .status(200)
+        .json(createApiResponse(true, undefined, "File deleted successfully"));
     } catch (error) {
       logger.error("[Storage] File deletion error", {
         error: error instanceof Error ? error.message : "Unknown error",

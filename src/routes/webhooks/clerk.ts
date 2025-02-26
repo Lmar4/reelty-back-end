@@ -4,7 +4,7 @@ import { WebhookEvent } from "@clerk/backend";
 import { prisma } from "../../lib/prisma.js";
 import { logger } from "../../utils/logger.js";
 import { PrismaClient, SubscriptionTierId } from "@prisma/client";
-
+import { createApiResponse } from "../../types/api.js";
 const router = express.Router();
 
 // Extend Express Request type to include webhookEvent
@@ -48,10 +48,16 @@ const validateClerkWebhook = async (
 
   if (!CLERK_WEBHOOK_SECRET) {
     logger.error("[Clerk Webhook] Missing CLERK_WEBHOOK_SECRET");
-    res.status(500).json({
-      success: false,
-      error: "Server configuration error",
-    });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Server configuration error"
+        )
+      );
     return;
   }
 
@@ -73,10 +79,11 @@ const validateClerkWebhook = async (
       svix_timestamp,
       svix_signature,
     });
-    res.status(400).json({
-      success: false,
-      error: "Missing svix headers",
-    });
+    res
+      .status(400)
+      .json(
+        createApiResponse(false, undefined, undefined, "Missing svix headers")
+      );
     return;
   }
 
@@ -100,10 +107,11 @@ const validateClerkWebhook = async (
 
     if (!payload) {
       logger.error("[Clerk Webhook] Missing request body");
-      res.status(400).json({
-        success: false,
-        error: "Missing request body",
-      });
+      res
+        .status(400)
+        .json(
+          createApiResponse(false, undefined, undefined, "Missing request body")
+        );
       return;
     }
 
@@ -132,10 +140,16 @@ const validateClerkWebhook = async (
         svix_signature,
       },
     });
-    res.status(400).json({
-      success: false,
-      error: "Webhook verification failed",
-    });
+    res
+      .status(400)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Webhook verification failed"
+        )
+      );
     return;
   }
 };
@@ -186,10 +200,16 @@ router.post(
           logger.error("[Clerk Webhook] No email address found", {
             availableEmails: email_addresses?.map((e) => e.email_address),
           });
-          res.status(400).json({
-            success: false,
-            error: "No email address found",
-          });
+          res
+            .status(400)
+            .json(
+              createApiResponse(
+                false,
+                undefined,
+                undefined,
+                "No email address found"
+              )
+            );
           return;
         }
 
@@ -262,10 +282,7 @@ router.post(
             operation: eventType === "user.created" ? "create" : "update",
           });
 
-          res.status(200).json({
-            success: true,
-            data: result,
-          });
+          res.status(200).json(createApiResponse(true, result));
           return;
         } catch (error) {
           logger.error("[Clerk Webhook] Database operation failed", {
@@ -288,10 +305,15 @@ router.post(
             logger.info("[Clerk Webhook] User already deleted or not found", {
               userId: id,
             });
-            res.status(200).json({
-              success: true,
-              message: "User already deleted or not found",
-            });
+            res
+              .status(200)
+              .json(
+                createApiResponse(
+                  true,
+                  undefined,
+                  "User already deleted or not found"
+                )
+              );
             return;
           }
 
@@ -304,10 +326,11 @@ router.post(
             userId: id,
           });
 
-          res.status(200).json({
-            success: true,
-            message: "User deleted successfully",
-          });
+          res
+            .status(200)
+            .json(
+              createApiResponse(true, undefined, "User deleted successfully")
+            );
           return;
         } catch (error) {
           logger.error("[Clerk Webhook] Error deleting user", {
@@ -320,20 +343,22 @@ router.post(
       }
 
       // Handle other event types if needed
-      res.status(200).json({
-        success: true,
-        message: "Event processed",
-      });
+      res.status(200).json(createApiResponse(true, null, "Event processed"));
     } catch (error) {
       logger.error("[Clerk Webhook] Error processing webhook", {
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,
       });
-      res.status(500).json({
-        success: false,
-        error:
-          error instanceof Error ? error.message : "Unknown error occurred",
-      });
+      res
+        .status(500)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            error instanceof Error ? error.message : "Failed to process webhook"
+          )
+        );
     }
   }
 );

@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { PrismaClient } from "@prisma/client";
 import Stripe from "stripe";
+import { createApiResponse } from "../../types/api.js";
 
 interface ListingCredit {
   id: string;
@@ -21,7 +22,16 @@ export const getBalance = async (
   try {
     const userId = req.user?.id;
     if (!userId) {
-      res.status(401).json({ error: "User not authenticated" });
+      res
+        .status(401)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "User not authenticated"
+          )
+        );
       return;
     }
 
@@ -52,17 +62,25 @@ export const getBalance = async (
     const used = Math.abs(usedCredits._sum.amount || 0);
     const available = total - used;
 
-    res.json({
-      success: true,
-      data: {
+    res.json(
+      createApiResponse(true, {
         total,
         available,
         used,
-      },
-    });
+      })
+    );
   } catch (error) {
     console.error("[GET_BALANCE_ERROR]", error);
-    res.status(500).json({ error: "Failed to get credit balance" });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Failed to get credit balance"
+        )
+      );
   }
 };
 
@@ -73,7 +91,16 @@ export const checkCredits = async (
   try {
     const userId = req.user?.id;
     if (!userId) {
-      res.status(401).json({ error: "User not authenticated" });
+      res
+        .status(401)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "User not authenticated"
+          )
+        );
       return;
     }
 
@@ -89,10 +116,19 @@ export const checkCredits = async (
       0
     );
 
-    res.json({ success: true, data: { credits: totalCredits } });
+    res.json(createApiResponse(true, { credits: totalCredits }));
   } catch (error) {
     console.error("[CHECK_CREDITS_ERROR]", error);
-    res.status(500).json({ success: false, error: "Failed to check credits" });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Failed to check credits"
+        )
+      );
   }
 };
 
@@ -103,7 +139,16 @@ export const deductCredits = async (
   try {
     const userId = req.user?.id;
     if (!userId) {
-      res.status(401).json({ error: "User not authenticated" });
+      res
+        .status(401)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "User not authenticated"
+          )
+        );
       return;
     }
 
@@ -159,14 +204,27 @@ export const deductCredits = async (
       return { success: true };
     });
 
-    res.json(result);
+    res.json(createApiResponse(true, result));
   } catch (error) {
     console.error("[DEDUCT_CREDITS_ERROR]", error);
     if (error instanceof Error && error.message === "Insufficient credits") {
-      res.status(400).json({ error: "Insufficient credits" });
+      res
+        .status(400)
+        .json(
+          createApiResponse(false, undefined, undefined, "Insufficient credits")
+        );
       return;
     }
-    res.status(500).json({ error: "Failed to deduct credits" });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Failed to deduct credits"
+        )
+      );
   }
 };
 
@@ -177,7 +235,16 @@ export const getCreditHistory = async (
   try {
     const authUserId = req.user?.id;
     if (!authUserId) {
-      res.status(401).json({ error: "User not authenticated" });
+      res
+        .status(401)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "User not authenticated"
+          )
+        );
       return;
     }
 
@@ -187,7 +254,14 @@ export const getCreditHistory = async (
     if (userId !== authUserId) {
       res
         .status(403)
-        .json({ error: "Not authorized to view this credit history" });
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "Not authorized to view this credit history"
+          )
+        );
       return;
     }
 
@@ -197,13 +271,19 @@ export const getCreditHistory = async (
       take: 50, // Limit to last 50 transactions
     });
 
-    res.json({
-      success: true,
-      data: creditLogs,
-    });
+    res.json(createApiResponse(true, creditLogs));
   } catch (error) {
     console.error("[CREDIT_HISTORY_ERROR]", error);
-    res.status(500).json({ error: "Failed to fetch credit history" });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Failed to fetch credit history"
+        )
+      );
   }
 };
 
@@ -212,7 +292,22 @@ export const purchaseCredits = async (
   res: Response
 ): Promise<void> => {
   try {
-    const { userId, amount, priceId } = req.body;
+    const { amount, priceId } = req.body;
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res
+        .status(401)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "User not authenticated"
+          )
+        );
+      return;
+    }
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -232,9 +327,18 @@ export const purchaseCredits = async (
       },
     });
 
-    res.json({ url: session.url });
+    res.json(createApiResponse(true, { url: session.url }));
   } catch (error) {
     console.error("[PURCHASE_CREDITS_ERROR]", error);
-    res.status(500).json({ error: "Failed to create checkout session" });
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Failed to create checkout session"
+        )
+      );
   }
 };
