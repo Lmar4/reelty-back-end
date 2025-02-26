@@ -1,6 +1,6 @@
-# Use the apt provider instead of the default Nix provider
-[providers]
-apt = true
+# Providers should be an array, not a map
+[build]
+providers = ["apt"]
 
 # Install packages using apt
 [phases.setup]
