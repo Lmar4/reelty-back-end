@@ -372,17 +372,80 @@ export class VideoProcessingService {
       }
     });
 
-    // Concatenate all clips
+    // Concatenate all clips in smaller batches
     if (clips.length > 1) {
       const inputs = clips.map((_, i) =>
         i > 0 && clips[i].transition ? `trans${i}` : `color${i}`
       );
-      filterCommands.push({
-        filter: "concat",
-        options: `n=${inputs.length}:v=1:a=0`,
-        inputs,
-        outputs: ["vconcat"],
-      });
+
+      // Use a smaller batch size for concatenation
+      const MAX_CONCAT_INPUTS = 4; // Limit number of inputs per concat operation
+
+      if (inputs.length <= MAX_CONCAT_INPUTS) {
+        // If we have few enough clips, we can do a single concat
+        filterCommands.push({
+          filter: "concat",
+          options: `n=${inputs.length}:v=1:a=0`,
+          inputs,
+          outputs: ["vconcat"],
+        });
+      } else {
+        // Otherwise, do multiple concat operations in a cascade
+        let remainingInputs = [...inputs];
+        let concatStepCount = 0;
+        let previousOutput = "";
+
+        while (remainingInputs.length > 0) {
+          const batchInputs = remainingInputs.splice(0, MAX_CONCAT_INPUTS);
+          const isFirstBatch = concatStepCount === 0;
+          const isLastBatch = remainingInputs.length === 0;
+          const outputLabel = isLastBatch
+            ? "vconcat"
+            : `concat_step${concatStepCount}`;
+
+          if (isFirstBatch) {
+            // First batch just concatenates the first set of inputs
+            filterCommands.push({
+              filter: "concat",
+              options: `n=${batchInputs.length}:v=1:a=0`,
+              inputs: batchInputs,
+              outputs: [outputLabel],
+            });
+          } else {
+            // Subsequent batches concatenate previous result with next batch
+            if (batchInputs.length > 1) {
+              // If we have multiple inputs in this batch, concat them first
+              const currentBatchOutput = `batch${concatStepCount}`;
+              filterCommands.push({
+                filter: "concat",
+                options: `n=${batchInputs.length}:v=1:a=0`,
+                inputs: batchInputs,
+                outputs: [currentBatchOutput],
+              });
+
+              // Then concat with previous result
+              filterCommands.push({
+                filter: "concat",
+                options: "n=2:v=1:a=0",
+                inputs: [previousOutput, currentBatchOutput],
+                outputs: [outputLabel],
+              });
+            } else {
+              // If only one input in this batch, concat directly with previous result
+              filterCommands.push({
+                filter: "concat",
+                options: "n=2:v=1:a=0",
+                inputs: [previousOutput, batchInputs[0]],
+                outputs: [outputLabel],
+              });
+            }
+          }
+
+          previousOutput = outputLabel;
+          concatStepCount++;
+        }
+      }
+
       lastOutput = "vconcat";
     }
 
