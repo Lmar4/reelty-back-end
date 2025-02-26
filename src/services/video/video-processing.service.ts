@@ -20,6 +20,16 @@ interface FFmpegError extends Error {
   exitCode?: number;
   ffmpegOutput?: string;
   killed?: boolean;
+  stderr?: string;
+  stdout?: string;
+  cmd?: string;
+  spawnargs?: string[];
+  details?: {
+    input?: string[];
+    output?: string;
+    filters?: string[];
+    errorAt?: string;
+  };
 }
 
 interface FFmpegProgress {
@@ -136,11 +146,43 @@ export class VideoProcessingService {
       // For media files, try to validate format
       if (context === "video" || context === "music") {
         try {
-          const duration = await this.getVideoDuration(filePath);
-          if (duration <= 0) {
-            throw new Error(`Invalid ${context} duration: ${duration}`);
-          }
-          logger.debug(`Validated ${context} duration`, { filePath, duration });
+          // Run ffprobe with detailed validation
+          return new Promise<void>((resolve, reject) => {
+            exec(
+              `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
+              (error, stdout, stderr) => {
+                if (error) {
+                  logger.error(`FFprobe validation failed for ${context}`, {
+                    filePath,
+                    error: error.message,
+                    stderr,
+                  });
+                  reject(
+                    new Error(`Invalid ${context} file: ${error.message}`)
+                  );
+                  return;
+                }
+
+                const duration = parseFloat(stdout.trim());
+                if (isNaN(duration) || duration <= 0) {
+                  logger.error(`Invalid ${context} duration`, {
+                    filePath,
+                    duration: stdout.trim(),
+                  });
+                  reject(
+                    new Error(`Invalid ${context} duration: ${stdout.trim()}`)
+                  );
+                  return;
+                }
+
+                logger.debug(`Validated ${context} duration`, {
+                  filePath,
+                  duration,
+                });
+                resolve();
+              }
+            );
+          });
         } catch (error) {
           logger.error(`Failed to validate ${context} duration`, {
             filePath,
@@ -340,24 +382,28 @@ export class VideoProcessingService {
   }
 
   private createFFmpegCommand(): ffmpeg.FfmpegCommand {
-    return ffmpeg()
-      .on("start", (commandLine) => {
-        logger.info("FFmpeg process started", { commandLine });
-      })
-      .on("progress", (progress) =>
-        this.handleFFmpegProgress(progress, "video-processing")
-      )
-      .on("end", () => logger.info("FFmpeg process completed"))
-      .on("error", (error: FFmpegError) =>
-        this.handleFFmpegError(error, "video-processing")
-      )
-      .on("stderr", (stderrLine) => {
-        // Enhanced FFmpeg stderr logging
-        logger.debug("FFmpeg stderr output", {
-          line: stderrLine,
-          timestamp: new Date().toISOString(),
-        });
-      });
+    return (
+      ffmpeg()
+        .on("start", (commandLine) => {
+          logger.info("FFmpeg process started", { commandLine });
+        })
+        .on("progress", (progress) =>
+          this.handleFFmpegProgress(progress, "video-processing")
+        )
+        .on("end", () => logger.info("FFmpeg process completed"))
+        .on("error", (error: FFmpegError) =>
+          this.handleFFmpegError(error, "video-processing")
+        )
+        .on("stderr", (stderrLine) => {
+          // Enhanced FFmpeg stderr logging
+          logger.debug("FFmpeg stderr output", {
+            line: stderrLine,
+            timestamp: new Date().toISOString(),
+          });
+        })
+        // Add verbose debugging output
+        .outputOptions(["-v", "debug"])
+    );
   }
 
   private handleFFmpegProgress(
@@ -378,20 +424,68 @@ export class VideoProcessingService {
   }
 
   private handleFFmpegError(error: FFmpegError, context: string): void {
+    // Extract all possible error details
     const details: Record<string, unknown> = {
       code: error.code,
       exitCode: error.exitCode,
       killed: error.killed,
       message: error.message,
+      cmd: error.cmd,
     };
+
+    // Extract error lines from ffmpeg output
     if (error.ffmpegOutput) {
-      details.ffmpegOutput = error.ffmpegOutput
+      const errorLines = error.ffmpegOutput
         .split("\n")
-        .filter((line) => line.toLowerCase().includes("error"));
+        .filter(
+          (line) =>
+            line.toLowerCase().includes("error") ||
+            line.toLowerCase().includes("failed")
+        );
+
+      details.ffmpegOutput =
+        errorLines.length > 0 ? errorLines : error.ffmpegOutput;
+    }
+
+    // Add stderr if available
+    if (error.stderr) {
+      details.stderr = error.stderr;
+    }
+
+    // Try to identify specific error patterns
+    const errorMessage = error.message || "";
+    if (errorMessage.includes("Error while opening encoder")) {
+      details.errorType = "ENCODER_INITIALIZATION_FAILED";
+      details.possibleCauses = [
+        "Missing codec libraries",
+        "Invalid encoding parameters",
+        "Insufficient permissions",
+        "Resource limitations",
+      ];
+    } else if (
+      errorMessage.includes("Invalid data found when processing input")
+    ) {
+      details.errorType = "INVALID_INPUT_DATA";
+    } else if (errorMessage.includes("No such file or directory")) {
+      details.errorType = "FILE_NOT_FOUND";
+    } else if (errorMessage.includes("Permission denied")) {
+      details.errorType = "PERMISSION_DENIED";
+    } else if (error.killed) {
+      details.errorType = "PROCESS_KILLED";
     }
 
     logger.error(`[${context}] FFmpeg processing failed`, details);
-    throw new Error(`FFmpeg error in ${context}: ${error.message}`);
+
+    // Create a more informative error message
+    let enhancedMessage = `FFmpeg error in ${context}: ${error.message}`;
+    if (details.errorType) {
+      enhancedMessage += ` (Type: ${details.errorType})`;
+    }
+    if (error.exitCode) {
+      enhancedMessage += ` (Exit code: ${error.exitCode})`;
+    }
+
+    throw new Error(enhancedMessage);
   }
 
   private async uploadToS3(filePath: string, s3Key: string): Promise<string> {
@@ -458,31 +552,86 @@ export class VideoProcessingService {
     const startTime = Date.now();
     const jobId = crypto.randomUUID();
 
-    // Log clips order before processing
-    logger.info(`[${jobId}] Clips prepared for stitching`, {
-      clips: clips.map((c) => ({ path: c.path, duration: c.duration })),
-    });
+    // Enhanced validation and logging
+    logger.info(
+      `[${jobId}] Starting video stitching with enhanced validation`,
+      {
+        clipCount: clips.length,
+        outputPath,
+        templateName: template.name,
+        hasWatermark: !!watermarkConfig,
+        hasMusic: !!template.music?.path,
+      }
+    );
 
-    // Validate and log detailed clip information
-    const clipsWithDuration = await Promise.all(
+    // Validate all input clips thoroughly before processing
+    const validatedClips = await Promise.all(
       clips.map(async (clip, index) => {
         try {
-          // Get video duration if not already set
-          if (clip.duration == null) {
-            const duration = await this.getVideoDuration(clip.path);
+          // Validate clip path exists and is readable
+          if (!clip.path) {
+            throw new Error(`Clip ${index} has no path`);
+          }
+
+          // Resolve path if it's an S3 URL
+          const resolvedPath =
+            clip.path.startsWith("http") || clip.path.startsWith("s3://")
+              ? await this.resolveAssetPath(clip.path, "video", true)
+              : clip.path;
+
+          // Validate file exists and has content
+          await this.validateFile(resolvedPath, `Clip ${index}`);
+
+          // Validate duration
+          if (!clip.duration || clip.duration <= 0) {
+            const duration = await this.getVideoDuration(resolvedPath);
+            if (duration <= 0) {
+              throw new Error(
+                `Invalid duration for clip ${index}: ${duration}`
+              );
+            }
             clip.duration = duration;
           }
 
-          logger.info(`[${jobId}] Clip ${index} validation:`, {
-            path: clip.path,
-            originalDuration: clip.duration,
+          // Validate transitions if present
+          if (clip.transition) {
+            if (
+              !["crossfade", "fade", "slide"].includes(clip.transition.type)
+            ) {
+              logger.warn(
+                `Invalid transition type for clip ${index}, defaulting to crossfade`,
+                {
+                  type: clip.transition.type,
+                }
+              );
+              clip.transition.type = "crossfade";
+            }
+
+            if (!clip.transition.duration || clip.transition.duration <= 0) {
+              logger.warn(
+                `Invalid transition duration for clip ${index}, defaulting to 0.5s`,
+                {
+                  duration: clip.transition.duration,
+                }
+              );
+              clip.transition.duration = 0.5;
+            }
+          }
+
+          logger.info(`[${jobId}] Validated clip ${index}`, {
+            path: resolvedPath,
+            duration: clip.duration,
             hasTransition: !!clip.transition,
-            hasColorCorrection: !!clip.colorCorrection,
+            transitionType: clip.transition?.type,
+            transitionDuration: clip.transition?.duration,
           });
 
-          return clip;
+          return {
+            ...clip,
+            path: resolvedPath,
+          };
         } catch (error) {
-          logger.error(`[${jobId}] Failed to process clip ${index}:`, {
+          logger.error(`[${jobId}] Clip ${index} validation failed`, {
             path: clip.path,
             error: error instanceof Error ? error.message : "Unknown error",
           });
@@ -491,98 +640,146 @@ export class VideoProcessingService {
       })
     );
 
-    // Calculate total duration including transitions
-    const totalDuration = clipsWithDuration.reduce((sum, clip, index) => {
-      if (!clip.duration) {
-        throw new Error(`Clip ${index} has no duration: ${clip.path}`);
+    // Validate music if present
+    let validatedMusic = template.music;
+    if (template.music?.path) {
+      try {
+        const musicPath = await this.resolveAssetPath(
+          template.music.path,
+          "music",
+          true
+        );
+        await this.validateFile(musicPath, "Music");
+        validatedMusic = {
+          ...template.music,
+          path: musicPath,
+        };
+        logger.info(`[${jobId}] Validated music file`, {
+          path: musicPath,
+        });
+      } catch (error) {
+        logger.warn(
+          `[${jobId}] Music validation failed, proceeding without music`,
+          {
+            path: template.music.path,
+            error: error instanceof Error ? error.message : "Unknown error",
+          }
+        );
+        validatedMusic = undefined;
       }
-      const transitionDuration =
-        clip.transition && index < clips.length - 1
-          ? clip.transition.duration
-          : 0;
-      return sum + clip.duration + transitionDuration;
-    }, 0);
+    }
 
-    logger.info("Starting video stitching", {
-      clipCount: clipsWithDuration.length,
-      totalDuration,
-      outputPath,
-      templateName: template.name,
-      hasWatermark: !!watermarkConfig,
-    });
+    // Validate watermark if present
+    let validatedWatermark = watermarkConfig;
+    if (watermarkConfig?.path) {
+      try {
+        const watermarkPath = await this.resolveAssetPath(
+          watermarkConfig.path,
+          "watermark",
+          true
+        );
+        await this.validateFile(watermarkPath, "Watermark");
+        validatedWatermark = {
+          ...watermarkConfig,
+          path: watermarkPath,
+        };
+        logger.info(`[${jobId}] Validated watermark file`, {
+          path: watermarkPath,
+        });
+      } catch (error) {
+        logger.warn(
+          `[${jobId}] Watermark validation failed, proceeding without watermark`,
+          {
+            path: watermarkConfig.path,
+            error: error instanceof Error ? error.message : "Unknown error",
+          }
+        );
+        validatedWatermark = undefined;
+      }
+    }
+
+    // Calculate total duration for progress tracking
+    const totalDuration = validatedClips.reduce(
+      (sum, clip) => sum + clip.duration,
+      0
+    );
 
     return new Promise((resolve, reject) => {
       const command = this.createFFmpegCommand();
+      let filterInfo: string[] = [];
 
       const setupCommand = async () => {
         try {
-          // Sequential processing of inputs to preserve order
-          for (const [i, clip] of clipsWithDuration.entries()) {
-            const resolvedPath = await this.resolveAssetPath(
-              clip.path,
-              "video",
-              true
-            );
-            await this.validateFile(resolvedPath, `Clip ${i}`);
-            command.input(resolvedPath);
-            logger.info(`[${jobId}] Added FFmpeg input ${i}`, {
-              path: resolvedPath,
-              isMap: clip.path.includes("map"),
-            });
+          // Add all validated clips as inputs
+          for (const [i, clip] of validatedClips.entries()) {
+            command.input(clip.path);
+            logger.info(`[${jobId}] Added input ${i}: ${clip.path}`);
           }
 
+          // Add music if validated
           let musicIndex = -1;
-          let musicPath = "";
-          if (template?.music?.path) {
-            musicPath = await this.resolveAssetPath(
-              template.music.path,
-              "music",
-              true
+          if (validatedMusic?.path) {
+            musicIndex = validatedClips.length;
+            command.input(validatedMusic.path);
+            logger.info(
+              `[${jobId}] Added music input at index ${musicIndex}: ${validatedMusic.path}`
             );
-            musicIndex = clipsWithDuration.length;
-            command.input(musicPath);
-            logger.info(`[${jobId}] Added music input at index ${musicIndex}`, {
-              path: musicPath,
-            });
           }
 
+          // Add watermark if validated
           let watermarkIndex = -1;
-          let watermarkPath = "";
-          if (watermarkConfig) {
-            watermarkPath = await this.resolveAssetPath(
-              watermarkConfig.path,
-              "watermark",
-              true
-            );
+          if (validatedWatermark?.path) {
             watermarkIndex =
-              musicIndex !== -1 ? musicIndex + 1 : clipsWithDuration.length;
+              musicIndex !== -1 ? musicIndex + 1 : validatedClips.length;
             command
-              .input(watermarkPath)
+              .input(validatedWatermark.path)
               .inputOptions(["-loop", "1", "-framerate", "24", "-f", "image2"]);
             logger.info(
-              `[${jobId}] Added watermark input at index ${watermarkIndex}`,
-              { path: watermarkPath }
+              `[${jobId}] Added watermark input at index ${watermarkIndex}: ${validatedWatermark.path}`
             );
           }
 
-          const filterGraph = this.buildFilterGraph(
-            clipsWithDuration,
-            watermarkConfig,
-            musicIndex,
-            watermarkIndex
-          );
-          if (filterGraph && filterGraph.length > 0) {
-            command.complexFilter(filterGraph);
-          } else {
-            command.outputOptions([
-              `-filter_complex`,
-              `concat=n=${clipsWithDuration.length}:v=1:a=0[vout]`,
-            ]);
+          // Build filter graph with enhanced error handling
+          try {
+            const filterGraph = this.buildFilterGraph(
+              validatedClips,
+              validatedWatermark,
+              musicIndex,
+              watermarkIndex
+            );
+
+            if (filterGraph && filterGraph.length > 0) {
+              filterInfo = filterGraph.map((f) => `${f.filter}:${f.options}`);
+              command.complexFilter(filterGraph);
+              logger.info(
+                `[${jobId}] Applied complex filter graph with ${filterGraph.length} filters`
+              );
+            } else {
+              // Fallback to simple concat filter
+              const concatFilter = `concat=n=${validatedClips.length}:v=1:a=0[vout]`;
+              command.outputOptions([`-filter_complex`, concatFilter]);
+              logger.info(
+                `[${jobId}] Applied simple concat filter: ${concatFilter}`
+              );
+            }
+          } catch (filterError) {
+            logger.error(
+              `[${jobId}] Filter graph creation failed, using simple concat`,
+              {
+                error:
+                  filterError instanceof Error
+                    ? filterError.message
+                    : "Unknown error",
+              }
+            );
+            // Use a simpler filter graph as fallback
+            const concatFilter = `concat=n=${validatedClips.length}:v=1:a=0[vout]`;
+            command.outputOptions([`-filter_complex`, concatFilter]);
           }
 
-          const videoCodec = await this.getAvailableCodec();
+          // Always use software encoding for reliability
           command
-            .videoCodec(videoCodec)
+            .videoCodec("libx264")
             .audioCodec("aac")
             .outputOptions([
               "-map [vout]",
@@ -602,6 +799,12 @@ export class VideoProcessingService {
           const localOutput = outputPath.startsWith("https://")
             ? path.join(this.TEMP_DIR, `temp_output_${crypto.randomUUID()}.mp4`)
             : outputPath;
+
+          // Log the full FFmpeg command for debugging
+          const fullCommand = command._getArguments().join(" ");
+          logger.info(`[${jobId}] Full FFmpeg command:`, {
+            command: fullCommand,
+          });
 
           command
             .on("progress", (progress) => {
@@ -628,8 +831,38 @@ export class VideoProcessingService {
                 });
               }
             })
-            .on("error", (err) => {
-              logger.error("FFmpeg error:", err);
+            .on("error", (err: FFmpegError) => {
+              // Enhance error with command details
+              err.details = {
+                input: validatedClips.map((clip) => clip.path),
+                output: localOutput,
+                filters: filterInfo.length > 0 ? filterInfo : ["concat"],
+              };
+
+              // Add command line to error object
+              err.cmd = command._getArguments().join(" ");
+
+              logger.error(`[${jobId}] FFmpeg error:`, {
+                error: err.message,
+                code: err.code,
+                killed: err.killed,
+                exitCode: err.exitCode,
+                commandLine: err.cmd,
+                details: err.details,
+              });
+
+              // Try to provide more specific error information
+              if (err.message.includes("Error while opening encoder")) {
+                logger.error(
+                  `[${jobId}] Encoder initialization failed. This may be due to missing codec libraries or invalid parameters.`,
+                  {
+                    codec: "libx264", // We're using software encoding
+                    possibleSolution:
+                      "Check if libx264 is properly installed in the container",
+                  }
+                );
+              }
+
               reject(err);
             })
             .on("end", async () => {
@@ -639,17 +872,23 @@ export class VideoProcessingService {
                   const s3Key = this.getS3KeyFromUrl(outputPath);
                   await this.uploadToS3(localOutput, s3Key);
                   await fs.unlink(localOutput);
-                  logger.info("Local file cleaned up after S3 upload", {
-                    localOutput,
-                  });
+                  logger.info(
+                    `[${jobId}] Local file cleaned up after S3 upload`,
+                    {
+                      localOutput,
+                    }
+                  );
                 }
-                logger.info("Video stitching completed successfully", {
-                  outputPath,
-                  durationMs: Date.now() - startTime,
-                  clipCount: clipsWithDuration.length,
-                  hasMusic: musicIndex !== -1,
-                  hasWatermark: watermarkIndex !== -1,
-                });
+                logger.info(
+                  `[${jobId}] Video stitching completed successfully`,
+                  {
+                    outputPath,
+                    durationMs: Date.now() - startTime,
+                    clipCount: validatedClips.length,
+                    hasMusic: musicIndex !== -1,
+                    hasWatermark: watermarkIndex !== -1,
+                  }
+                );
                 resolve();
               } catch (error) {
                 reject(error);
@@ -670,7 +909,7 @@ export class VideoProcessingService {
             ),
           ]);
         } catch (error) {
-          logger.error("Video stitching failed", {
+          logger.error(`[${jobId}] Video stitching failed`, {
             outputPath,
             error: error instanceof Error ? error.message : "Unknown error",
             stack: error instanceof Error ? error.stack : undefined,
@@ -697,13 +936,19 @@ export class VideoProcessingService {
           return;
         }
 
+        logger.info("Available FFmpeg encoders:", {
+          hasLibx264: stdout.includes("libx264"),
+          hasNvenc: stdout.includes("h264_nvenc"),
+          hasVideotoolbox: stdout.includes("h264_videotoolbox"),
+        });
+
         // First try to detect hardware encoders
         if (stdout.includes("h264_nvenc")) {
           try {
-            // Test if NVENC is actually working by running a simple command
+            // Test if NVENC is actually working by running a simple command with verbose output
             exec(
-              "ffmpeg -f lavfi -i color=c=black:s=32x32 -t 1 -c:v h264_nvenc -f null -",
-              (nvencError) => {
+              "ffmpeg -v verbose -f lavfi -i color=c=black:s=32x32 -t 1 -c:v h264_nvenc -f null -",
+              (nvencError, nvencStdout, nvencStderr) => {
                 if (!nvencError) {
                   logger.info("Using NVENC hardware acceleration");
                   resolve("h264_nvenc");
@@ -712,6 +957,7 @@ export class VideoProcessingService {
                     "NVENC detected but not working, falling back to libx264",
                     {
                       error: nvencError.message,
+                      stderr: nvencStderr,
                     }
                   );
                   resolve("libx264");
@@ -729,10 +975,10 @@ export class VideoProcessingService {
           }
         } else if (stdout.includes("h264_videotoolbox")) {
           try {
-            // Test if VideoToolbox is actually working
+            // Test if VideoToolbox is actually working with verbose output
             exec(
-              "ffmpeg -f lavfi -i color=c=black:s=32x32 -t 1 -c:v h264_videotoolbox -f null -",
-              (vtError) => {
+              "ffmpeg -v verbose -f lavfi -i color=c=black:s=32x32 -t 1 -c:v h264_videotoolbox -f null -",
+              (vtError, vtStdout, vtStderr) => {
                 if (!vtError) {
                   logger.info("Using VideoToolbox hardware acceleration");
                   resolve("h264_videotoolbox");
@@ -741,6 +987,7 @@ export class VideoProcessingService {
                     "VideoToolbox detected but not working, falling back to libx264",
                     {
                       error: vtError.message,
+                      stderr: vtStderr,
                     }
                   );
                   resolve("libx264");
