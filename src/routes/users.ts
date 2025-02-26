@@ -33,6 +33,19 @@ const createUserSchema = z.object({
   lastName: z.string().optional(),
 });
 
+// Add this middleware before your routes
+router.use((req, res, next) => {
+  logger.debug("[Users] Incoming request", {
+    method: req.method,
+    path: req.path,
+    headers: req.headers,
+    body: req.body,
+    query: req.query,
+    params: req.params,
+  });
+  next();
+});
+
 // Create user from Clerk webhook
 router.post(
   "/",
