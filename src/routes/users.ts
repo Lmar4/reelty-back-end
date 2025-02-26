@@ -204,65 +204,50 @@ const deleteUser = async (
   }
 };
 
-// Get user by ID
-const getUser = async (
+// Get user data endpoint
+const getUserData = async (
   req: express.Request,
-  res: express.Response,
-  next: express.NextFunction
-) => {
+  res: express.Response
+): Promise<void> => {
   try {
-    const { userId } = req.params;
-
-    if (!userId || typeof userId !== "string") {
-      logger.error("[Users] Invalid user ID format", { userId });
-      res.status(400).json({
-        success: false,
-        error: "Invalid user ID format",
-      });
+    const userId = req.user?.id;
+    if (!userId) {
+      res.status(401).json({ error: "User not authenticated" });
       return;
     }
 
-    logger.info("[Users] Fetching user", { userId });
-
+    // Fetch user with related data including listing credits
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
         currentTier: true,
+        listingCredits: true, // Include listing credits
+        listings: {
+          select: {
+            id: true,
+            status: true,
+          },
+        },
       },
     });
 
     if (!user) {
-      logger.error("[Users] User not found", { userId });
-      res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
+      res.status(404).json({ error: "User not found" });
       return;
     }
 
-    const { password, ...safeUser } = user;
-
-    res.json({
+    res.status(200).json({
       success: true,
-      data: safeUser,
+      data: user,
     });
   } catch (error) {
-    // Log any errors in detail
-    console.error("5. Error in getUser:", error);
-    logger.error("[Users] Error fetching user", {
-      error: error instanceof Error ? error.message : "Unknown error",
-      stack: error instanceof Error ? error.stack : undefined,
-    });
-
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    console.error("Error fetching user data:", error);
+    res.status(500).json({ error: "Failed to fetch user data" });
   }
 };
 
 // Route handlers
-router.get("/:userId", isAuthenticated, getUser);
+router.get("/:userId", isAuthenticated, getUserData);
 router.delete("/:userId", isAuthenticated, deleteUser);
 
 export default router;
