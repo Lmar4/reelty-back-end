@@ -1,8 +1,11 @@
+# Use the apt provider instead of the default Nix provider
+[providers]
+apt = true
+
+# Install packages using apt
 [phases.setup]
 aptPkgs = ["ffmpeg", "ffmpeg-doc", "libavcodec-extra"]
 
+# Set environment variables
 [phases.setup.env]
 PATH = "/usr/bin:$PATH"
-LD_LIBRARY_PATH = "/usr/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
-FFMPEG_PATH = "/usr/bin/ffmpeg"
-FFPROBE_PATH = "/usr/bin/ffprobe"
