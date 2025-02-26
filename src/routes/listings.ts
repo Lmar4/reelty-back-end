@@ -441,7 +441,29 @@ const handleDeleteListing = async (
   res: Response
 ): Promise<void> => {
   const { listingId } = req.params;
+  const userId = req.user!.id;
+
   try {
+    // Verify the listing belongs to the authenticated user
+    const listing = await prisma.listing.findUnique({
+      where: {
+        id: listingId,
+        userId,
+      },
+    });
+
+    if (!listing) {
+      logger.error("[LISTING_DELETE] Listing not found or access denied", {
+        listingId,
+        userId,
+      });
+      res.status(404).json({
+        success: false,
+        error: "Listing not found or access denied",
+      });
+      return;
+    }
+
     await deleteListing(listingId);
     res.json({ success: true });
   } catch (error) {
