@@ -1365,60 +1365,171 @@ export class ProductionPipeline {
     coordinates?: { lat: number; lng: number },
     mapVideo?: string | null
   ): Promise<string[]> {
-    const filteredTemplates = templates.filter((t) => {
-      const needsMap = reelTemplates[t].sequence.includes("map");
-      if (needsMap && !mapVideo) {
-        logger.info(
-          `[${jobId}] Skipping template ${t} due to missing map video`
+    const BATCH_SIZE = 2;
+    const results: string[] = [];
+
+    // Separate map-dependent templates from others
+    const mapDependentTemplates = templates.filter(
+      (t) => reelTemplates[t].sequence[0] === "map"
+    );
+    const regularTemplates = templates.filter(
+      (t) => reelTemplates[t].sequence[0] !== "map"
+    );
+
+    // Validate map requirements early
+    if (mapDependentTemplates.length > 0) {
+      if (!coordinates) {
+        logger.warn(
+          `[${jobId}] Map-dependent templates requested but no coordinates provided`,
+          {
+            templates: mapDependentTemplates,
+          }
         );
-        return false;
+        // Filter out map-dependent templates if no coordinates
+        templates = regularTemplates;
+      } else if (!mapVideo) {
+        // Try to generate map video if not provided
+        try {
+          logger.info(`[${jobId}] Generating map video for templates`, {
+            templates: mapDependentTemplates,
+            coordinates,
+          });
+          mapVideo = await this.generateMapVideoForTemplate(
+            coordinates,
+            jobId,
+            listingId
+          );
+
+          if (!mapVideo) {
+            throw new Error("Map video generation failed");
+          }
+        } catch (error) {
+          logger.error(`[${jobId}] Failed to generate map video`, {
+            error: error instanceof Error ? error.message : String(error),
+            coordinates,
+          });
+          // Continue with regular templates only
+          templates = regularTemplates;
+        }
       }
-      return true;
-    });
-
-    const templatePromises = filteredTemplates.map((template) =>
-      this.limit(() =>
-        this.processTemplate(
-          template,
-          runwayVideos,
-          jobId,
-          listingId,
-          coordinates,
-          mapVideo
-        )
-      )
-    );
-
-    const results = await Promise.allSettled(templatePromises);
-    const successfulResults = results
-      .filter(
-        (r): r is PromiseFulfilledResult<TemplateProcessingResult> =>
-          r.status === "fulfilled" &&
-          r.value.status === "SUCCESS" &&
-          !!r.value.outputPath
-      )
-      .map((r) => r.value.outputPath!);
-
-    const failedResults = results.filter(
-      (r): r is PromiseRejectedResult => r.status === "rejected"
-    );
-    failedResults.forEach((r) => {
-      logger.error(`[${jobId}] Template processing rejected`, {
-        reason: r.reason instanceof Error ? r.reason.message : "Unknown error",
-      });
-    });
-
-    if (successfulResults.length === 0) {
-      throw new Error("No templates processed successfully");
     }
 
-    logger.info(`[${jobId}] Template processing completed`, {
-      successful: successfulResults.length,
-      failed: filteredTemplates.length - successfulResults.length,
-      total: filteredTemplates.length,
-    });
+    // Process regular templates in batches
+    for (let i = 0; i < regularTemplates.length; i += BATCH_SIZE) {
+      const batch = regularTemplates.slice(i, i + BATCH_SIZE);
 
-    return successfulResults;
+      try {
+        logger.info(
+          `[${jobId}] Processing regular template batch ${i / BATCH_SIZE + 1}`,
+          {
+            templates: batch,
+            batchSize: batch.length,
+          }
+        );
+
+        const batchResults = await Promise.all(
+          batch.map((template) =>
+            this.processTemplate(
+              template,
+              runwayVideos,
+              jobId,
+              listingId,
+              coordinates,
+              mapVideo
+            )
+          )
+        );
+
+        const successfulOutputs = batchResults
+          .filter((result) => result.status === "SUCCESS" && result.outputPath)
+          .map((result) => result.outputPath!);
+
+        results.push(...successfulOutputs);
+
+        // Log batch completion status
+        logger.info(`[${jobId}] Batch ${i / BATCH_SIZE + 1} completed`, {
+          total: batch.length,
+          successful: successfulOutputs.length,
+          failed: batch.length - successfulOutputs.length,
+        });
+      } catch (error) {
+        logger.error(`[${jobId}] Batch processing failed`, {
+          batch,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        // Continue with next batch despite errors
+        continue;
+      }
+
+      // Small delay between batches
+      if (i + BATCH_SIZE < regularTemplates.length) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    }
+
+    // Process map-dependent templates if map video is available
+    if (mapDependentTemplates.length > 0 && mapVideo) {
+      logger.info(`[${jobId}] Processing map-dependent templates`, {
+        templates: mapDependentTemplates,
+        mapVideoPath: mapVideo,
+      });
+
+      // Validate map video before processing
+      try {
+        const isMapValid = await this.validateMapVideo(mapVideo, jobId);
+        if (!isMapValid) {
+          throw new Error("Map video validation failed");
+        }
+
+        // Process map-dependent templates one at a time
+        for (const template of mapDependentTemplates) {
+          try {
+            logger.info(`[${jobId}] Processing map template: ${template}`, {
+              mapVideo,
+              runwayVideosCount: runwayVideos.length,
+            });
+
+            const result = await this.processTemplate(
+              template,
+              runwayVideos,
+              jobId,
+              listingId,
+              coordinates,
+              mapVideo
+            );
+
+            if (result.status === "SUCCESS" && result.outputPath) {
+              results.push(result.outputPath);
+              logger.info(`[${jobId}] Map template processed successfully`, {
+                template,
+                processingTime: result.processingTime,
+              });
+            } else {
+              throw new Error(
+                result.error || "Unknown error in map template processing"
+              );
+            }
+          } catch (error) {
+            logger.error(`[${jobId}] Map template processing failed`, {
+              template,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            // Continue with next template despite errors
+            continue;
+          }
+
+          // Small delay between map templates
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      } catch (error) {
+        logger.error(`[${jobId}] Map video validation failed`, {
+          mapVideo,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    return results;
   }
 
   private async processVisionImages(jobId: string): Promise<ProcessingImage[]> {
