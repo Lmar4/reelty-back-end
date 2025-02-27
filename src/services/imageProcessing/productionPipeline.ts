@@ -946,32 +946,85 @@ export class ProductionPipeline {
     mapVideo?: string | null
   ): Promise<TemplateProcessingResult> {
     const startTime = Date.now();
+
+    // Get the user's subscription tier to check watermark settings
+    const job = await this.prisma.videoJob.findUnique({
+      where: { id: jobId },
+      select: {
+        user: {
+          select: {
+            currentTier: true,
+          },
+        },
+      },
+    });
+
+    const userTier = job?.user?.currentTier;
+    const shouldShowWatermark = userTier?.hasWatermark ?? true; // Default to showing watermark if no tier
+
+    // Resolve watermark only if the user's tier requires it
+    let watermarkConfig: WatermarkConfig | undefined;
+    if (shouldShowWatermark) {
+      const localWatermarkPath = await this.getSharedWatermarkPath(jobId);
+      if (localWatermarkPath) {
+        try {
+          await fs.access(localWatermarkPath);
+          watermarkConfig = {
+            path: localWatermarkPath,
+            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
+          };
+
+          logger.info(
+            `[${jobId}] Applying watermark based on subscription tier`,
+            {
+              tierId: userTier?.tierId,
+              hasWatermark: userTier?.hasWatermark,
+            }
+          );
+        } catch (error) {
+          logger.warn(
+            `[${jobId}] Watermark file inaccessible, proceeding without`,
+            {
+              path: localWatermarkPath,
+              error: error instanceof Error ? error.message : "Unknown error",
+            }
+          );
+        }
+      }
+    } else {
+      logger.info(`[${jobId}] Skipping watermark based on subscription tier`, {
+        tierId: userTier?.tierId,
+        hasWatermark: userTier?.hasWatermark,
+      });
+    }
+
     const tempDir = path.join(process.cwd(), "temp", `${jobId}_${template}`);
+    const videoTemplateService = VideoTemplateService.getInstance();
 
     try {
-      // Check system resources before processing
-      if (!(await this.checkResources(jobId))) {
-        throw new Error("Insufficient system resources for video processing");
-      }
-
       await fs.mkdir(tempDir, { recursive: true });
+
       const templateConfig = reelTemplates[template];
+
+      // 1. Improved Duration Array Handling - do it early and validate
       const durations = Array.isArray(templateConfig.durations)
         ? templateConfig.durations
         : Object.values(templateConfig.durations);
 
-      if (
-        !durations.length ||
-        durations.some((d) => typeof d !== "number" || d <= 0)
-      ) {
-        throw new Error(`Template ${template} has invalid durations`);
+      if (!durations.length) {
+        throw new Error(`Template ${template} has no valid durations defined`);
+      }
+
+      // Validate all durations are positive numbers
+      if (durations.some((d) => typeof d !== "number" || d <= 0)) {
+        throw new Error(`Template ${template} has invalid duration values`);
       }
 
       const needsMap = templateConfig.sequence.includes("map");
       if (needsMap && !mapVideo) {
-        throw new Error(
-          `Map video required but not available for template ${template}`
-        );
+        const error = `Map video required but not available for template ${template}`;
+        logger.error(`[${jobId}] ${error}`);
+        return { template, status: "FAILED", outputPath: null, error };
       }
 
       await this.updateJobProgress(jobId, {
@@ -981,33 +1034,21 @@ export class ProductionPipeline {
         message: `Generating ${template} template`,
       });
 
-      // Get watermark configuration
-      const job = await this.prisma.videoJob.findUnique({
-        where: { id: jobId },
-        select: { user: { select: { currentTier: true } } },
-      });
-      const shouldShowWatermark = job?.user?.currentTier?.hasWatermark ?? true;
-      let watermarkConfig: WatermarkConfig | undefined;
-      if (shouldShowWatermark) {
-        const localWatermarkPath = await this.getSharedWatermarkPath(jobId);
-        if (localWatermarkPath) {
-          watermarkConfig = {
-            path: localWatermarkPath,
-            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
-          };
-        }
-      }
-
-      // Download and validate videos
+      // Download and validate runway videos
       const localVideos = await Promise.all(
         runwayVideos.map(async (video, index) => {
           const localPath = path.join(tempDir, `segment_${index}.mp4`);
           try {
             await this.s3Service.downloadFile(video, localPath);
+            const duration = await videoProcessingService.getVideoDuration(
+              localPath
+            );
+            if (duration <= 0) throw new Error("Invalid video duration");
             await this.resourceManager.trackResource(localPath);
             return localPath;
           } catch (error) {
-            logger.warn(`[${jobId}] Failed to download video ${index}`, {
+            logger.warn(`[${jobId}] Skipping corrupt or inaccessible video`, {
+              index,
               path: video,
               error: error instanceof Error ? error.message : "Unknown error",
             });
@@ -1021,115 +1062,163 @@ export class ProductionPipeline {
         throw new Error("No valid videos available for template processing");
       }
 
-      // Handle map video
+      // Handle map video with improved validation
       let localMapVideo: string | undefined;
+      let mapDuration: number | undefined;
       if (needsMap && mapVideo) {
         localMapVideo = path.join(tempDir, "map.mp4");
         try {
           await this.s3Service.downloadFile(mapVideo, localMapVideo);
+          mapDuration = await videoProcessingService.getVideoDuration(
+            localMapVideo
+          );
+          if (mapDuration <= 0) throw new Error("Invalid map video duration");
           await this.resourceManager.trackResource(localMapVideo);
         } catch (error) {
-          logger.warn(`[${jobId}] Failed to download map video`, {
+          logger.warn(`[${jobId}] Map video inaccessible, proceeding without`, {
             path: mapVideo,
             error: error instanceof Error ? error.message : "Unknown error",
           });
+          localMapVideo = undefined;
         }
       }
 
-      // Prepare clips sequence
+      // Resolve music
+      let resolvedMusic: ReelTemplate["music"] | undefined =
+        templateConfig.music;
+      if (templateConfig.music?.path) {
+        const musicPath = path.join(tempDir, `music_${template}.mp3`);
+        try {
+          const resolvedMusicPath = await videoTemplateService.resolveAssetPath(
+            templateConfig.music.path,
+            "music",
+            true
+          );
+          if (resolvedMusicPath) {
+            await this.s3Service.downloadFile(resolvedMusicPath, musicPath);
+            const duration = await videoProcessingService.getVideoDuration(
+              musicPath
+            );
+            if (duration <= 0) throw new Error("Invalid music file duration");
+            await this.resourceManager.trackResource(musicPath);
+            resolvedMusic = {
+              ...templateConfig.music,
+              path: musicPath,
+              isValid: true,
+            };
+          }
+        } catch (error) {
+          logger.warn(`[${jobId}] Music file issue, proceeding without`, {
+            path: templateConfig.music.path,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          resolvedMusic = undefined;
+        }
+      }
+
+      // 2. Segment Count Control & 3. Duration-Sequence Alignment
       const combinedVideos: string[] = [];
       const adjustedDurations: number[] = [];
+      const sequenceMapping: Array<{
+        type: string;
+        source: string;
+        duration: number;
+      }> = [];
       let segmentCount = 0;
+      const maxSegments = validLocalVideos.length;
 
       for (const item of templateConfig.sequence) {
+        // 4. Improved Map Video Handling
         if (item === "map" && localMapVideo) {
-          const mapDuration =
+          const mapDurationValue =
             typeof templateConfig.durations === "object"
               ? (templateConfig.durations as Record<string, number>).map
               : durations[segmentCount];
+
+          if (!mapDurationValue) {
+            logger.warn(
+              `[${jobId}] No duration specified for map video, skipping`
+            );
+            continue;
+          }
+
           combinedVideos.push(localMapVideo);
-          adjustedDurations.push(mapDuration);
-        } else if (segmentCount < validLocalVideos.length) {
+          adjustedDurations.push(mapDurationValue);
+          sequenceMapping.push({
+            type: "map",
+            source: localMapVideo,
+            duration: mapDurationValue,
+          });
+        } else {
+          if (segmentCount >= maxSegments) {
+            logger.info(
+              `[${jobId}] Reached maximum available segments (${maxSegments})`
+            );
+            break;
+          }
+
           const videoIndex = typeof item === "string" ? parseInt(item) : item;
           if (videoIndex < validLocalVideos.length) {
+            const duration = durations[segmentCount];
+
+            // 5. Stricter Validation
+            if (!duration) {
+              logger.warn(
+                `[${jobId}] No duration specified for segment ${segmentCount}, skipping`
+              );
+              continue;
+            }
+
             combinedVideos.push(validLocalVideos[videoIndex]);
-            adjustedDurations.push(durations[segmentCount]);
+            adjustedDurations.push(duration);
+            sequenceMapping.push({
+              type: "runway",
+              source: `video_${videoIndex}`,
+              duration,
+            });
             segmentCount++;
           }
         }
       }
+
+      // Enhanced logging with duration information
+      logger.info(`[${jobId}] Clip sequence for ${template}`, {
+        template,
+        sequence: templateConfig.sequence,
+        sequenceMapping,
+        combinedVideos: combinedVideos.map((path, idx) => ({
+          index: idx,
+          path,
+          duration: adjustedDurations[idx],
+          isMap: path === localMapVideo,
+        })),
+        totalClips: combinedVideos.length,
+        expectedTotal: templateConfig.sequence.length,
+        totalDuration: adjustedDurations.reduce((sum, d) => sum + d, 0),
+      });
 
       if (combinedVideos.length === 0) {
         throw new Error("No valid clips generated for template");
       }
 
       // Create clips with validated durations
-      const clips = combinedVideos.map((path, index) => ({
-        path,
-        duration: adjustedDurations[index],
-        transition: templateConfig.transitions?.[index > 0 ? index - 1 : 0],
-        colorCorrection: templateConfig.colorCorrection,
-      }));
-
-      // Validate all clips
-      const validationResults = await Promise.all(
-        clips.map((clip, index) =>
-          this.validateClipDuration(clip, index, jobId, templateConfig)
-        )
-      );
-
-      const validClips = clips.filter((_, index) => validationResults[index]);
-      if (validClips.length === 0) {
-        throw new Error("No valid clips available after duration validation");
-      }
-
-      if (validClips.length < clips.length) {
-        logger.warn(`[${jobId}] Some clips were invalid and will be skipped`, {
-          originalCount: clips.length,
-          validCount: validClips.length,
-          template,
-        });
-      }
-
-      // Prepare music if needed
-      let resolvedMusic: ReelTemplate["music"] | undefined =
-        templateConfig.music;
-      if (templateConfig.music?.path) {
-        const musicPath = path.join(tempDir, `music_${template}.mp3`);
-        const resolvedMusicPath = await this.assetManager.getAssetPath(
-          AssetType.MUSIC,
-          templateConfig.music.path
-        );
-        if (resolvedMusicPath) {
-          await this.s3Service.downloadFile(resolvedMusicPath, musicPath);
-          await this.resourceManager.trackResource(musicPath);
-          resolvedMusic = {
-            ...templateConfig.music,
-            path: musicPath,
-            isValid: true,
-          };
+      const clips = combinedVideos.map((path, index) => {
+        const duration = adjustedDurations[index];
+        if (duration === undefined) {
+          throw new Error(`No duration defined for clip ${index}: ${path}`);
         }
-      }
+        return {
+          path,
+          duration,
+          transition: templateConfig.transitions?.[index > 0 ? index - 1 : 0],
+          colorCorrection: templateConfig.colorCorrection,
+        };
+      });
 
-      const outputPath = `https://${this.bucket}.s3.${this.region}.amazonaws.com/properties/${listingId}/videos/templates/${jobId}/${template}.mp4`;
+      const outputPath = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/properties/${listingId}/videos/templates/${jobId}/${template}.mp4`;
 
-      // Use batched processing for complex templates
-      if (template === "googlezoomintro" || validClips.length > 7) {
-        return await this.processBatchedTemplate(
-          validClips,
-          template,
-          templateConfig,
-          jobId,
-          outputPath,
-          watermarkConfig,
-          resolvedMusic,
-          startTime
-        );
-      }
-
-      // Regular processing for simple templates
       await videoProcessingService.stitchVideos(
-        validClips,
+        clips,
         outputPath,
         {
           name: templateConfig.name,
@@ -1159,21 +1248,17 @@ export class ProductionPipeline {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error";
-      logger.error(`[${jobId}] Template processing failed`, {
+      logger.error(`[${jobId}] Template processing error`, {
         template,
         error: errorMessage,
         stack: error instanceof Error ? error.stack : undefined,
-        ffmpegError: (error as any)?.stderr,
-        processingTime: Date.now() - startTime,
       });
-
       await this.updateJobProgress(jobId, {
         stage: "template",
         subStage: template,
         progress: 0,
         error: errorMessage,
       });
-
       return {
         template,
         status: "FAILED",
@@ -1182,16 +1267,8 @@ export class ProductionPipeline {
         processingTime: Date.now() - startTime,
       };
     } finally {
-      if (existsSync(tempDir)) {
-        await fs
-          .rm(tempDir, { recursive: true, force: true })
-          .catch((error) => {
-            logger.warn(`[${jobId}] Failed to cleanup temp directory`, {
-              dir: tempDir,
-              error: error instanceof Error ? error.message : "Unknown error",
-            });
-          });
-      }
+      // Cleanup moved to execute, but log here for visibility
+      logger.debug(`[${jobId}] Temp directory ready for cleanup`, { tempDir });
     }
   }
 
@@ -1203,14 +1280,6 @@ export class ProductionPipeline {
     coordinates?: { lat: number; lng: number },
     mapVideo?: string | null
   ): Promise<string[]> {
-    // Log the inputs for better debugging
-    logger.info(`[${jobId}] Starting template processing`, {
-      validRunwayVideos: runwayVideos.filter(Boolean).length,
-      totalRunwayVideos: runwayVideos.length,
-      requestedTemplates: templates,
-      hasMapVideo: !!mapVideo,
-    });
-
     const filteredTemplates = templates.filter((t) => {
       const needsMap = reelTemplates[t].sequence.includes("map");
       if (needsMap && !mapVideo) {
@@ -1862,7 +1931,10 @@ export class ProductionPipeline {
     jobId: string,
     listingId: string
   ): Promise<string | null> {
-    const MAP_GENERATION_TIMEOUT = 120000;
+    // Increase timeout to 5 minutes for map generation
+    const MAP_GENERATION_TIMEOUT = 300000; // 5 minutes
+    const MAX_RETRIES = 3;
+
     const cacheKey = `map_${jobId}_${crypto
       .createHash("md5")
       .update(`${coordinates.lat},${coordinates.lng}`)
@@ -1870,34 +1942,22 @@ export class ProductionPipeline {
     const tempS3Key = `temp/maps/${jobId}/${Date.now()}.mp4`;
 
     try {
-      // Check cache first
+      // Check cache first with validation
       const cachedPath = await this.getCachedAsset(cacheKey, "map");
       if (cachedPath) {
-        const exists = await this.verifyS3Asset(
-          this.getS3KeyFromUrl(cachedPath)
-        );
-        if (exists) {
-          logger.info(`[${jobId}] Using cached map video from S3`, {
+        const isValid = await this.validateMapVideo(cachedPath, jobId);
+        if (isValid) {
+          logger.info(`[${jobId}] Using validated cached map video from S3`, {
             cachedPath,
           });
           return this.validateS3Url(cachedPath);
         } else {
-          // If cached path is local (not S3), upload it to temp location
-          if (!cachedPath.startsWith("https://")) {
-            logger.info(
-              `[${jobId}] Uploading cached local map video to temp S3`,
-              {
-                cachedPath,
-                tempS3Key,
-              }
-            );
-            const fileBuffer = await fs.readFile(cachedPath);
-            await this.s3VideoService.uploadFile(fileBuffer, tempS3Key);
-          } else {
-            logger.warn(`[${jobId}] Cached S3 file not found, regenerating`, {
+          logger.warn(
+            `[${jobId}] Cached map video failed validation, regenerating`,
+            {
               cachedPath,
-            });
-          }
+            }
+          );
         }
       }
 
@@ -1906,32 +1966,65 @@ export class ProductionPipeline {
         cacheKey,
       });
 
-      // Generate map video if no valid cache
-      const localVideoPath = cachedPath?.startsWith("https://")
-        ? null
-        : cachedPath ||
-          (await this.retryWithBackoff(
-            async () => {
-              return Promise.race([
-                mapCaptureService.generateMapVideo(coordinates, jobId),
-                new Promise<never>((_, reject) =>
-                  setTimeout(
-                    () => reject(new Error("Map video generation timeout")),
-                    MAP_GENERATION_TIMEOUT
-                  )
-                ),
-              ]);
-            },
-            2,
-            "Map video generation",
-            jobId
-          ));
+      // Generate map video with retries and validation
+      let localVideoPath: string | null = null;
+      let attempt = 0;
 
-      // Upload to temp location if not already done
-      if (localVideoPath && !cachedPath?.startsWith("https://")) {
-        const fileBuffer = await fs.readFile(localVideoPath);
-        await this.s3VideoService.uploadFile(fileBuffer, tempS3Key);
+      while (attempt < MAX_RETRIES && !localVideoPath) {
+        attempt++;
+        try {
+          localVideoPath = await Promise.race([
+            mapCaptureService.generateMapVideo(coordinates, jobId),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("Map video generation timeout")),
+                MAP_GENERATION_TIMEOUT
+              )
+            ),
+          ]);
+
+          // Validate the generated video
+          if (localVideoPath) {
+            const isValid = await this.validateMapVideo(localVideoPath, jobId);
+            if (!isValid) {
+              logger.warn(
+                `[${jobId}] Generated map video failed validation, retrying`,
+                {
+                  attempt,
+                  path: localVideoPath,
+                }
+              );
+              localVideoPath = null;
+              continue;
+            }
+          }
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : "Unknown error";
+          logger.warn(`[${jobId}] Map generation attempt ${attempt} failed`, {
+            error: errorMessage,
+            coordinates,
+          });
+
+          if (attempt < MAX_RETRIES) {
+            const delay = Math.min(
+              1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random()),
+              30000
+            );
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
+        }
       }
+
+      if (!localVideoPath) {
+        throw new Error(
+          `Failed to generate valid map video after ${MAX_RETRIES} attempts`
+        );
+      }
+
+      // Upload to temp location with validation
+      const fileBuffer = await fs.readFile(localVideoPath);
+      await this.s3VideoService.uploadFile(fileBuffer, tempS3Key);
 
       // Move to final location
       const finalS3Url = await this.s3VideoService.moveFromTempToListing(
@@ -1939,80 +2032,19 @@ export class ProductionPipeline {
         listingId,
         jobId
       );
-      logger.info(`[${jobId}] Verifying map video before caching`, {
-        finalS3Url,
-      });
-      const exists = await this.verifyS3Asset(this.getS3KeyFromUrl(finalS3Url));
-      if (!exists)
-        throw new Error(`Map video not accessible after move: ${finalS3Url}`);
+
+      // Final validation after move
+      const finalValidation = await this.validateMapVideo(finalS3Url, jobId);
+      if (!finalValidation) {
+        throw new Error("Final map video failed validation after S3 move");
+      }
+
+      // Cache the validated video
       await this.cacheAsset(jobId, cacheKey, finalS3Url, "map");
 
-      logger.info(`[${jobId}] Map video generation completed`, {
+      logger.info(`[${jobId}] Map video generation completed and validated`, {
         finalS3Url,
       });
-
-      // Add validation step for the map video before proceeding
-      if (localVideoPath) {
-        // Validate the video integrity before uploading
-        const isValid = await videoProcessingService.validateVideoIntegrity(
-          localVideoPath
-        );
-        const duration = await videoProcessingService.getVideoDuration(
-          localVideoPath
-        );
-
-        if (!isValid || duration <= 0) {
-          logger.error(`[${jobId}] Generated map video is corrupt`, {
-            path: localVideoPath,
-            duration,
-            isValid,
-          });
-          throw new Error("Map video generation failed validation");
-        }
-
-        logger.info(`[${jobId}] Map video validated successfully`, {
-          path: localVideoPath,
-          duration,
-        });
-      }
-
-      // Enhance verification for the final S3 file
-      if (finalS3Url) {
-        // Download for validation
-        const validationPath = path.join(
-          process.cwd(),
-          "temp",
-          `${jobId}_validate_map.mp4`
-        );
-        await this.resourceManager.trackResource(validationPath);
-
-        try {
-          await this.s3Service.downloadFile(finalS3Url, validationPath);
-          const duration = await videoProcessingService.getVideoDuration(
-            validationPath
-          );
-          const isValid = await videoProcessingService.validateVideoIntegrity(
-            validationPath
-          );
-
-          if (!isValid || duration <= 0) {
-            logger.error(`[${jobId}] S3 map video is invalid`, {
-              finalS3Url,
-              duration,
-              isValid,
-            });
-            throw new Error("Map video in S3 is corrupt");
-          }
-
-          logger.info(`[${jobId}] S3 map video validated successfully`, {
-            finalS3Url,
-            duration,
-          });
-        } finally {
-          // Clean up temp file
-          await fs.unlink(validationPath).catch(() => {});
-        }
-      }
 
       return finalS3Url;
     } catch (error) {
@@ -2022,6 +2054,102 @@ export class ProductionPipeline {
         stack: error instanceof Error ? error.stack : undefined,
       });
       return null;
+    }
+  }
+
+  /**
+   * Validates a map video file for completeness and quality
+   */
+  private async validateMapVideo(
+    videoPath: string,
+    jobId: string
+  ): Promise<boolean> {
+    try {
+      let localPath = videoPath;
+
+      // If it's an S3 URL, download it temporarily for validation
+      if (videoPath.startsWith("https://")) {
+        localPath = path.join(
+          process.cwd(),
+          "temp",
+          `${jobId}_map_validate.mp4`
+        );
+        await this.s3Service.downloadFile(videoPath, localPath);
+        await this.resourceManager.trackResource(localPath);
+      }
+
+      // Check if file exists and is readable
+      await fs.access(localPath, fs.constants.R_OK);
+
+      // Check file size
+      const stats = await fs.stat(localPath);
+      if (stats.size < 1024) {
+        // Minimum 1KB
+        logger.warn(`[${jobId}] Map video file too small`, {
+          size: stats.size,
+          path: videoPath,
+        });
+        return false;
+      }
+
+      // Check video duration
+      const duration = await videoProcessingService.getVideoDuration(localPath);
+      if (duration < 1) {
+        // Minimum 1 second
+        logger.warn(`[${jobId}] Map video duration too short`, {
+          duration,
+          path: videoPath,
+        });
+        return false;
+      }
+
+      // Check video integrity
+      const isIntegrityValid =
+        await videoProcessingService.validateVideoIntegrity(localPath);
+      if (!isIntegrityValid) {
+        logger.warn(`[${jobId}] Map video integrity check failed`, {
+          path: videoPath,
+        });
+        return false;
+      }
+
+      // Check video metadata
+      const metadata = await videoProcessingService.getVideoMetadata(localPath);
+      if (!metadata.hasVideo || !metadata.width || !metadata.height) {
+        logger.warn(`[${jobId}] Map video missing required metadata`, {
+          path: videoPath,
+          metadata,
+        });
+        return false;
+      }
+
+      // Clean up temporary file if we downloaded it
+      if (videoPath.startsWith("https://")) {
+        await fs.unlink(localPath).catch((error) => {
+          logger.warn(
+            `[${jobId}] Failed to cleanup temporary validation file`,
+            {
+              path: localPath,
+              error: error instanceof Error ? error.message : "Unknown error",
+            }
+          );
+        });
+      }
+
+      logger.info(`[${jobId}] Map video validation successful`, {
+        path: videoPath,
+        duration,
+        size: stats.size,
+        metadata,
+      });
+
+      return true;
+    } catch (error) {
+      logger.error(`[${jobId}] Map video validation failed`, {
+        error: error instanceof Error ? error.message : "Unknown error",
+        path: videoPath,
+      });
+      return false;
     }
   }
 
@@ -2398,69 +2526,33 @@ export class ProductionPipeline {
     template?: ReelTemplate
   ): Promise<boolean> {
     try {
-      const actualDuration = await videoProcessingService.getVideoDuration(
-        clip.path
-      );
+      const duration = await videoProcessingService.getVideoDuration(clip.path);
 
-      if (actualDuration <= 0) {
-        logger.error(`[${jobId}] Invalid clip duration`, {
-          index,
-          path: clip.path,
-          actualDuration,
-        });
-        return false;
-      }
-
-      const requestedDuration = clip.duration;
+      // Get expected duration from template if available
       const expectedDuration = template?.durations[index];
+      const requestedDuration = clip.duration;
 
-      if (requestedDuration > actualDuration) {
-        logger.warn(`[${jobId}] Adjusting clip duration to match actual`, {
-          index,
-          path: clip.path,
-          requested: requestedDuration,
-          actual: actualDuration,
-          expected: expectedDuration,
-          template: template?.name,
-          adjustment: actualDuration - requestedDuration,
-        });
-        clip.duration = actualDuration;
+      // If the requested duration is longer than actual video duration
+      if (requestedDuration > duration) {
+        logger.warn(
+          `[${jobId}] Clip ${index} requested duration exceeds actual duration`,
+          {
+            clipPath: clip.path,
+            requestedDuration,
+            actualDuration: duration,
+            templateDuration: expectedDuration,
+          }
+        );
+
+        // Adjust the clip duration to actual duration
+        clip.duration = duration;
       }
 
-      if (clip.duration < 0.5) {
-        logger.warn(`[${jobId}] Clip duration too short`, {
-          index,
-          path: clip.path,
-          duration: clip.duration,
-          template: template?.name,
-        });
-        return false;
-      }
-
-      if (
-        expectedDuration &&
-        Math.abs(clip.duration - expectedDuration) > 0.5
-      ) {
-        logger.warn(`[${jobId}] Significant duration mismatch with template`, {
-          index,
-          path: clip.path,
-          actual: clip.duration,
-          expected: expectedDuration,
-          difference: Math.abs(clip.duration - expectedDuration),
-        });
-      }
-
-      logger.debug(`[${jobId}] Clip validated`, {
-        index,
-        path: clip.path,
-        duration: clip.duration,
-      });
       return true;
     } catch (error) {
       logger.error(`[${jobId}] Failed to validate clip ${index} duration`, {
         clipPath: clip.path,
         error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
       });
       return false;
     }
@@ -2615,139 +2707,6 @@ export class ProductionPipeline {
       throw error;
     } finally {
       await prisma.$disconnect();
-    }
-  }
-
-  private async processBatchedTemplate(
-    clips: VideoClip[],
-    template: TemplateKey,
-    templateConfig: ReelTemplate,
-    jobId: string,
-    outputPath: string,
-    watermarkConfig?: WatermarkConfig,
-    resolvedMusic?: ReelTemplate["music"],
-    startTime?: number
-  ): Promise<TemplateProcessingResult> {
-    const BATCH_SIZE = 5;
-    const batches: VideoClip[][] = [];
-
-    for (let i = 0; i < clips.length; i += BATCH_SIZE) {
-      batches.push(clips.slice(i, i + BATCH_SIZE));
-    }
-
-    logger.info(`[${jobId}] Processing template in batches`, {
-      template,
-      totalClips: clips.length,
-      batchCount: batches.length,
-      batchSize: BATCH_SIZE,
-    });
-
-    const tempOutputs: string[] = [];
-
-    for (let i = 0; i < batches.length; i++) {
-      const tempOutput = path.join(
-        process.cwd(),
-        "temp",
-        `${jobId}_batch${i}.mp4`
-      );
-      await this.resourceManager.trackResource(tempOutput);
-      tempOutputs.push(tempOutput);
-
-      const batchTransitions = templateConfig.transitions?.slice(
-        i * (BATCH_SIZE - 1),
-        (i + 1) * (BATCH_SIZE - 1)
-      );
-
-      await videoProcessingService.stitchVideos(
-        batches[i],
-        tempOutput,
-        {
-          name: `${templateConfig.name} (batch ${i + 1})`,
-          description: templateConfig.description,
-          colorCorrection: templateConfig.colorCorrection,
-          transitions: batchTransitions,
-          reverseClips: templateConfig.reverseClips,
-          music: undefined, // Don't add music to intermediate batches
-        } as VideoTemplate,
-        undefined // Don't add watermark to intermediate batches
-      );
-
-      logger.info(`[${jobId}] Completed batch ${i + 1}/${batches.length}`, {
-        template,
-        batchSize: batches[i].length,
-        outputPath: tempOutput,
-      });
-    }
-
-    const finalClips = await Promise.all(
-      tempOutputs.map(async (path) => ({
-        path,
-        duration: await videoProcessingService.getVideoDuration(path),
-      }))
-    );
-
-    await videoProcessingService.stitchVideos(
-      finalClips,
-      outputPath,
-      {
-        name: templateConfig.name,
-        description: templateConfig.description,
-        colorCorrection: undefined, // Skip color correction for final merge
-        transitions: [{ type: "fade", duration: 0.5 }], // Simple transition for final merge
-        reverseClips: false,
-        music: resolvedMusic,
-        outputOptions: ["-q:a 2"],
-      } as VideoTemplate,
-      watermarkConfig
-    );
-
-    return {
-      template,
-      status: "SUCCESS",
-      outputPath,
-      processingTime: startTime ? Date.now() - startTime : undefined,
-    };
-  }
-
-  private async checkResources(jobId: string): Promise<boolean> {
-    try {
-      // Check memory usage
-      const memoryUsage = process.memoryUsage();
-      const heapUsage = memoryUsage.heapUsed / memoryUsage.heapTotal;
-
-      if (heapUsage > 0.9) {
-        logger.error(`[${jobId}] Insufficient memory for FFmpeg`, {
-          heapUsed: Math.round(memoryUsage.heapUsed / 1024 / 1024),
-          heapTotal: Math.round(memoryUsage.heapTotal / 1024 / 1024),
-          heapUsagePercentage: Math.round(heapUsage * 100),
-        });
-        return false;
-      }
-
-      // Check disk space
-      const tempDir = path.join(process.cwd(), "temp");
-      const stats = await fs.statfs(tempDir);
-      const freeSpaceMB = Math.round((stats.bfree * stats.bsize) / 1024 / 1024);
-
-      if (freeSpaceMB < 500) {
-        logger.error(`[${jobId}] Insufficient disk space`, {
-          freeSpaceMB,
-          requiredMB: 500,
-        });
-        return false;
-      }
-
-      logger.debug(`[${jobId}] Resource check passed`, {
-        heapUsagePercentage: Math.round(heapUsage * 100),
-        freeSpaceMB,
-      });
-      return true;
-    } catch (error) {
-      logger.error(`[${jobId}] Failed to check resources`, {
-        error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-      return false;
     }
   }
 }

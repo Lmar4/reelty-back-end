@@ -257,8 +257,9 @@ model Photo {
 
   // Relations
   user        User     @relation(fields: [userId], references: [id])
-  listing     Listing  @relation(fields: [listingId], references: [id])
-@@unique([listingId, order])
+  listing     Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@unique([listingId, order])
   @@map("photos")
 }
 
@@ -283,7 +284,7 @@ model VideoJob {
 
   // Relations
   user        User     @relation(fields: [userId], references: [id])
-  listing     Listing  @relation(fields: [listingId], references: [id])
+  listing     Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
 
   @@index([status, position])
   @@map("video_jobs")

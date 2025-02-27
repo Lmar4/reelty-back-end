@@ -71,13 +71,13 @@ export class AssetManager {
       [
         AssetType.WATERMARK,
         {
-          s3Key: "assets/watermark/default_watermark.png",
+          s3Key: "assets/watermark/watermark_transparent_v1.png",
           type: AssetType.WATERMARK,
         },
       ],
       [
         AssetType.MUSIC,
-        { s3Key: "assets/music/default_background.mp3", type: AssetType.MUSIC },
+        { s3Key: "assets/music/storyteller.mp3", type: AssetType.MUSIC },
       ],
     ]);
     this.assetCacheService = AssetCacheService.getInstance();

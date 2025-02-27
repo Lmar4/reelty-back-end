@@ -77,7 +77,6 @@ export class VideoProcessingService {
   private readonly TEMP_DIR = process.env.TEMP_OUTPUT_DIR || "./temp";
   private s3Service: S3Service;
   private readonly FFmpeg_TIMEOUT = 60 * 60 * 1000; // 1 hour timeout
-  private readonly progressEmitter: EventEmitter = new EventEmitter();
 
   private constructor() {
     this.s3Service = new S3Service();
@@ -549,27 +548,67 @@ export class VideoProcessingService {
     }
   }
 
-  private handleFFmpegError(error: any, jobId: string): never {
-    let enhancedMessage = "FFmpeg error in video-processing";
-
-    if (error.code) {
-      enhancedMessage += `: ffmpeg exited with code ${error.code}`;
-    }
-
-    if (error.stderr) {
-      enhancedMessage += `: ${error.stderr}`;
-      logger.error(`[${jobId}] FFmpeg stderr output`, {
-        stderr: error.stderr,
-        code: error.code,
-      });
-    }
-
-    logger.error(`[${jobId}] FFmpeg processing failed`, {
-      error: error.message || error,
-      stack: error.stack,
+  private handleFFmpegError(error: FFmpegError, context: string): void {
+    // Extract all possible error details
+    const details: Record<string, unknown> = {
       code: error.code,
-      stderr: error.stderr,
-    });
+      exitCode: error.exitCode,
+      killed: error.killed,
+      message: error.message,
+      cmd: error.cmd,
+    };
+
+    // Extract error lines from ffmpeg output
+    if (error.ffmpegOutput) {
+      const errorLines = error.ffmpegOutput
+        .split("\n")
+        .filter(
+          (line) =>
+            line.toLowerCase().includes("error") ||
+            line.toLowerCase().includes("failed")
+        );
+
+      details.ffmpegOutput =
+        errorLines.length > 0 ? errorLines : error.ffmpegOutput;
+    }
+
+    // Add stderr if available
+    if (error.stderr) {
+      details.stderr = error.stderr;
+    }
+
+    // Try to identify specific error patterns
+    const errorMessage = error.message || "";
+    if (errorMessage.includes("Error while opening encoder")) {
+      details.errorType = "ENCODER_INITIALIZATION_FAILED";
+      details.possibleCauses = [
+        "Missing codec libraries",
+        "Invalid encoding parameters",
+        "Insufficient permissions",
+        "Resource limitations",
+      ];
+    } else if (
+      errorMessage.includes("Invalid data found when processing input")
+    ) {
+      details.errorType = "INVALID_INPUT_DATA";
+    } else if (errorMessage.includes("No such file or directory")) {
+      details.errorType = "FILE_NOT_FOUND";
+    } else if (errorMessage.includes("Permission denied")) {
+      details.errorType = "PERMISSION_DENIED";
+    } else if (error.killed) {
+      details.errorType = "PROCESS_KILLED";
+    }
+
+    logger.error(`[${context}] FFmpeg processing failed`, details);
+
+    // Create a more informative error message
+    let enhancedMessage = `FFmpeg error in ${context}: ${error.message}`;
+    if (details.errorType) {
+      enhancedMessage += ` (Type: ${details.errorType})`;
+    }
+    if (error.exitCode) {
+      enhancedMessage += ` (Exit code: ${error.exitCode})`;
+    }
 
     throw new Error(enhancedMessage);
   }
@@ -633,9 +672,10 @@ export class VideoProcessingService {
     outputPath: string,
     template: VideoTemplate,
     watermarkConfig?: WatermarkConfig,
-    jobId?: string
+    progressEmitter?: EventEmitter
   ): Promise<void> {
     const startTime = Date.now();
+    const jobId = crypto.randomUUID();
 
     // Enhanced validation and logging
     logger.info(
@@ -893,7 +933,7 @@ export class VideoProcessingService {
 
           command
             .on("progress", (progress) => {
-              if (this.progressEmitter) {
+              if (progressEmitter) {
                 // Convert timemark (HH:MM:SS) to seconds
                 const timeComponents = progress.timemark.split(":");
                 const currentSeconds =
@@ -907,7 +947,7 @@ export class VideoProcessingService {
                   Math.round((currentSeconds / totalDuration) * 100)
                 );
 
-                this.progressEmitter.emit("progress", {
+                progressEmitter.emit("progress", {
                   ...progress,
                   percent,
                   totalDuration,
@@ -1274,6 +1314,66 @@ export class VideoProcessingService {
       });
       return false;
     }
+  }
+
+  /**
+   * Get video metadata including dimensions, codec info, and stream details
+   */
+  public async getVideoMetadata(filePath: string): Promise<{
+    hasVideo: boolean;
+    width?: number;
+    height?: number;
+    duration?: number;
+    codec?: string;
+    fps?: number;
+  }> {
+    return new Promise((resolve, reject) => {
+      if (!existsSync(filePath)) {
+        logger.error("File not found when getting metadata:", {
+          path: filePath,
+        });
+        reject(new Error(`File not found: ${filePath}`));
+        return;
+      }
+
+      ffmpeg.ffprobe(filePath, (err, metadata) => {
+        if (err) {
+          logger.error("Failed to get video metadata:", {
+            path: filePath,
+            error: err.message,
+          });
+          reject(err);
+          return;
+        }
+
+        const videoStream = metadata.streams?.find(
+          (stream) => stream.codec_type === "video"
+        );
+
+        if (!videoStream) {
+          resolve({ hasVideo: false });
+          return;
+        }
+
+        // Extract frame rate as a number
+        let fps: number | undefined;
+        if (videoStream.r_frame_rate) {
+          const [num, den] = videoStream.r_frame_rate.split("/").map(Number);
+          if (!isNaN(num) && !isNaN(den) && den !== 0) {
+            fps = num / den;
+          }
+        }
+
+        resolve({
+          hasVideo: true,
+          width: videoStream.width,
+          height: videoStream.height,
+          duration: Number(metadata.format?.duration || videoStream.duration),
+          codec: videoStream.codec_name,
+          fps,
+        });
+      });
+    });
   }
 
   public async validateMusicFile(filePath: string): Promise<boolean> {
