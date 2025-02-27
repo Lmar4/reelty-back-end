@@ -512,27 +512,78 @@ export class ProductionPipeline {
       );
 
       if (validationResult) {
-        // Update the Photo record with the validated Runway video URL
-        await this.prisma.photo.updateMany({
+        // First, get the photo ID
+        const photo = await this.prisma.photo.findFirst({
           where: {
             listingId,
             order: index,
-            status: { in: ["PENDING", "PROCESSING"] },
           },
-          data: {
-            runwayVideoPath: s3Url,
-            status: "COMPLETED",
-            updatedAt: new Date(),
-            metadata: {
-              runwayGeneratedAt: new Date().toISOString(),
-              inputProcessedPath: inputUrl,
-              attempt,
-              generatedAt: new Date().toISOString(),
-              validationStatus: "success",
-              duration: validationResult.duration,
-            },
+          select: {
+            id: true,
+            status: true,
+            runwayVideoPath: true,
           },
         });
+
+        if (!photo) {
+          throw new Error(
+            `Photo not found for listingId ${listingId} and order ${index}`
+          );
+        }
+
+        // Use a transaction to ensure atomicity
+        const updatedPhoto = await this.prisma.$transaction(async (tx) => {
+          // Update the specific photo by ID
+          const result = await tx.photo.update({
+            where: {
+              id: photo.id,
+            },
+            data: {
+              runwayVideoPath: s3Url,
+              status: "COMPLETED",
+              updatedAt: new Date(),
+              metadata: {
+                runwayGeneratedAt: new Date().toISOString(),
+                inputProcessedPath: inputUrl,
+                attempt,
+                generatedAt: new Date().toISOString(),
+                validationStatus: "success",
+                duration: validationResult.duration,
+              },
+            },
+            select: {
+              id: true,
+              runwayVideoPath: true,
+              status: true,
+            },
+          });
+
+          return result;
+        });
+
+        logger.info(`[${jobId}] Photo update completed for order ${index}`, {
+          photoId: photo.id,
+          oldStatus: photo.status,
+          newStatus: updatedPhoto.status,
+          oldPath: photo.runwayVideoPath,
+          newPath: updatedPhoto.runwayVideoPath,
+        });
+
+        if (
+          !updatedPhoto.runwayVideoPath ||
+          updatedPhoto.runwayVideoPath !== s3Url
+        ) {
+          logger.error(
+            `[${jobId}] Failed to update runwayVideoPath for photo ${photo.id}`,
+            {
+              expected: s3Url,
+              actual: updatedPhoto.runwayVideoPath,
+            }
+          );
+          throw new Error(
+            `Failed to update runwayVideoPath for photo ${photo.id}`
+          );
+        }
 
         return {
           s3Url,
@@ -2764,34 +2815,51 @@ export class ProductionPipeline {
     for (const result of results) {
       if (result?.path) {
         runwayVideos[result.index] = result.path;
-        // Verify the runwayVideoPath is saved in the database
-        const updatedPhoto = await this.prisma.photo.findFirst({
+        // Get the photo by listingId and order
+        const photo = await this.prisma.photo.findFirst({
           where: {
             listingId,
             order: result.index,
-            status: "COMPLETED",
           },
-          select: { runwayVideoPath: true },
+          select: {
+            id: true,
+            runwayVideoPath: true,
+            status: true,
+          },
         });
+
+        if (!photo) {
+          logger.error(`[${jobId}] Photo not found for order ${result.index}`, {
+            listingId,
+            order: result.index,
+          });
+          throw new Error(`Photo not found for order ${result.index}`);
+        }
+
         if (
-          !updatedPhoto?.runwayVideoPath ||
-          updatedPhoto.runwayVideoPath !== result.path.s3Url // Acceder a s3Url
+          !photo.runwayVideoPath ||
+          photo.runwayVideoPath !== result.path.s3Url ||
+          photo.status !== "COMPLETED"
         ) {
           logger.error(
-            `[${jobId}] runwayVideoPath not saved correctly for order ${result.index}`,
+            `[${jobId}] runwayVideoPath not saved correctly for photo ${photo.id}`,
             {
-              expected: result.path.s3Url, // Usar s3Url aquí también
-              actual: updatedPhoto?.runwayVideoPath,
+              expected: result.path.s3Url,
+              actual: photo.runwayVideoPath,
+              status: photo.status,
             }
           );
           throw new Error(
-            `Failed to save runwayVideoPath for order ${result.index}`
+            `Failed to save runwayVideoPath for photo ${photo.id}`
           );
         }
+
         logger.info(
-          `[${jobId}] Successfully saved runwayVideoPath for order ${result.index}`,
+          `[${jobId}] Successfully verified runwayVideoPath for photo ${photo.id}`,
           {
-            path: result.path,
+            photoId: photo.id,
+            path: result.path.s3Url,
+            status: photo.status,
           }
         );
       } else {
