@@ -358,10 +358,7 @@ export class S3VideoService {
         await this.downloadVideo(s3Url, localPath);
 
         // Validate the downloaded file
-        await VideoValidationService.getInstance().validateVideo(
-          localPath,
-          jobId
-        );
+        await VideoValidationService.getInstance().validateVideo(localPath);
 
         logger.info(
           `${logContext} Successfully downloaded and validated video`,
