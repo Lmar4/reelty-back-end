@@ -149,7 +149,12 @@ export class ImageProcessor {
     const s3Regex = /^s3:\/\/[a-zA-Z0-9-_.]+\/[a-zA-Z0-9-_./]+$/;
     const httpsRegex =
       /^https:\/\/[a-zA-Z0-9-_.]+\.s3\.[a-zA-Z0-9-_.]+\.amazonaws\.com\/[a-zA-Z0-9-_./]+$/;
-    return s3Regex.test(url) || httpsRegex.test(url);
+
+    if (!s3Regex.test(url) && !httpsRegex.test(url)) {
+      throw new Error(`Invalid S3 URL format: ${url}`);
+    }
+
+    return true;
   }
 
   private async validateS3Path(path: string): Promise<boolean> {
@@ -338,7 +343,14 @@ export class ImageProcessor {
       filename: path.basename(outputPath),
       cleanup: async () => {
         try {
-          await fs.promises.unlink(outputPath);
+          if (
+            await fs.promises
+              .stat(outputPath)
+              .then(() => true)
+              .catch(() => false)
+          ) {
+            await fs.promises.unlink(outputPath);
+          }
         } catch (error) {
           logger.error("Failed to cleanup temp file:", {
             path: outputPath,
