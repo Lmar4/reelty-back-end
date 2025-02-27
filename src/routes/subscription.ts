@@ -1,8 +1,11 @@
-import { PrismaClient } from "@prisma/client";
-import express, { RequestHandler } from "express";
+import { PrismaClient, SubscriptionTierId } from "@prisma/client";
+import express, { Request, Response } from "express";
 import Stripe from "stripe";
 import { z } from "zod";
-import { isValidTierId } from "../constants/subscription-tiers.js";
+import {
+  isValidTierId,
+  SUBSCRIPTION_TIERS,
+} from "../constants/subscription-tiers.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { validateRequest } from "../middleware/validate.js";
 import { createApiResponse } from "../types/api.js";
@@ -59,7 +62,7 @@ interface ListingWithCounts {
 }
 
 // Get available subscription tiers
-const getTiers: RequestHandler = async (_req, res) => {
+const getTiers = async (_req: Request, res: Response) => {
   try {
     const tiers = await prisma.subscriptionTier.findMany({
       orderBy: [{ createdAt: "asc" }],
@@ -86,7 +89,7 @@ const getTiers: RequestHandler = async (_req, res) => {
 };
 
 // Update user's subscription tier
-const updateTier: RequestHandler = async (req, res) => {
+const updateTier = async (req: Request, res: Response) => {
   try {
     const { tierId } = req.body;
     const userId = req.user!.id;
@@ -171,7 +174,7 @@ const updateTier: RequestHandler = async (req, res) => {
 };
 
 // Create checkout session
-const createCheckout: RequestHandler = async (req, res) => {
+const createCheckout = async (req: Request, res: Response) => {
   try {
     // Get user ID from the request body since it's passed from the frontend
     const { userId, plan, billingType, returnUrl } = req.body;
@@ -276,7 +279,7 @@ const createCheckout: RequestHandler = async (req, res) => {
 };
 
 // Update subscription from Stripe
-const updateSubscriptionFromStripe: RequestHandler = async (req, res) => {
+const updateSubscriptionFromStripe = async (req: Request, res: Response) => {
   try {
     const {
       userId,
@@ -327,7 +330,7 @@ const updateSubscriptionFromStripe: RequestHandler = async (req, res) => {
 };
 
 // Cancel subscription
-const cancelSubscription: RequestHandler = async (req, res) => {
+const cancelSubscription = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const { stripeSubscriptionId } = req.body;
@@ -368,7 +371,7 @@ const cancelSubscription: RequestHandler = async (req, res) => {
 };
 
 // Get current user's subscription
-const getCurrentSubscription: RequestHandler = async (req, res) => {
+const getCurrentSubscription = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const user = await prisma.user.findUnique({
@@ -415,7 +418,7 @@ const getCurrentSubscription: RequestHandler = async (req, res) => {
 };
 
 // Get user's invoices
-const getInvoices: RequestHandler = async (req, res) => {
+const getInvoices = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const limit = parseInt(req.query.limit as string) || 10;
@@ -469,7 +472,7 @@ const getInvoices: RequestHandler = async (req, res) => {
 };
 
 // Get user's usage statistics
-const getUsageStats: RequestHandler = async (req, res) => {
+const getUsageStats = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
 
@@ -553,6 +556,109 @@ const getUsageStats: RequestHandler = async (req, res) => {
   }
 };
 
+// Ensure user has a subscription tier
+const ensureTier = async (req: Request, res: Response) => {
+  try {
+    const { userId } = req.body;
+
+    // Get user with their current tier
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        currentTier: true,
+        listings: {
+          where: { status: "ACTIVE" },
+          select: { id: true },
+        },
+      },
+    });
+
+    if (!user) {
+      res
+        .status(404)
+        .json(createApiResponse(false, undefined, undefined, "User not found"));
+      return;
+    }
+
+    // If user has no tier, assign free trial tier
+    if (!user.currentTierId) {
+      const freeTier = await prisma.subscriptionTier.findFirst({
+        where: { tierId: SubscriptionTierId.FREE },
+      });
+
+      if (!freeTier) {
+        res
+          .status(500)
+          .json(
+            createApiResponse(
+              false,
+              undefined,
+              undefined,
+              "Free tier not found"
+            )
+          );
+        return;
+      }
+
+      await prisma.user.update({
+        where: { id: userId },
+        data: {
+          currentTierId: freeTier.tierId,
+          subscriptionStatus: "TRIALING",
+        },
+      });
+
+      res.json(
+        createApiResponse(true, {
+          tier: {
+            maxActiveListings: freeTier.maxActiveListings,
+            name: freeTier.name,
+            currentCount: user.listings.length,
+          },
+        })
+      );
+      return;
+    }
+
+    // Return current tier info
+    if (!user.currentTier) {
+      res
+        .status(500)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "Current tier not found"
+          )
+        );
+      return;
+    }
+
+    res.json(
+      createApiResponse(true, {
+        tier: {
+          maxActiveListings: user.currentTier.maxActiveListings,
+          name: user.currentTier.name,
+          currentCount: user.listings.length,
+        },
+      })
+    );
+  } catch (error) {
+    console.error("Ensure tier error:", error);
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error ? error.message : "Failed to ensure tier"
+        )
+      );
+  }
+};
+
 // Route handlers
 router.get("/tiers", getTiers);
 router.patch(
@@ -576,5 +682,6 @@ router.post("/cancel", isAuthenticated, cancelSubscription);
 router.get("/current", isAuthenticated, getCurrentSubscription);
 router.get("/invoices", isAuthenticated, getInvoices);
 router.get("/usage", isAuthenticated, getUsageStats);
+router.post("/ensure-tier", isAuthenticated, ensureTier);
 
 export default router;
