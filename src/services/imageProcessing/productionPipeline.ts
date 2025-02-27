@@ -1578,6 +1578,26 @@ export class ProductionPipeline {
     }
   }
 
+  private async cleanupStaleLocks(listingId: string): Promise<void> {
+    try {
+      const now = new Date();
+      await this.prisma.listingLock.deleteMany({
+        where: {
+          listingId,
+          expiresAt: {
+            lt: now,
+          },
+        },
+      });
+      return;
+    } catch (error) {
+      logger.warn(`Failed to cleanup stale locks for listing ${listingId}`, {
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      return;
+    }
+  }
+
   private async acquireListingLock(
     jobId: string,
     listingId: string
@@ -1593,9 +1613,32 @@ export class ProductionPipeline {
     const maxRetries = 3;
     const retryDelay = 1000; // 1 second
 
+    // First cleanup any stale locks
+    await this.cleanupStaleLocks(listingId);
+
     while (retries < maxRetries) {
       try {
-        // Try to acquire advisory lock first, outside the transaction
+        // Check for existing valid lock first
+        const existingLock = await this.prisma.listingLock.findFirst({
+          where: {
+            listingId,
+            expiresAt: {
+              gt: new Date(),
+            },
+          },
+        });
+
+        if (existingLock) {
+          logger.info({
+            message: `[${jobId}] Listing ${listingId} has valid lock held by job ${existingLock.jobId}`,
+            jobId,
+            listingId,
+            lockHolderId: existingLock.jobId,
+          });
+          return false;
+        }
+
+        // Try to acquire advisory lock
         const advisoryResult = await this.prisma.$queryRaw<
           { locked: boolean }[]
         >`
@@ -1613,8 +1656,22 @@ export class ProductionPipeline {
         }
 
         try {
-          // If advisory lock acquired, try to create database lock in a separate transaction
+          // Try to create database lock
           await this.prisma.$transaction(async (tx) => {
+            // Double check within transaction that no lock was created
+            const lockCheck = await tx.listingLock.findFirst({
+              where: {
+                listingId,
+                expiresAt: {
+                  gt: new Date(),
+                },
+              },
+            });
+
+            if (lockCheck) {
+              throw new Error("Lock was acquired by another process");
+            }
+
             await tx.listingLock.create({
               data: {
                 listingId,
@@ -1627,7 +1684,7 @@ export class ProductionPipeline {
 
           return true;
         } catch (dbError) {
-          // If database lock fails, release advisory lock and maybe retry
+          // If database lock fails, release advisory lock
           await this.prisma
             .$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
 
@@ -1635,7 +1692,6 @@ export class ProductionPipeline {
             dbError instanceof Prisma.PrismaClientKnownRequestError &&
             dbError.code === "P2002"
           ) {
-            // Unique constraint violation - lock already exists
             logger.info(`[${jobId}] Listing lock already exists in database`, {
               jobId,
               listingId,
