@@ -581,22 +581,38 @@ export class ProductionPipeline {
         })),
       });
 
-      // Initialize runwayVideos with existing videos first
-      const runwayVideos = new Array(10).fill(null);
-      existingPhotos.forEach((photo) => {
-        if (photo.runwayVideoPath) {
-          runwayVideos[photo.order] = photo.runwayVideoPath;
-          logger.info(`[${jobId}] Using existing runway video`, {
-            order: photo.order,
-            path: photo.runwayVideoPath,
-            photoId: photo.id,
-          });
-        }
-      });
+      // Initialize runwayVideos based on total photos count
+      const maxOrder = Math.max(
+        ...existingPhotos.map((p) => p.order),
+        ...photosToRegenerate.map((p) => p.order)
+      );
+      const runwayVideos = new Array(maxOrder + 1);
 
-      // Process only the photos that need regeneration
+      // First, process photos that need regeneration to ensure we have all videos
       const processedVideos = await Promise.all(
         photosToRegenerate.map(async (photo) => {
+          // Check if there's already a valid runwayVideoPath for this photo
+          const existingPhoto = allPhotos.find((p) => p.id === photo.id);
+          if (
+            existingPhoto?.runwayVideoPath &&
+            (await this.verifyS3VideoAccess(
+              existingPhoto.runwayVideoPath,
+              jobId
+            )) &&
+            !forceRegeneration
+          ) {
+            runwayVideos[photo.order] = existingPhoto.runwayVideoPath;
+            logger.info(
+              `[${jobId}] Reusing existing runwayVideoPath for regeneration, skipping Runway call`,
+              {
+                photoId: photo.id,
+                order: photo.order,
+                path: existingPhoto.runwayVideoPath,
+              }
+            );
+            return { order: photo.order, path: existingPhoto.runwayVideoPath };
+          }
+
           let inputPath: string | null = photo.processedFilePath;
           if (
             !inputPath ||
@@ -622,26 +638,91 @@ export class ProductionPipeline {
               job.listingId,
               jobId
             );
-            return { order: photo.order, path: runwayVideo || null };
+            if (!runwayVideo) {
+              throw new Error(
+                `Failed to generate runway video for photo ${photo.id} at order ${photo.order}`
+              );
+            }
+
+            // Verify the runwayVideoPath is saved in the database
+            const updatedPhoto = await this.prisma.photo.findFirst({
+              where: {
+                listingId: job.listingId,
+                order: photo.order,
+                status: "COMPLETED",
+              },
+              select: { runwayVideoPath: true, id: true },
+            });
+
+            if (
+              !updatedPhoto?.runwayVideoPath ||
+              updatedPhoto.runwayVideoPath !== runwayVideo
+            ) {
+              logger.error(
+                `[${jobId}] runwayVideoPath not saved correctly for photo ${photo.id} at order ${photo.order}`,
+                {
+                  expected: runwayVideo,
+                  actual: updatedPhoto?.runwayVideoPath,
+                }
+              );
+              throw new Error(
+                `Failed to save runwayVideoPath for photo ${photo.id}`
+              );
+            }
+
+            logger.info(
+              `[${jobId}] Successfully saved runwayVideoPath for photo ${photo.id} at order ${photo.order}`,
+              {
+                path: runwayVideo,
+              }
+            );
+
+            return { order: photo.order, path: runwayVideo };
           }
-          return { order: photo.order, path: null };
+          throw new Error(
+            `No valid input path for photo ${photo.id} at order ${photo.order}`
+          );
         })
       );
 
-      // Replace only the regenerated videos in our array
+      // Add regenerated videos to the array
       processedVideos.forEach((video) => {
-        if (video.path) {
-          runwayVideos[video.order] = video.path;
-          logger.info(`[${jobId}] Replaced with regenerated runway video`, {
-            order: video.order,
-            path: video.path,
-          });
-        } else {
-          logger.warn(`[${jobId}] Failed to regenerate video`, {
-            order: video.order,
+        runwayVideos[video.order] = video.path;
+        logger.info(`[${jobId}] Added regenerated runway video`, {
+          order: video.order,
+          path: video.path,
+        });
+      });
+
+      // Fill in existing videos for non-regenerated photos
+      existingPhotos.forEach((photo) => {
+        if (!photo.runwayVideoPath) {
+          throw new Error(
+            `Missing runway video for existing photo ${photo.id} at order ${photo.order}`
+          );
+        }
+        if (!processedVideos.some((v) => v.order === photo.order)) {
+          runwayVideos[photo.order] = photo.runwayVideoPath;
+          logger.info(`[${jobId}] Using existing runway video`, {
+            order: photo.order,
+            path: photo.runwayVideoPath,
+            photoId: photo.id,
           });
         }
       });
+
+      // Verify we have all videos
+      const missingVideos = runwayVideos
+        .map((v, i) => ({ index: i, hasVideo: !!v }))
+        .filter(({ hasVideo }) => !hasVideo);
+
+      if (missingVideos.length > 0) {
+        throw new Error(
+          `Missing runway videos for positions: ${missingVideos
+            .map((v) => v.index)
+            .join(", ")}`
+        );
+      }
 
       // Log and return the full set of videos
       logger.debug(`[${jobId}] Final runway videos for regeneration`, {
@@ -649,6 +730,7 @@ export class ProductionPipeline {
         total: runwayVideos.length,
         nonNullCount: runwayVideos.filter((v) => v !== null).length,
       });
+
       return runwayVideos;
     }
 
@@ -657,8 +739,12 @@ export class ProductionPipeline {
       inputFiles,
       jobId,
       job.listingId,
-      [],
-      new Map()
+      allPhotos, // Pass all photos instead of empty array
+      new Map(
+        allPhotos
+          .filter((p) => p.runwayVideoPath !== null)
+          .map((p) => [p.order, p.runwayVideoPath!])
+      ) // Create Map from existing runwayVideoPaths
     );
   }
 
@@ -1618,6 +1704,22 @@ export class ProductionPipeline {
       }
       if (!listingId) throw new Error("listingId is required");
 
+      // Acquire lock to prevent concurrent processing of the same listing
+      if (!input.skipLock) {
+        logger.info(
+          `[${jobId}] Attempting to acquire lock for listing ${listingId}`
+        );
+        const lockAcquired = await this.acquireListingLock(jobId, listingId);
+        if (!lockAcquired) {
+          const errorMessage = `Failed to acquire lock for listing ${listingId}. Another job may be processing this listing.`;
+          logger.warn(`[${jobId}] ${errorMessage}`);
+          throw new Error(errorMessage);
+        }
+        logger.info(`[${jobId}] Lock acquired for listing ${listingId}`);
+      } else {
+        logger.info(`[${jobId}] Skipping lock acquisition as requested`);
+      }
+
       // Log job state
       const jobCheck = await this.prisma.videoJob.findUnique({
         where: { id: jobId },
@@ -1631,7 +1733,12 @@ export class ProductionPipeline {
         logger.warn(`[${jobId}] Job not found before execution`);
       }
 
-      await this.processVisionImages(jobId);
+      // Process vision images with memory check
+      await this.processWithMemoryCheck(
+        jobId,
+        async () => await this.processVisionImages(jobId),
+        "Vision image processing"
+      );
 
       let runwayVideos: string[] = [];
       const options = {
@@ -1641,52 +1748,90 @@ export class ProductionPipeline {
       };
 
       if (!input.skipRunwayIfCached) {
-        runwayVideos = await this.processRunwayVideos(
+        // Process runway videos with memory check and retry with backoff
+        runwayVideos = await this.processWithMemoryCheck(
           jobId,
-          inputFiles,
-          options
+          async () =>
+            await this.retryWithBackoff(
+              () => this.processRunwayVideos(jobId, inputFiles, options),
+              this.MAX_RUNWAY_RETRIES,
+              "Runway video processing",
+              jobId
+            ),
+          "Runway video generation"
         );
       } else {
-        const existingVideos = await this.prisma.photo.findMany({
-          where: { listingId, runwayVideoPath: { not: null } },
-          orderBy: { order: "asc" },
-          select: { runwayVideoPath: true, order: true },
-        });
+        // Check for existing videos
+        const existingVideosData = await this.getRunwayVideos(jobId);
+        const existingVideos = existingVideosData.map((v) => v.path);
 
         if (
           existingVideos.length === input.inputFiles.length &&
           !isRegeneration // Skip cache if regenerating
         ) {
-          runwayVideos = existingVideos.map((v) => v.runwayVideoPath!);
+          runwayVideos = existingVideos;
           logger.info(`[${jobId}] Using cached Runway videos`, {
             count: runwayVideos.length,
           });
         } else {
-          runwayVideos = await this.processRunwayVideos(
+          // Process runway videos with memory check and retry with backoff
+          runwayVideos = await this.processWithMemoryCheck(
             jobId,
-            inputFiles,
-            options
+            async () =>
+              await this.retryWithBackoff(
+                () => this.processRunwayVideos(jobId, inputFiles, options),
+                this.MAX_RUNWAY_RETRIES,
+                "Runway video processing",
+                jobId
+              ),
+            "Runway video generation"
           );
         }
       }
 
+      // Validate video count and ensure no missing videos
+      runwayVideos = this.validateVideoCount(
+        runwayVideos,
+        inputFiles.length,
+        jobId,
+        !!isRegeneration
+      );
+
       logger.debug(`[${jobId}] Runway videos generated`, { runwayVideos });
 
+      // Verify all resources are accessible before proceeding
+      await this.verifyResources(runwayVideos, null);
+
       const mapVideo = input.coordinates
-        ? await this.generateMapVideoForTemplate(
-            input.coordinates,
+        ? await this.processWithMemoryCheck(
             jobId,
-            listingId
+            async () =>
+              await this.generateMapVideoForTemplate(
+                input.coordinates!,
+                jobId,
+                listingId
+              ),
+            "Map video generation"
           )
         : null;
 
-      const templateResults = await this.processTemplatesForSpecific(
-        runwayVideos,
+      // If map video was generated, verify it's accessible
+      if (mapVideo) {
+        await this.verifyResources([mapVideo], null);
+      }
+
+      const templateResults = await this.processWithMemoryCheck(
         jobId,
-        listingId,
-        Object.keys(reelTemplates) as TemplateKey[],
-        input.coordinates,
-        mapVideo
+        async () =>
+          await this.processTemplatesForSpecific(
+            runwayVideos,
+            jobId,
+            listingId,
+            Object.keys(reelTemplates) as TemplateKey[],
+            input.coordinates,
+            mapVideo
+          ),
+        "Template processing"
       );
 
       if (templateResults.length === 0)
@@ -1777,6 +1922,26 @@ export class ProductionPipeline {
 
       throw error;
     } finally {
+      // Release the lock if we acquired one
+      if (!input.skipLock && input.listingId) {
+        try {
+          await this.releaseListingLock(jobId, input.listingId);
+          logger.info(
+            `[${jobId}] Lock released for listing ${input.listingId}`
+          );
+        } catch (lockError) {
+          logger.warn(
+            `[${jobId}] Failed to release lock for listing ${input.listingId}`,
+            {
+              error:
+                lockError instanceof Error
+                  ? lockError.message
+                  : "Unknown error",
+            }
+          );
+        }
+      }
+
       // Enhanced cleanup logging
       try {
         const resourcesBeforeCleanup: string[] = Array.from(
@@ -2452,9 +2617,49 @@ export class ProductionPipeline {
       )
     );
 
-    results.forEach((result) => {
-      if (result?.path) runwayVideos[result.index] = result.path;
-    });
+    // Verify and log database updates for each generated video
+    for (const result of results) {
+      if (result?.path) {
+        runwayVideos[result.index] = result.path;
+        // Verify the runwayVideoPath is saved in the database
+        const updatedPhoto = await this.prisma.photo.findFirst({
+          where: {
+            listingId,
+            order: result.index,
+            status: "COMPLETED",
+          },
+          select: { runwayVideoPath: true },
+        });
+        if (
+          !updatedPhoto?.runwayVideoPath ||
+          updatedPhoto.runwayVideoPath !== result.path
+        ) {
+          logger.error(
+            `[${jobId}] runwayVideoPath not saved correctly for order ${result.index}`,
+            {
+              expected: result.path,
+              actual: updatedPhoto?.runwayVideoPath,
+            }
+          );
+          throw new Error(
+            `Failed to save runwayVideoPath for order ${result.index}`
+          );
+        }
+        logger.info(
+          `[${jobId}] Successfully saved runwayVideoPath for order ${result.index}`,
+          {
+            path: result.path,
+          }
+        );
+      } else {
+        logger.warn(
+          `[${jobId}] No runway video generated for order ${result.index}`,
+          {
+            inputFile: inputFiles[result.index],
+          }
+        );
+      }
+    }
 
     return runwayVideos.filter(
       (v): v is string => !!v && v.toLowerCase().endsWith(".mp4")
