@@ -28,7 +28,10 @@ import { resourceManager, ResourceState } from "../storage/resource-manager.js";
 import { S3Service } from "../storage/s3.service.js";
 import { runwayService } from "../video/runway.service.js";
 import { S3VideoService } from "../video/s3-video.service.js";
-import { videoProcessingService } from "../video/video-processing.service.js";
+import {
+  videoProcessingService,
+  VideoClip,
+} from "../video/video-processing.service.js";
 import { reelTemplates, TemplateKey } from "./templates/types.js";
 import {
   ImageOptimizationOptions,
@@ -41,7 +44,6 @@ import {
 import { existsSync } from "fs";
 import { VideoTemplateService } from "../video/video-template.service.js";
 import { ReelTemplate } from "./templates/types.js";
-import { VideoClip } from "../video/video-processing.service.js";
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",
@@ -112,6 +114,39 @@ interface ProcessingImage {
   id?: string;
 }
 
+// Nuevas interfaces para el manejo de validación y resultados
+interface ValidationResult {
+  success: boolean;
+  duration?: number;
+  error?: string;
+}
+
+interface RunwayGenerationResult {
+  s3Url: string;
+  duration: number;
+  validated: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+interface ValidationCache {
+  s3Url: string;
+  duration: number;
+  validatedAt: Date;
+  metadata?: Record<string, unknown>;
+}
+
+// Primero, agregar una interfaz para el manejo de recursos
+interface ResourceTracker {
+  path: string;
+  type: "temp" | "video" | "music" | "watermark";
+  metadata?: Record<string, unknown>;
+}
+
+interface ValidatedVideo {
+  path: string;
+  duration: number;
+}
+
 class ResourceManager {
   public tempFiles: Set<string> = new Set();
 
@@ -168,6 +203,9 @@ export class ProductionPipeline {
     quality: 80,
     fit: "cover",
   };
+
+  private validationCache = new Map<string, ValidationCache>();
+  private readonly VALIDATION_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   constructor(private readonly prisma: PrismaClient = new PrismaClient()) {
     this.resourceManager = new ResourceManager();
@@ -342,34 +380,119 @@ export class ProductionPipeline {
     });
   }
 
+  private async validateRunwayVideo(
+    s3Url: string,
+    index: number,
+    jobId: string
+  ): Promise<ValidationResult> {
+    try {
+      const s3Key = this.getS3KeyFromUrl(s3Url);
+      const exists = await this.verifyS3Asset(s3Key);
+
+      if (!exists) {
+        return {
+          success: false,
+          error: `Generated video not accessible at ${s3Url}`,
+        };
+      }
+
+      const tempPath = path.join(
+        process.cwd(),
+        "temp",
+        `${jobId}_validate_${index}.mp4`
+      );
+
+      await this.resourceManager.trackResource(tempPath);
+
+      try {
+        await this.s3Service.downloadFile(s3Url, tempPath);
+        const duration = await videoProcessingService.getVideoDuration(
+          tempPath
+        );
+
+        if (duration <= 0) {
+          return {
+            success: false,
+            error: `Invalid video duration (${duration}s) from Runway output`,
+          };
+        }
+
+        const isValid = await videoProcessingService.validateVideoIntegrity(
+          tempPath
+        );
+        if (!isValid) {
+          return {
+            success: false,
+            error: "Video file integrity check failed",
+          };
+        }
+
+        return { success: true, duration };
+      } finally {
+        await fs.unlink(tempPath).catch((error) => {
+          logger.warn(`[${jobId}] Failed to cleanup validation file`, {
+            path: tempPath,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+        });
+      }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    }
+  }
+
+  private async validateWithCache(
+    s3Url: string,
+    index: number,
+    jobId: string
+  ): Promise<ValidationCache | null> {
+    const cacheKey = `${jobId}_${index}`;
+    const cached = this.validationCache.get(cacheKey);
+
+    if (
+      cached &&
+      Date.now() - cached.validatedAt.getTime() < this.VALIDATION_CACHE_TTL
+    ) {
+      logger.debug(`[${jobId}] Using cached validation for video`, {
+        s3Url,
+        index,
+        cachedAt: cached.validatedAt,
+      });
+      return cached;
+    }
+
+    const validation = await this.validateRunwayVideo(s3Url, index, jobId);
+    if (!validation.success) {
+      return null;
+    }
+
+    const cacheEntry: ValidationCache = {
+      s3Url,
+      duration: validation.duration!,
+      validatedAt: new Date(),
+    };
+
+    this.validationCache.set(cacheKey, cacheEntry);
+    return cacheEntry;
+  }
+
   private async retryRunwayGeneration(
     inputUrl: string,
     index: number,
     listingId: string,
     jobId: string,
     attempt = 1
-  ): Promise<string | null> {
+  ): Promise<RunwayGenerationResult | null> {
     try {
       logger.info(
         `[${jobId}] Attempting Runway generation (attempt ${attempt}/${this.MAX_RUNWAY_RETRIES})`,
-        {
-          index,
-          inputUrl,
-        }
+        { index, inputUrl }
       );
 
-      // Track the input resource
-      await resourceManager.trackResource(inputUrl, "runway-input");
-      await resourceManager.updateResourceState(
-        inputUrl,
-        ResourceState.PROCESSING,
-        {
-          operation: "runway-generation",
-          attempt,
-        }
-      );
-
-      // Generate video directly to S3
+      // Generate video with Runway (with its own retries)
       const s3Url = await runwayService.generateVideo(
         inputUrl,
         index,
@@ -381,98 +504,64 @@ export class ProductionPipeline {
         throw new Error("Runway returned no S3 URL");
       }
 
-      // Verify the S3 asset exists and is valid
-      const s3Key = this.getS3KeyFromUrl(s3Url);
-      const exists = await this.verifyS3Asset(s3Key);
-      if (!exists) {
-        throw new Error(`Generated video not accessible at ${s3Url}`);
-      }
-
-      // Validate video integrity
-      const tempPath = path.join(
-        process.cwd(),
-        "temp",
-        `${jobId}_validate_${index}.mp4`
-      );
-      await this.resourceManager.trackResource(tempPath);
-
-      let duration: number;
-      try {
-        // Download for validation
-        await this.s3Service.downloadFile(s3Url, tempPath);
-
-        // Check video duration and integrity
-        duration = await videoProcessingService.getVideoDuration(tempPath);
-        if (duration <= 0) {
-          throw new Error(
-            `Invalid video duration (${duration}s) from Runway output`
-          );
-        }
-
-        // Additional integrity check
-        const isValid = await videoProcessingService.validateVideoIntegrity(
-          tempPath
-        );
-        if (!isValid) {
-          throw new Error("Video file integrity check failed");
-        }
-
-        logger.info(`[${jobId}] Validated Runway output`, {
-          index,
-          duration,
-          s3Url,
-        });
-      } finally {
-        // Clean up temp file
-        await fs.unlink(tempPath).catch((error) => {
-          logger.warn(`[${jobId}] Failed to cleanup validation file`, {
-            path: tempPath,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
-        });
-      }
-
-      // Update resource state to uploaded
-      await resourceManager.updateResourceState(
-        inputUrl,
-        ResourceState.UPLOADED,
-        {
-          s3Url,
-          validationStatus: "success",
-          duration: duration,
-        }
+      // Verify and validate with cache
+      const validationResult = await this.validateWithCache(
+        s3Url,
+        index,
+        jobId
       );
 
-      // Update the Photo record with the Runway video URL and metadata
-      await this.prisma.photo.updateMany({
-        where: {
-          listingId,
-          order: index,
-          status: { in: ["PENDING", "PROCESSING"] },
-        },
-        data: {
-          runwayVideoPath: s3Url,
-          status: "COMPLETED",
-          updatedAt: new Date(),
+      if (validationResult) {
+        // Update the Photo record with the validated Runway video URL
+        await this.prisma.photo.updateMany({
+          where: {
+            listingId,
+            order: index,
+            status: { in: ["PENDING", "PROCESSING"] },
+          },
+          data: {
+            runwayVideoPath: s3Url,
+            status: "COMPLETED",
+            updatedAt: new Date(),
+            metadata: {
+              runwayGeneratedAt: new Date().toISOString(),
+              inputProcessedPath: inputUrl,
+              attempt,
+              generatedAt: new Date().toISOString(),
+              validationStatus: "success",
+              duration: validationResult.duration,
+            },
+          },
+        });
+
+        return {
+          s3Url,
+          duration: validationResult.duration,
+          validated: true,
           metadata: {
-            runwayGeneratedAt: new Date().toISOString(),
-            inputProcessedPath: inputUrl,
             attempt,
             generatedAt: new Date().toISOString(),
-            validationStatus: "success",
-            duration,
           },
-        },
-      });
+        };
+      }
 
-      logger.info(`[${jobId}] Stored Runway video URL for photo`, {
-        listingId,
-        order: index,
-        s3Url,
-        duration,
-      });
+      // Si la validación falló pero aún tenemos intentos, reintentamos solo la generación
+      if (attempt < this.MAX_RUNWAY_RETRIES) {
+        logger.warn(`[${jobId}] Validation failed, retrying generation`, {
+          attempt,
+          index,
+          inputUrl,
+        });
+        return this.retryRunwayGeneration(
+          inputUrl,
+          index,
+          listingId,
+          jobId,
+          attempt + 1
+        );
+      }
 
-      return s3Url;
+      return null;
     } catch (error) {
       const isLastAttempt = attempt >= this.MAX_RUNWAY_RETRIES;
       const errorMessage =
@@ -487,15 +576,6 @@ export class ProductionPipeline {
           index,
           inputUrl,
           stack: error instanceof Error ? error.stack : undefined,
-        }
-      );
-
-      await resourceManager.updateResourceState(
-        inputUrl,
-        isLastAttempt ? ResourceState.FAILED : ResourceState.PROCESSING,
-        {
-          error: errorMessage,
-          attempt,
         }
       );
 
@@ -549,16 +629,19 @@ export class ProductionPipeline {
     ): Promise<string | null> => {
       const existingVideo = await verifyRunwayVideo(index);
       if (existingVideo) {
-        logger.info(
-          `[${jobId}] Runway video already exists for order ${index}, skipping retry`
-        );
         const photo = await this.prisma.photo.findFirst({
           where: { listingId: job.listingId, order: index },
           select: { runwayVideoPath: true },
         });
         return photo?.runwayVideoPath || null;
       }
-      return this.retryRunwayGeneration(inputUrl, index, job.listingId, jobId);
+      const result = await this.retryRunwayGeneration(
+        inputUrl,
+        index,
+        job.listingId,
+        jobId
+      );
+      return result?.s3Url || null;
     };
 
     const isRegeneration = options?.isRegeneration ?? false;
@@ -1047,6 +1130,45 @@ export class ProductionPipeline {
     }
   }
 
+  private async withResourceTracking<T>(
+    jobId: string,
+    operation: () => Promise<T>,
+    resources: ResourceTracker[]
+  ): Promise<T> {
+    const trackedResources: string[] = [];
+
+    try {
+      // Registrar todos los recursos
+      for (const resource of resources) {
+        await this.resourceManager.trackResource(resource.path);
+        trackedResources.push(resource.path);
+
+        logger.debug(`[${jobId}] Tracking resource`, {
+          path: resource.path,
+          type: resource.type,
+          metadata: resource.metadata,
+        });
+      }
+
+      return await operation();
+    } finally {
+      // Cleanup automático
+      for (const path of trackedResources) {
+        try {
+          if (existsSync(path)) {
+            await fs.unlink(path);
+            logger.debug(`[${jobId}] Cleaned up resource`, { path });
+          }
+        } catch (error) {
+          logger.warn(`[${jobId}] Failed to cleanup resource`, {
+            path,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+        }
+      }
+    }
+  }
+
   private async processTemplate(
     template: TemplateKey,
     runwayVideos: string[],
@@ -1056,67 +1178,14 @@ export class ProductionPipeline {
     mapVideo?: string | null
   ): Promise<TemplateProcessingResult> {
     const startTime = Date.now();
-
-    // Get the user's subscription tier to check watermark settings
-    const job = await this.prisma.videoJob.findUnique({
-      where: { id: jobId },
-      select: {
-        user: {
-          select: {
-            currentTier: true,
-          },
-        },
-      },
-    });
-
-    const userTier = job?.user?.currentTier;
-    const shouldShowWatermark = userTier?.hasWatermark ?? true; // Default to showing watermark if no tier
-
-    // Resolve watermark only if the user's tier requires it
-    let watermarkConfig: WatermarkConfig | undefined;
-    if (shouldShowWatermark) {
-      const localWatermarkPath = await this.getSharedWatermarkPath(jobId);
-      if (localWatermarkPath) {
-        try {
-          await fs.access(localWatermarkPath);
-          watermarkConfig = {
-            path: localWatermarkPath,
-            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
-          };
-
-          logger.info(
-            `[${jobId}] Applying watermark based on subscription tier`,
-            {
-              tierId: userTier?.tierId,
-              hasWatermark: userTier?.hasWatermark,
-            }
-          );
-        } catch (error) {
-          logger.warn(
-            `[${jobId}] Watermark file inaccessible, proceeding without`,
-            {
-              path: localWatermarkPath,
-              error: error instanceof Error ? error.message : "Unknown error",
-            }
-          );
-        }
-      }
-    } else {
-      logger.info(`[${jobId}] Skipping watermark based on subscription tier`, {
-        tierId: userTier?.tierId,
-        hasWatermark: userTier?.hasWatermark,
-      });
-    }
-
     const tempDir = path.join(process.cwd(), "temp", `${jobId}_${template}`);
     const videoTemplateService = VideoTemplateService.getInstance();
 
     try {
       await fs.mkdir(tempDir, { recursive: true });
-
       const templateConfig = reelTemplates[template];
 
-      // 1. Improved Duration Array Handling - do it early and validate
+      // Validar durations temprano
       const durations = Array.isArray(templateConfig.durations)
         ? templateConfig.durations
         : Object.values(templateConfig.durations);
@@ -1125,11 +1194,11 @@ export class ProductionPipeline {
         throw new Error(`Template ${template} has no valid durations defined`);
       }
 
-      // Validate all durations are positive numbers
       if (durations.some((d) => typeof d !== "number" || d <= 0)) {
         throw new Error(`Template ${template} has invalid duration values`);
       }
 
+      // Verificar necesidad de mapa
       const needsMap = templateConfig.sequence.includes("map");
       if (needsMap && !mapVideo) {
         const error = `Map video required but not available for template ${template}`;
@@ -1144,217 +1213,176 @@ export class ProductionPipeline {
         message: `Generating ${template} template`,
       });
 
-      // Download and validate runway videos
-      const localVideos = await Promise.all(
-        runwayVideos.map(async (video, index) => {
-          const localPath = path.join(tempDir, `segment_${index}.mp4`);
-          try {
-            await this.s3Service.downloadFile(video, localPath);
-            const duration = await videoProcessingService.getVideoDuration(
-              localPath
-            );
-            if (duration <= 0) throw new Error("Invalid video duration");
-            await this.resourceManager.trackResource(localPath);
-            return localPath;
-          } catch (error) {
-            logger.warn(`[${jobId}] Skipping corrupt or inaccessible video`, {
-              index,
-              path: video,
-              error: error instanceof Error ? error.message : "Unknown error",
-            });
-            return null;
-          }
-        })
-      );
-
-      const validLocalVideos = localVideos.filter((v): v is string => !!v);
-      if (validLocalVideos.length === 0) {
-        throw new Error("No valid videos available for template processing");
-      }
-
-      // Handle map video with improved validation
-      let localMapVideo: string | undefined;
-      let mapDuration: number | undefined;
-      if (needsMap && mapVideo) {
-        localMapVideo = path.join(tempDir, "map.mp4");
-        try {
-          await this.s3Service.downloadFile(mapVideo, localMapVideo);
-          mapDuration = await videoProcessingService.getVideoDuration(
-            localMapVideo
-          );
-          if (mapDuration <= 0) throw new Error("Invalid map video duration");
-          await this.resourceManager.trackResource(localMapVideo);
-        } catch (error) {
-          logger.warn(`[${jobId}] Map video inaccessible, proceeding without`, {
-            path: mapVideo,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
-          localMapVideo = undefined;
-        }
-      }
-
-      // Resolve music
-      let resolvedMusic: ReelTemplate["music"] | undefined =
-        templateConfig.music;
-      if (templateConfig.music?.path) {
-        const musicPath = path.join(tempDir, `music_${template}.mp3`);
-        try {
-          const resolvedMusicPath = await videoTemplateService.resolveAssetPath(
-            templateConfig.music.path,
-            "music",
-            true
-          );
-          if (resolvedMusicPath) {
-            await this.s3Service.downloadFile(resolvedMusicPath, musicPath);
-            const duration = await videoProcessingService.getVideoDuration(
-              musicPath
-            );
-            if (duration <= 0) throw new Error("Invalid music file duration");
-            await this.resourceManager.trackResource(musicPath);
-            resolvedMusic = {
-              ...templateConfig.music,
-              path: musicPath,
-              isValid: true,
-            };
-          }
-        } catch (error) {
-          logger.warn(`[${jobId}] Music file issue, proceeding without`, {
-            path: templateConfig.music.path,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
-          resolvedMusic = undefined;
-        }
-      }
-
-      // 2. Segment Count Control & 3. Duration-Sequence Alignment
-      const combinedVideos: string[] = [];
-      const adjustedDurations: number[] = [];
-      const sequenceMapping: Array<{
-        type: string;
-        source: string;
-        duration: number;
-      }> = [];
-      let segmentCount = 0;
-      const maxSegments = validLocalVideos.length;
-
-      for (const item of templateConfig.sequence) {
-        // 4. Improved Map Video Handling
-        if (item === "map" && localMapVideo) {
-          const mapDurationValue =
-            typeof templateConfig.durations === "object"
-              ? (templateConfig.durations as Record<string, number>).map
-              : durations[segmentCount];
-
-          if (!mapDurationValue) {
-            logger.warn(
-              `[${jobId}] No duration specified for map video, skipping`
-            );
-            continue;
-          }
-
-          combinedVideos.push(localMapVideo);
-          adjustedDurations.push(mapDurationValue);
-          sequenceMapping.push({
-            type: "map",
-            source: localMapVideo,
-            duration: mapDurationValue,
-          });
-        } else {
-          if (segmentCount >= maxSegments) {
-            logger.info(
-              `[${jobId}] Reached maximum available segments (${maxSegments})`
-            );
-            break;
-          }
-
-          const videoIndex = typeof item === "string" ? parseInt(item) : item;
-          if (videoIndex < validLocalVideos.length) {
-            const duration = durations[segmentCount];
-
-            // 5. Stricter Validation
-            if (!duration) {
-              logger.warn(
-                `[${jobId}] No duration specified for segment ${segmentCount}, skipping`
+      // Procesar videos y recursos dentro del tracking
+      return await this.withResourceTracking(
+        jobId,
+        async () => {
+          // Descargar y validar videos
+          const processedVideos = await Promise.all(
+            runwayVideos.map(async (video, index) => {
+              const localPath = path.join(tempDir, `segment_${index}.mp4`);
+              const validation = await this.validateWithCache(
+                video,
+                index,
+                jobId
               );
-              continue;
-            }
 
-            combinedVideos.push(validLocalVideos[videoIndex]);
-            adjustedDurations.push(duration);
-            sequenceMapping.push({
-              type: "runway",
-              source: `video_${videoIndex}`,
-              duration,
-            });
-            segmentCount++;
+              if (!validation) {
+                logger.warn(`[${jobId}] Skipping invalid video`, {
+                  index,
+                  path: video,
+                });
+                return null;
+              }
+
+              await this.s3Service.downloadFile(video, localPath);
+              return {
+                path: localPath,
+                duration: validation.duration,
+              } as ValidatedVideo;
+            })
+          );
+
+          const validVideos = processedVideos.filter(
+            (v): v is ValidatedVideo => v !== null
+          );
+          if (validVideos.length === 0) {
+            throw new Error(
+              "No valid videos available for template processing"
+            );
           }
-        }
-      }
 
-      // Enhanced logging with duration information
-      logger.info(`[${jobId}] Clip sequence for ${template}`, {
-        template,
-        sequence: templateConfig.sequence,
-        sequenceMapping,
-        combinedVideos: combinedVideos.map((path, idx) => ({
-          index: idx,
-          path,
-          duration: adjustedDurations[idx],
-          isMap: path === localMapVideo,
-        })),
-        totalClips: combinedVideos.length,
-        expectedTotal: templateConfig.sequence.length,
-        totalDuration: adjustedDurations.reduce((sum, d) => sum + d, 0),
-      });
+          // Procesar video del mapa si es necesario
+          let processedMapVideo: ValidatedVideo | undefined;
+          if (needsMap && mapVideo) {
+            const mapPath = path.join(tempDir, "map.mp4");
+            const mapValidation = await this.validateWithCache(
+              mapVideo,
+              -1,
+              jobId
+            );
 
-      if (combinedVideos.length === 0) {
-        throw new Error("No valid clips generated for template");
-      }
+            if (mapValidation) {
+              await this.s3Service.downloadFile(mapVideo, mapPath);
+              processedMapVideo = {
+                path: mapPath,
+                duration: mapValidation.duration,
+              };
+            }
+          }
 
-      // Create clips with validated durations
-      const clips = combinedVideos.map((path, index) => {
-        const duration = adjustedDurations[index];
-        if (duration === undefined) {
-          throw new Error(`No duration defined for clip ${index}: ${path}`);
-        }
-        return {
-          path,
-          duration,
-          transition: templateConfig.transitions?.[index > 0 ? index - 1 : 0],
-          colorCorrection: templateConfig.colorCorrection,
-        };
-      });
+          // Procesar música
+          let processedMusic: ReelTemplate["music"] | undefined;
+          if (templateConfig.music?.path) {
+            const musicPath = path.join(tempDir, `music_${template}.mp3`);
+            try {
+              const resolvedMusicPath =
+                await videoTemplateService.resolveAssetPath(
+                  templateConfig.music.path,
+                  "music",
+                  true
+                );
 
-      const outputPath = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/properties/${listingId}/videos/templates/${jobId}/${template}.mp4`;
+              if (resolvedMusicPath) {
+                await this.s3Service.downloadFile(resolvedMusicPath, musicPath);
+                const isValid = await videoProcessingService.validateMusicFile(
+                  musicPath
+                );
 
-      await videoProcessingService.stitchVideos(
-        clips,
-        outputPath,
-        {
-          name: templateConfig.name,
-          description: templateConfig.description,
-          colorCorrection: templateConfig.colorCorrection,
-          transitions: templateConfig.transitions,
-          reverseClips: templateConfig.reverseClips,
-          music: resolvedMusic,
-          outputOptions: ["-q:a 2"],
-        } as VideoTemplate,
-        watermarkConfig
+                if (isValid) {
+                  processedMusic = {
+                    ...templateConfig.music,
+                    path: musicPath,
+                    isValid: true,
+                  };
+                }
+              }
+            } catch (error) {
+              logger.warn(`[${jobId}] Music file issue, proceeding without`, {
+                path: templateConfig.music.path,
+                error: error instanceof Error ? error.message : "Unknown error",
+              });
+            }
+          }
+
+          // Preparar clips
+          const clips = validVideos.map((video, index) => ({
+            path: video.path,
+            duration: durations[index] || video.duration,
+            transition: templateConfig.transitions?.[index > 0 ? index - 1 : 0],
+            colorCorrection: templateConfig.colorCorrection,
+          }));
+
+          const outputPath = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/properties/${listingId}/videos/templates/${jobId}/${template}.mp4`;
+
+          // Obtener configuración de watermark
+          const watermarkConfig = await this.getSharedWatermarkPath(jobId);
+          const watermarkSettings = watermarkConfig
+            ? ({
+                path: watermarkConfig,
+                position: {
+                  x: "(main_w-overlay_w)/2",
+                  y: "main_h-overlay_h-300",
+                },
+              } as WatermarkConfig)
+            : undefined;
+
+          // Procesar el video
+          await videoProcessingService.stitchVideos(
+            clips,
+            outputPath,
+            {
+              name: templateConfig.name,
+              description: templateConfig.description,
+              colorCorrection: templateConfig.colorCorrection,
+              transitions: templateConfig.transitions,
+              reverseClips: templateConfig.reverseClips,
+              music: processedMusic,
+              outputOptions: ["-q:a 2"],
+            } as VideoTemplate,
+            watermarkSettings
+          );
+
+          await this.updateJobProgress(jobId, {
+            stage: "template",
+            subStage: template,
+            progress: 100,
+            message: `${template} template completed`,
+          });
+
+          // Preparar recursos para tracking
+          const resources: ResourceTracker[] = [
+            ...validVideos.map((v) => ({
+              path: v.path,
+              type: "video" as const,
+            })),
+            ...(processedMapVideo
+              ? [
+                  {
+                    path: processedMapVideo.path,
+                    type: "video" as const,
+                  },
+                ]
+              : []),
+            ...(processedMusic?.path
+              ? [
+                  {
+                    path: processedMusic.path,
+                    type: "music" as const,
+                  },
+                ]
+              : []),
+          ];
+
+          return {
+            template,
+            status: "SUCCESS",
+            outputPath,
+            processingTime: Date.now() - startTime,
+          };
+        },
+        [] // Los recursos se manejan internamente
       );
-
-      await this.updateJobProgress(jobId, {
-        stage: "template",
-        subStage: template,
-        progress: 100,
-        message: `${template} template completed`,
-      });
-
-      return {
-        template,
-        status: "SUCCESS",
-        outputPath,
-        processingTime: Date.now() - startTime,
-      };
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error";
@@ -1363,12 +1391,14 @@ export class ProductionPipeline {
         error: errorMessage,
         stack: error instanceof Error ? error.stack : undefined,
       });
+
       await this.updateJobProgress(jobId, {
         stage: "template",
         subStage: template,
         progress: 0,
         error: errorMessage,
       });
+
       return {
         template,
         status: "FAILED",
@@ -1376,9 +1406,6 @@ export class ProductionPipeline {
         error: errorMessage,
         processingTime: Date.now() - startTime,
       };
-    } finally {
-      // Cleanup moved to execute, but log here for visibility
-      logger.debug(`[${jobId}] Temp directory ready for cleanup`, { tempDir });
     }
   }
 
@@ -2748,12 +2775,12 @@ export class ProductionPipeline {
         });
         if (
           !updatedPhoto?.runwayVideoPath ||
-          updatedPhoto.runwayVideoPath !== result.path
+          updatedPhoto.runwayVideoPath !== result.path.s3Url // Acceder a s3Url
         ) {
           logger.error(
             `[${jobId}] runwayVideoPath not saved correctly for order ${result.index}`,
             {
-              expected: result.path,
+              expected: result.path.s3Url, // Usar s3Url aquí también
               actual: updatedPhoto?.runwayVideoPath,
             }
           );
