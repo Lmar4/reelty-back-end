@@ -41,6 +41,10 @@ class ProgressTrackerService {
       );
     } catch (error) {
       logger.error(`Failed to update progress for job ${jobId}:`, error);
+      const errorMessage = `Progress update failed for job ${jobId}: ${
+        error instanceof Error ? error.message : "Unknown error"
+      }`;
+      throw new Error(errorMessage);
     }
   }
 
