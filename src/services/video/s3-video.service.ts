@@ -13,6 +13,7 @@ import { Readable } from "stream";
 import { logger } from "../../utils/logger.js";
 import * as path from "path";
 import { promises as fsPromises } from "fs";
+import { VideoValidationService } from "./video-validation.service.js";
 
 export class S3VideoService {
   private static instance: S3VideoService;
@@ -338,6 +339,118 @@ export class S3VideoService {
       });
       throw error;
     }
+  }
+
+  /**
+   * Downloads a video with retries and validation
+   */
+  async downloadVideoWithValidation(
+    s3Url: string,
+    localPath: string,
+    jobId?: string
+  ): Promise<boolean> {
+    const MAX_RETRIES = parseInt(process.env.FILE_DOWNLOAD_RETRIES || "3", 10);
+    const logContext = jobId ? `[${jobId}]` : "";
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        // Download the file
+        await this.downloadVideo(s3Url, localPath);
+
+        // Validate the downloaded file
+        await VideoValidationService.getInstance().validateVideo(
+          localPath,
+          jobId
+        );
+
+        logger.info(
+          `${logContext} Successfully downloaded and validated video`,
+          {
+            s3Url,
+            localPath,
+            attempt,
+          }
+        );
+
+        return true;
+      } catch (error) {
+        logger.warn(
+          `${logContext} Download attempt ${attempt}/${MAX_RETRIES} failed`,
+          {
+            s3Url,
+            localPath,
+            error: error instanceof Error ? error.message : "Unknown error",
+          }
+        );
+
+        if (attempt === MAX_RETRIES) {
+          logger.error(`${logContext} All download attempts failed`, {
+            s3Url,
+            localPath,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          return false;
+        }
+
+        // Exponential backoff with jitter
+        const delay = Math.min(
+          1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random()),
+          30000
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+
+        // Clean up any partial download
+        try {
+          await fsPromises.unlink(localPath);
+        } catch (cleanupError) {
+          // Ignore errors if file doesn't exist
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Verifies a file exists in S3 with retries
+   */
+  async verifyS3FileWithRetries(
+    bucket: string,
+    key: string,
+    retries = 3
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const exists = await this.checkFileExists(bucket, key);
+        if (exists) return true;
+
+        if (attempt < retries) {
+          // Exponential backoff with jitter
+          const delay = Math.min(
+            1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random()),
+            10000
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      } catch (error) {
+        logger.warn(`S3 verification attempt ${attempt}/${retries} failed`, {
+          bucket,
+          key,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+
+        if (attempt < retries) {
+          // Exponential backoff with jitter
+          const delay = Math.min(
+            1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random()),
+            10000
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    return false;
   }
 }
 
