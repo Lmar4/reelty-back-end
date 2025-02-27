@@ -1919,7 +1919,6 @@ export class ProductionPipeline {
           } satisfies Prisma.InputJsonValue,
         },
       });
-
       throw error;
     } finally {
       // Release the lock if we acquired one
