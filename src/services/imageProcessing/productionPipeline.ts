@@ -1280,6 +1280,14 @@ export class ProductionPipeline {
     coordinates?: { lat: number; lng: number },
     mapVideo?: string | null
   ): Promise<string[]> {
+    // Log the inputs for better debugging
+    logger.info(`[${jobId}] Starting template processing`, {
+      validRunwayVideos: runwayVideos.filter(Boolean).length,
+      totalRunwayVideos: runwayVideos.length,
+      requestedTemplates: templates,
+      hasMapVideo: !!mapVideo,
+    });
+
     const filteredTemplates = templates.filter((t) => {
       const needsMap = reelTemplates[t].sequence.includes("map");
       if (needsMap && !mapVideo) {
@@ -1975,32 +1983,40 @@ export class ProductionPipeline {
         cacheKey,
       });
 
-      // Generate map video if no valid cache
-      const localVideoPath = cachedPath?.startsWith("https://")
-        ? null
-        : cachedPath ||
-          (await this.retryWithBackoff(
-            async () => {
-              return Promise.race([
-                mapCaptureService.generateMapVideo(coordinates, jobId),
-                new Promise<never>((_, reject) =>
-                  setTimeout(
-                    () => reject(new Error("Map video generation timeout")),
-                    MAP_GENERATION_TIMEOUT
-                  )
-                ),
-              ]);
-            },
-            2,
-            "Map video generation",
-            jobId
-          ));
+      // Generate map video with enhanced error handling
+      const localVideoPath = await this.retryWithBackoff(
+        async () => {
+          return Promise.race([
+            mapCaptureService.generateMapVideo(coordinates, jobId),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () => reject(new Error("Map video generation timeout")),
+                MAP_GENERATION_TIMEOUT
+              )
+            ),
+          ]);
+        },
+        3,
+        "Map video generation",
+        jobId
+      );
 
-      // Upload to temp location if not already done
-      if (localVideoPath && !cachedPath?.startsWith("https://")) {
-        const fileBuffer = await fs.readFile(localVideoPath);
-        await this.s3VideoService.uploadFile(fileBuffer, tempS3Key);
+      if (!localVideoPath) {
+        throw new Error("Map video generation returned no path");
       }
+
+      // Validate the map video before uploading to S3
+      const isValid = await this.validateMapVideo(localVideoPath, jobId);
+      if (!isValid) {
+        logger.error(`[${jobId}] Generated map video failed validation`, {
+          path: localVideoPath,
+        });
+        throw new Error("Map video failed validation checks");
+      }
+
+      // Upload to S3
+      const fileBuffer = await fs.readFile(localVideoPath);
+      await this.s3VideoService.uploadFile(fileBuffer, tempS3Key);
 
       // Move to final location
       const finalS3Url = await this.s3VideoService.moveFromTempToListing(
@@ -2008,17 +2024,44 @@ export class ProductionPipeline {
         listingId,
         jobId
       );
-      logger.info(`[${jobId}] Verifying map video before caching`, {
-        finalS3Url,
-      });
-      const exists = await this.verifyS3Asset(this.getS3KeyFromUrl(finalS3Url));
-      if (!exists)
-        throw new Error(`Map video not accessible after move: ${finalS3Url}`);
-      await this.cacheAsset(jobId, cacheKey, finalS3Url, "map");
 
-      logger.info(`[${jobId}] Map video generation completed`, {
-        finalS3Url,
-      });
+      // Verify the S3 video and download for validation
+      const validationPath = path.join(
+        process.cwd(),
+        "temp",
+        `${jobId}_validate_map.mp4`
+      );
+      await this.resourceManager.trackResource(validationPath);
+      try {
+        await this.s3Service.downloadFile(finalS3Url, validationPath);
+
+        // Verify the downloaded video
+        const duration = await videoProcessingService.getVideoDuration(
+          validationPath
+        );
+        const integrityCheck =
+          await videoProcessingService.validateVideoIntegrity(validationPath);
+
+        if (duration <= 0 || !integrityCheck) {
+          logger.error(`[${jobId}] Map video validation failed`, {
+            duration,
+            integrityCheck,
+            s3Url: finalS3Url,
+          });
+          throw new Error("Map video failed post-upload validation");
+        }
+
+        logger.info(`[${jobId}] Map video validated successfully`, {
+          duration,
+          s3Url: finalS3Url,
+        });
+      } finally {
+        // Clean up validation file
+        await fs.unlink(validationPath).catch(() => {});
+      }
+
+      // Cache the validated video
+      await this.cacheAsset(jobId, cacheKey, finalS3Url, "map");
 
       return finalS3Url;
     } catch (error) {
@@ -2028,6 +2071,62 @@ export class ProductionPipeline {
         stack: error instanceof Error ? error.stack : undefined,
       });
       return null;
+    }
+  }
+
+  // New helper function to validate map videos
+  private async validateMapVideo(
+    videoPath: string,
+    jobId: string
+  ): Promise<boolean> {
+    try {
+      // Check file size
+      const stats = await fs.stat(videoPath);
+      const minSizeBytes = 50000; // 50KB minimum for a valid video
+
+      if (stats.size < minSizeBytes) {
+        logger.error(`[${jobId}] Map video too small`, {
+          path: videoPath,
+          size: stats.size,
+          minRequiredSize: minSizeBytes,
+        });
+        return false;
+      }
+
+      // Check duration
+      const duration = await videoProcessingService.getVideoDuration(videoPath);
+      if (duration <= 0 || duration > 10) {
+        logger.error(`[${jobId}] Invalid map video duration`, {
+          path: videoPath,
+          duration,
+        });
+        return false;
+      }
+
+      // Check video integrity
+      const isValid = await videoProcessingService.validateVideoIntegrity(
+        videoPath
+      );
+      if (!isValid) {
+        logger.error(`[${jobId}] Map video integrity check failed`, {
+          path: videoPath,
+        });
+        return false;
+      }
+
+      logger.info(`[${jobId}] Map video validated successfully`, {
+        path: videoPath,
+        size: stats.size,
+        duration,
+      });
+
+      return true;
+    } catch (error) {
+      logger.error(`[${jobId}] Error validating map video`, {
+        path: videoPath,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      return false;
     }
   }
 

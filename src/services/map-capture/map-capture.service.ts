@@ -413,31 +413,41 @@ export class MapCaptureService {
   ): Promise<string> {
     try {
       const outputPath = await tempFileManager.createFile("map.mp4");
+      const tempOutputPath = await tempFileManager.createFile("map_temp.mp4");
+      const { FFMPEG } = MAP_CAPTURE_CONFIG;
 
       return new Promise((resolve, reject) => {
+        logger.info("Starting FFmpeg processing", {
+          framesDir,
+          outputPath: outputPath.path,
+          ffmpegConfig: {
+            fps: FFMPEG.FPS,
+            codec: FFMPEG.CODEC,
+            preset: FFMPEG.PRESET,
+            crf: FFMPEG.CRF,
+            duration: FFMPEG.DURATION,
+          },
+        });
+
+        // First pass - create video with consistent settings
         ffmpeg()
           .input(path.join(framesDir, "frame_%02d.jpg"))
-          .inputFPS(24)
-          .output(outputPath.path)
+          .inputFPS(parseInt(FFMPEG.FPS))
+          .output(tempOutputPath.path)
           .outputOptions([
             "-c:v",
-            "libx264",
+            FFMPEG.CODEC,
             "-preset",
-            "slow",
+            FFMPEG.PRESET,
             "-crf",
-            "18",
+            FFMPEG.CRF,
             "-r",
-            "24",
+            FFMPEG.FPS,
             "-pix_fmt",
-            "yuv420p",
-            "-profile:v",
-            "high",
-            "-level",
-            "4.0",
-            "-movflags",
-            "+faststart",
+            FFMPEG.PIXEL_FORMAT,
             "-t",
-            "3",
+            FFMPEG.DURATION,
+            ...FFMPEG.OUTPUT_OPTIONS,
           ])
           .on("progress", (progress) => {
             logger.info("FFmpeg progress", {
@@ -449,35 +459,75 @@ export class MapCaptureService {
           })
           .on("end", async () => {
             try {
-              // Clean up frames first
-              await this.cleanupFrames(framesDir);
-
-              // Then clean up browser resources
-              if (page) {
-                await this.clearPageResources(page).catch((err) => {
-                  logger.warn("Error clearing page resources:", {
-                    error: err instanceof Error ? err.message : "Unknown error",
-                  });
+              // Validate the video exists and has proper size
+              const stats = await fsPromises.stat(tempOutputPath.path);
+              if (stats.size < 10000) {
+                logger.error("Generated video file too small", {
+                  path: tempOutputPath.path,
+                  size: stats.size,
                 });
-              }
-              if (browser) {
-                await browser.close().catch((err) => {
-                  logger.warn("Error closing browser:", {
-                    error: err instanceof Error ? err.message : "Unknown error",
-                  });
-                });
+                reject(new Error("Generated video file too small"));
+                return;
               }
 
-              logger.info("Map video created successfully", {
-                outputPath: outputPath.path,
-              });
-              resolve(outputPath.path);
+              // Second pass - ensure compatibility with consistent bitrate
+              ffmpeg(tempOutputPath.path)
+                .output(outputPath.path)
+                .outputOptions([
+                  "-c:v",
+                  FFMPEG.CODEC,
+                  "-b:v",
+                  FFMPEG.BITRATE,
+                  "-movflags",
+                  "+faststart",
+                  "-pix_fmt",
+                  FFMPEG.PIXEL_FORMAT,
+                ])
+                .on("end", async () => {
+                  try {
+                    // Clean up temp files
+                    await this.cleanupFrames(framesDir);
+                    await fsPromises
+                      .unlink(tempOutputPath.path)
+                      .catch(() => {});
+
+                    // Validate final output
+                    const finalStats = await fsPromises.stat(outputPath.path);
+                    logger.info("Map video created successfully", {
+                      outputPath: outputPath.path,
+                      fileSize: finalStats.size,
+                    });
+
+                    // Close browser resources
+                    if (page)
+                      await this.clearPageResources(page).catch((err) =>
+                        logger.warn("Error clearing page", { error: err })
+                      );
+                    if (browser)
+                      await browser
+                        .close()
+                        .catch((err) =>
+                          logger.warn("Error closing browser", { error: err })
+                        );
+
+                    resolve(outputPath.path);
+                  } catch (error) {
+                    reject(error);
+                  }
+                })
+                .on("error", (err) => {
+                  logger.error("Failed in second pass encoding", {
+                    error: err.message,
+                  });
+                  reject(err);
+                })
+                .run();
             } catch (error) {
               reject(error);
             }
           })
           .on("error", (err) => {
-            logger.error("Failed to create map video:", {
+            logger.error("Failed to create map video in first pass", {
               error: err.message,
               framesDir,
             });
