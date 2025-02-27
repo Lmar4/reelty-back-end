@@ -3,6 +3,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import path from "path";
 import { logger } from "../../utils/logger.js";
+import ffmpeg from "fluent-ffmpeg";
 
 const execAsync = promisify(exec);
 
@@ -116,146 +117,95 @@ export class VideoValidationService {
   /**
    * Validates a video file with retries
    */
-  public async validateVideo(
-    filePath: string,
-    jobId?: string
-  ): Promise<VideoMetadata> {
-    const logContext = jobId ? `[${jobId}]` : "";
-
-    for (let attempt = 1; attempt <= this.MAX_RETRIES; attempt++) {
-      try {
-        // Check if file is completely written
-        const isComplete = await this.ensureFileComplete(filePath);
-        if (!isComplete) {
-          logger.warn(`${logContext} File not completely written, retrying`, {
+  public async validateVideo(filePath: string): Promise<{
+    hasVideo: boolean;
+    hasAudio: boolean;
+    duration: number;
+    width?: number;
+    height?: number;
+    codec?: string;
+    fps?: number;
+  }> {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(filePath, (err, metadata) => {
+        if (err) {
+          logger.error("FFprobe error during validation", {
             path: filePath,
-            attempt,
+            error: err.message,
           });
-          await new Promise((resolve) =>
-            setTimeout(resolve, this.RETRY_DELAY * Math.pow(2, attempt - 1))
-          );
-          continue;
+          reject(err);
+          return;
         }
 
-        // Create a copy for validation to prevent race conditions
-        const validationCopy = await this.createValidationCopy(filePath);
-
-        try {
-          // Get video metadata
-          const metadata = await this.getVideoMetadata(validationCopy);
-
-          // Validate integrity
-          const isValid = await this.validateVideoIntegrity(validationCopy);
-          if (!isValid) {
-            throw new Error("Video integrity check failed");
-          }
-
-          logger.info(`${logContext} Video validation successful`, {
-            path: filePath,
-            metadata,
-            attempt,
-          });
-
-          return metadata;
-        } finally {
-          // Clean up validation copy
-          await fs.unlink(validationCopy).catch((err) => {
-            logger.warn(`${logContext} Failed to cleanup validation copy`, {
-              path: validationCopy,
-              error: err instanceof Error ? err.message : "Unknown error",
-            });
-          });
-        }
-      } catch (error) {
-        if (attempt === this.MAX_RETRIES) {
-          logger.error(
-            `${logContext} Video validation failed after ${this.MAX_RETRIES} attempts`,
-            {
-              path: filePath,
-              error: error instanceof Error ? error.message : "Unknown error",
-            }
-          );
-          throw error;
-        }
-
-        logger.warn(
-          `${logContext} Video validation attempt ${attempt} failed, retrying`,
-          {
-            path: filePath,
-            error: error instanceof Error ? error.message : "Unknown error",
-          }
+        // Find video stream
+        const videoStream = metadata.streams.find(
+          (stream) => stream.codec_type === "video"
+        );
+        const audioStream = metadata.streams.find(
+          (stream) => stream.codec_type === "audio"
         );
 
-        await new Promise((resolve) =>
-          setTimeout(resolve, this.RETRY_DELAY * Math.pow(2, attempt - 1))
-        );
-      }
-    }
+        // Enhanced logging for debugging
+        logger.debug("Video validation metadata", {
+          path: filePath,
+          streams: metadata.streams.map((s) => ({
+            codecType: s.codec_type,
+            codec: s.codec_name,
+            width: s.width,
+            height: s.height,
+            duration: s.duration,
+          })),
+          format: metadata.format,
+        });
 
-    throw new Error(
-      `Video validation failed after ${this.MAX_RETRIES} attempts`
-    );
+        const result = {
+          hasVideo: !!videoStream,
+          hasAudio: !!audioStream,
+          duration: parseFloat(String(metadata.format.duration || "0")),
+          width: videoStream?.width,
+          height: videoStream?.height,
+          codec: videoStream?.codec_name,
+          fps: videoStream?.r_frame_rate
+            ? eval(videoStream.r_frame_rate) // Safely evaluate frame rate fraction
+            : undefined,
+        };
+
+        // Log validation result
+        logger.info("Video validation result", {
+          path: filePath,
+          ...result,
+        });
+
+        resolve(result);
+      });
+    });
   }
 
-  /**
-   * Gets video metadata using ffprobe
-   */
-  private async getVideoMetadata(filePath: string): Promise<VideoMetadata> {
+  // Add a more comprehensive validation method
+  public async validateVideoIntegrity(filePath: string): Promise<boolean> {
     try {
-      const ffprobePath = process.env.FFPROBE_PATH || "ffprobe";
-      const command = `${ffprobePath} -v error -show_entries format=duration -show_entries stream=width,height,codec_name,r_frame_rate -of json "${filePath}"`;
+      const metadata = await this.validateVideo(filePath);
 
-      const { stdout } = await execAsync(command, {
-        timeout: this.VALIDATION_TIMEOUT,
-      });
-      const data = JSON.parse(stdout);
-
-      const videoStream = data.streams.find(
-        (s: any) => s.codec_type === "video"
+      // Enhanced validation criteria
+      const isValid = Boolean(
+        metadata.hasVideo && // Has video stream
+          metadata.duration > 0 && // Has duration
+          metadata.width &&
+          metadata.width > 0 && // Has valid dimensions
+          metadata.height &&
+          metadata.height > 0 &&
+          metadata.codec && // Has valid codec
+          !isNaN(metadata.fps as number) &&
+          metadata.fps! > 0 // Has valid framerate
       );
-      const audioStream = data.streams.find(
-        (s: any) => s.codec_type === "audio"
-      );
 
-      let fps = 0;
-      if (videoStream && videoStream.r_frame_rate) {
-        const [num, den] = videoStream.r_frame_rate.split("/");
-        fps = parseInt(num, 10) / parseInt(den || "1", 10);
-      }
-
-      return {
-        duration: parseFloat(data.format.duration || "0"),
-        width: videoStream?.width,
-        height: videoStream?.height,
-        codec: videoStream?.codec_name,
-        fps,
-        hasVideo: !!videoStream,
-        hasAudio: !!audioStream,
-      };
-    } catch (error) {
-      logger.error("Failed to get video metadata", {
+      logger.info("Video integrity check result", {
         path: filePath,
-        error: error instanceof Error ? error.message : "Unknown error",
+        isValid,
+        metadata,
       });
-      throw new Error(
-        `Failed to get video metadata: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`
-      );
-    }
-  }
 
-  /**
-   * Validates video integrity by checking if it can be read completely
-   */
-  private async validateVideoIntegrity(filePath: string): Promise<boolean> {
-    try {
-      const ffprobePath = process.env.FFPROBE_PATH || "ffprobe";
-      // Use a more thorough validation command
-      const command = `${ffprobePath} -v error -show_entries stream=codec_type -select_streams v -of json -count_frames -count_packets "${filePath}"`;
-
-      await execAsync(command, { timeout: this.VALIDATION_TIMEOUT });
-      return true;
+      return isValid;
     } catch (error) {
       logger.error("Video integrity check failed", {
         path: filePath,
@@ -270,7 +220,7 @@ export class VideoValidationService {
    */
   public async getVideoDuration(filePath: string): Promise<number> {
     try {
-      const metadata = await this.getVideoMetadata(filePath);
+      const metadata = await this.validateVideo(filePath);
       return metadata.duration;
     } catch (error) {
       logger.error("Failed to get video duration", {
