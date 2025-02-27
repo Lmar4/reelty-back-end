@@ -734,159 +734,56 @@ export class ProductionPipeline {
     if (isRegeneration && regenerationContext) {
       const { photosToRegenerate, existingPhotos } = regenerationContext;
 
-      logger.info(`[${jobId}] Processing regeneration`, {
+      // Crear array con los videos existentes, filtrando undefined
+      const runwayVideos = existingPhotos
+        .map((photo) => photo.runwayVideoPath)
+        .filter((path): path is string => path !== undefined);
+
+      logger.info(`[${jobId}] Starting regeneration with existing videos`, {
+        existingVideosCount: runwayVideos.length,
         photosToRegenerateCount: photosToRegenerate.length,
-        photosToRegenerate: photosToRegenerate.map((p) => ({
-          id: p.id,
-          order: p.order,
-          hasProcessedPath: !!p.processedFilePath,
-        })),
+        regeneratingOrders: photosToRegenerate.map((p) => p.order),
       });
 
-      // Initialize runwayVideos based on total photos count
-      const maxOrder = Math.max(
-        ...existingPhotos.map((p) => p.order),
-        ...photosToRegenerate.map((p) => p.order)
-      );
-      const runwayVideos = new Array(maxOrder + 1);
-
-      // First, process photos that need regeneration to ensure we have all videos
-      const processedVideos = await Promise.all(
-        photosToRegenerate.map(async (photo) => {
-          // Check if there's already a valid runwayVideoPath for this photo
-          const existingPhoto = allPhotos.find((p) => p.id === photo.id);
-          if (
-            existingPhoto?.runwayVideoPath &&
-            (await this.verifyS3VideoAccess(
-              existingPhoto.runwayVideoPath,
-              jobId
-            )) &&
-            !forceRegeneration
-          ) {
-            runwayVideos[photo.order] = existingPhoto.runwayVideoPath;
-            logger.info(
-              `[${jobId}] Reusing existing runwayVideoPath for regeneration, skipping Runway call`,
-              {
-                photoId: photo.id,
-                order: photo.order,
-                path: existingPhoto.runwayVideoPath,
-              }
-            );
-            return { order: photo.order, path: existingPhoto.runwayVideoPath };
-          }
-
-          let inputPath: string | null = photo.processedFilePath;
-          if (
-            !inputPath ||
-            !(await this.verifyS3VideoAccess(inputPath, jobId))
-          ) {
-            logger.info(`[${jobId}] Falling back to vision processing`, {
-              photoId: photo.id,
-              order: photo.order,
-              originalPath: inputPath,
-            });
-
-            inputPath = await this.processVisionImageFallback(
-              this.getS3KeyFromUrl(photo.filePath),
-              photo.order,
-              jobId,
-              job.listingId
-            );
-          }
-          if (inputPath) {
-            // Use the new retryRunway function instead of retryRunwayGeneration
-            const runwayVideo = await retryRunway(inputPath, photo.order);
-            if (!runwayVideo) {
-              throw new Error(
-                `Failed to generate runway video for photo ${photo.id} at order ${photo.order}`
-              );
-            }
-
-            // Verify the runwayVideoPath is saved in the database
-            const updatedPhoto = await this.prisma.photo.findFirst({
-              where: {
-                listingId: job.listingId,
-                order: photo.order,
-                status: "COMPLETED",
-              },
-              select: { runwayVideoPath: true, id: true },
-            });
-
-            if (
-              !updatedPhoto?.runwayVideoPath ||
-              updatedPhoto.runwayVideoPath !== runwayVideo
-            ) {
-              logger.error(
-                `[${jobId}] runwayVideoPath not saved correctly for photo ${photo.id} at order ${photo.order}`,
-                {
-                  expected: runwayVideo,
-                  actual: updatedPhoto?.runwayVideoPath,
-                }
-              );
-              throw new Error(
-                `Failed to save runwayVideoPath for photo ${photo.id}`
-              );
-            }
-
-            logger.info(
-              `[${jobId}] Successfully saved runwayVideoPath for photo ${photo.id} at order ${photo.order}`,
-              {
-                path: runwayVideo,
-              }
-            );
-
-            return { order: photo.order, path: runwayVideo };
-          }
+      // Procesar solo los videos que necesitan regeneración
+      for (const photo of photosToRegenerate) {
+        if (!photo.processedFilePath) {
           throw new Error(
-            `No valid input path for photo ${photo.id} at order ${photo.order}`
+            `Missing processedFilePath for photo order ${photo.order}`
           );
-        })
-      );
+        }
 
-      // Add regenerated videos to the array
-      processedVideos.forEach((video) => {
-        runwayVideos[video.order] = video.path;
-        logger.info(`[${jobId}] Added regenerated runway video`, {
-          order: video.order,
-          path: video.path,
+        const newVideo = await retryRunway(
+          photo.processedFilePath,
+          photo.order
+        );
+        if (!newVideo) {
+          throw new Error(
+            `Failed to regenerate video for photo order ${photo.order}`
+          );
+        }
+
+        // Reemplazar el video en la posición específica
+        runwayVideos[photo.order] = newVideo;
+
+        logger.info(`[${jobId}] Replaced video at order ${photo.order}`, {
+          oldPath: existingPhotos.find((p) => p.order === photo.order)
+            ?.runwayVideoPath,
+          newPath: newVideo,
         });
-      });
+      }
 
-      // Fill in existing videos for non-regenerated photos
-      existingPhotos.forEach((photo) => {
-        if (!photo.runwayVideoPath) {
-          throw new Error(
-            `Missing runway video for existing photo ${photo.id} at order ${photo.order}`
-          );
-        }
-        if (!processedVideos.some((v) => v.order === photo.order)) {
-          runwayVideos[photo.order] = photo.runwayVideoPath;
-          logger.info(`[${jobId}] Using existing runway video`, {
-            order: photo.order,
-            path: photo.runwayVideoPath,
-            photoId: photo.id,
-          });
-        }
-      });
-
-      // Verify we have all videos
-      const missingVideos = runwayVideos
-        .map((v, i) => ({ index: i, hasVideo: !!v }))
-        .filter(({ hasVideo }) => !hasVideo);
-
-      if (missingVideos.length > 0) {
+      // Verificar que no hay huecos en el array
+      const missingVideos = runwayVideos.findIndex((v) => !v);
+      if (missingVideos !== -1) {
         throw new Error(
-          `Missing runway videos for positions: ${missingVideos
-            .map((v) => v.index)
-            .join(", ")}`
+          `Missing video at position ${missingVideos} after regeneration`
         );
       }
 
-      // Log and return the full set of videos
-      logger.debug(`[${jobId}] Final runway videos for regeneration`, {
-        runwayVideos,
-        total: runwayVideos.length,
-        nonNullCount: runwayVideos.filter((v) => v !== null).length,
+      logger.info(`[${jobId}] Regeneration complete`, {
+        totalVideos: runwayVideos.length,
+        regeneratedCount: photosToRegenerate.length,
       });
 
       return runwayVideos;
