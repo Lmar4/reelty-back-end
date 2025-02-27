@@ -45,6 +45,7 @@ import { existsSync } from "fs";
 import { VideoTemplateService } from "../video/video-template.service.js";
 import { ReelTemplate } from "./templates/types.js";
 import { v4 as uuidv4 } from "uuid";
+import ffmpeg, { FfprobeData, FfprobeStream } from "fluent-ffmpeg";
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",
@@ -146,6 +147,22 @@ interface ResourceTracker {
 interface ValidatedVideo {
   path: string;
   duration: number;
+}
+
+// Add this interface near the top of the file with other interfaces
+interface FFprobeStream {
+  codec_type: string;
+  codec_name?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+}
+
+interface FFprobeMetadata {
+  streams: FFprobeStream[];
+  format: {
+    duration?: string;
+  };
 }
 
 class ResourceManager {
@@ -2348,9 +2365,6 @@ export class ProductionPipeline {
     }
   }
 
-  /**
-   * Validates a map video file for completeness and quality
-   */
   private async validateMapVideo(
     videoPath: string,
     jobId: string
@@ -2358,7 +2372,6 @@ export class ProductionPipeline {
     try {
       let localPath = videoPath;
 
-      // If it's an S3 URL, download it temporarily for validation
       if (videoPath.startsWith("https://")) {
         localPath = path.join(
           process.cwd(),
@@ -2369,13 +2382,10 @@ export class ProductionPipeline {
         await this.resourceManager.trackResource(localPath);
       }
 
-      // Check if file exists and is readable
       await fs.access(localPath, fs.constants.R_OK);
 
-      // Check file size
       const stats = await fs.stat(localPath);
       if (stats.size < 1024) {
-        // Minimum 1KB
         logger.warn(`[${jobId}] Map video file too small`, {
           size: stats.size,
           path: videoPath,
@@ -2383,10 +2393,8 @@ export class ProductionPipeline {
         return false;
       }
 
-      // Check video duration
       const duration = await videoProcessingService.getVideoDuration(localPath);
       if (duration < 1) {
-        // Minimum 1 second
         logger.warn(`[${jobId}] Map video duration too short`, {
           duration,
           path: videoPath,
@@ -2394,7 +2402,6 @@ export class ProductionPipeline {
         return false;
       }
 
-      // Check video integrity
       const isIntegrityValid =
         await videoProcessingService.validateVideoIntegrity(localPath);
       if (!isIntegrityValid) {
@@ -2404,17 +2411,34 @@ export class ProductionPipeline {
         return false;
       }
 
-      // Check video metadata
       const metadata = await videoProcessingService.getVideoMetadata(localPath);
+      logger.debug(`[${jobId}] Video metadata before validation`, {
+        path: videoPath,
+        fullMetadata: metadata, // Log full metadata for debugging
+      });
+
       if (!metadata.hasVideo || !metadata.width || !metadata.height) {
         logger.warn(`[${jobId}] Map video missing required metadata`, {
           path: videoPath,
           metadata,
         });
-        return false;
+
+        // Fallback: Use FFprobe directly to verify video content
+        const ffprobeOutput = await this.runFFprobe(localPath);
+        if (
+          !ffprobeOutput.streams ||
+          !ffprobeOutput.streams.some(
+            (stream: FfprobeStream) => stream.codec_type === "video"
+          )
+        ) {
+          logger.error(`[${jobId}] FFprobe confirms no video content`, {
+            path: videoPath,
+            ffprobeOutput,
+          });
+          return false;
+        }
       }
 
-      // Clean up temporary file if we downloaded it
       if (videoPath.startsWith("https://")) {
         await fs.unlink(localPath).catch((error) => {
           logger.warn(
@@ -2439,9 +2463,20 @@ export class ProductionPipeline {
       logger.error(`[${jobId}] Map video validation failed`, {
         error: error instanceof Error ? error.message : "Unknown error",
         path: videoPath,
+        stack: error instanceof Error ? error.stack : undefined,
       });
       return false;
     }
+  }
+
+  // Helper method to run FFprobe (you may need to install ffprobe or use a library like fluent-ffmpeg for this)
+  private async runFFprobe(filePath: string): Promise<FfprobeData> {
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(filePath, (err: Error | null, metadata: FfprobeData) => {
+        if (err) reject(err);
+        else resolve(metadata);
+      });
+    });
   }
 
   private async uploadToS3(filePath: string, s3Key: string): Promise<string> {
