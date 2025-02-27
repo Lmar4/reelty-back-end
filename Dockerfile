@@ -15,13 +15,25 @@ RUN apt-get update && \
     libgnutls28-dev libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
     libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
     libasound2 libpango-1.0-0 libcairo2 && \
-    rm -rf /var/lib/apt/lists/*
+    # Add these lines to ensure consistent FFmpeg configuration
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Create temp directories with proper permissions
+    mkdir -p /app/temp/output /app/temp/map-cache /app/temp/templates /app/temp/validation && \
+    chmod -R 777 /app/temp
 
 # Set ffmpeg environment variables
 ENV PATH="/usr/bin:$PATH" \
     FFMPEG_PATH="/usr/bin/ffmpeg" \
     FFPROBE_PATH="/usr/bin/ffprobe" \
-    NODE_OPTIONS="--max-old-space-size=8192"
+    NODE_OPTIONS="--max-old-space-size=8192" \
+    # Add these environment variables
+    TEMP_DIR="/app/temp" \
+    FFMPEG_VALIDATION_TIMEOUT="30000" \
+    FILE_DOWNLOAD_RETRIES="3" \
+    FILE_VALIDATION_RETRIES="3" \
+    FILE_VALIDATION_DELAY="1000" \
+    FILE_DOWNLOAD_TIMEOUT="60000"
 
 # Copy package files
 COPY package.json pnpm-lock.yaml ./
