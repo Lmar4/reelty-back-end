@@ -159,10 +159,8 @@ export class ImageProcessor {
 
   private async validateS3Path(path: string): Promise<boolean> {
     try {
-      if (!this.validateS3Url(path)) {
-        logger.warn("Invalid S3 URL format", { path });
-        return false;
-      }
+      // Validate URL format first
+      this.validateS3Url(path);
 
       // Extract bucket and key from URL
       let bucket: string;
