@@ -19,8 +19,18 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* && \
     # Create temp directories with proper permissions
-    mkdir -p /app/temp/output /app/temp/map-cache /app/temp/templates /app/temp/validation && \
-    chmod -R 777 /app/temp
+    mkdir -p /app/temp/output \
+            /app/temp/map-cache \
+            /app/temp/templates \
+            /app/temp/validation \
+            /app/temp/processing \
+            /app/temp/downloads \
+            /app/temp/uploads \
+            /app/temp/frames && \
+    chmod -R 777 /app/temp && \
+    # Create log directory
+    mkdir -p /app/logs && \
+    chmod -R 777 /app/logs
 
 # Set ffmpeg environment variables
 ENV PATH="/usr/bin:$PATH" \
@@ -29,11 +39,17 @@ ENV PATH="/usr/bin:$PATH" \
     NODE_OPTIONS="--max-old-space-size=8192" \
     # Add these environment variables
     TEMP_DIR="/app/temp" \
+    TEMP_OUTPUT_DIR="/app/temp/output" \
+    TEMP_PROCESSING_DIR="/app/temp/processing" \
+    TEMP_DOWNLOAD_DIR="/app/temp/downloads" \
+    TEMP_UPLOAD_DIR="/app/temp/uploads" \
+    TEMP_FRAMES_DIR="/app/temp/frames" \
     FFMPEG_VALIDATION_TIMEOUT="30000" \
     FILE_DOWNLOAD_RETRIES="3" \
     FILE_VALIDATION_RETRIES="3" \
     FILE_VALIDATION_DELAY="1000" \
-    FILE_DOWNLOAD_TIMEOUT="60000"
+    FILE_DOWNLOAD_TIMEOUT="60000" \
+    LOG_DIR="/app/logs"
 
 # Copy package files
 COPY package.json pnpm-lock.yaml ./

@@ -14,6 +14,8 @@ import { exec } from "child_process";
 import { Upload } from "@aws-sdk/lib-storage";
 import { S3Client } from "@aws-sdk/client-s3";
 import { EventEmitter } from "events";
+import { VideoValidationService } from "./video-validation.service.js";
+import { S3VideoService } from "./s3-video.service.js";
 
 interface FFmpegError extends Error {
   code?: string;
@@ -76,10 +78,14 @@ export class VideoProcessingService {
   private static instance: VideoProcessingService;
   private readonly TEMP_DIR = process.env.TEMP_OUTPUT_DIR || "./temp";
   private s3Service: S3Service;
+  private s3VideoService: S3VideoService;
+  private videoValidationService: VideoValidationService;
   private readonly FFmpeg_TIMEOUT = 60 * 60 * 1000; // 1 hour timeout
 
   private constructor() {
     this.s3Service = new S3Service();
+    this.s3VideoService = S3VideoService.getInstance();
+    this.videoValidationService = VideoValidationService.getInstance();
     if (!existsSync(this.TEMP_DIR)) {
       mkdirSync(this.TEMP_DIR, { recursive: true });
       logger.info("Created TEMP_DIR", { path: this.TEMP_DIR });
@@ -134,68 +140,11 @@ export class VideoProcessingService {
     context: string = "file"
   ): Promise<void> {
     try {
-      // Check if file exists and is readable
-      await fs.access(filePath, fs.constants.R_OK);
-
-      // Get file stats
-      const stats = await fs.stat(filePath);
-      if (stats.size === 0) {
-        throw new Error(`${context} is empty`);
-      }
-
-      // For media files, try to validate format
-      if (context === "video" || context === "music") {
-        try {
-          // Run ffprobe with detailed validation
-          return new Promise<void>((resolve, reject) => {
-            exec(
-              `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`,
-              (error, stdout, stderr) => {
-                if (error) {
-                  logger.error(`FFprobe validation failed for ${context}`, {
-                    filePath,
-                    error: error.message,
-                    stderr,
-                  });
-                  reject(
-                    new Error(`Invalid ${context} file: ${error.message}`)
-                  );
-                  return;
-                }
-
-                const duration = parseFloat(stdout.trim());
-                if (isNaN(duration) || duration <= 0) {
-                  logger.error(`Invalid ${context} duration`, {
-                    filePath,
-                    duration: stdout.trim(),
-                  });
-                  reject(
-                    new Error(`Invalid ${context} duration: ${stdout.trim()}`)
-                  );
-                  return;
-                }
-
-                logger.debug(`Validated ${context} duration`, {
-                  filePath,
-                  duration,
-                });
-                resolve();
-              }
-            );
-          });
-        } catch (error) {
-          logger.error(`Failed to validate ${context} duration`, {
-            filePath,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
-          throw error;
-        }
-      }
-
-      logger.debug(`Validated ${context} file`, { filePath, size: stats.size });
+      // Use the new validation service
+      await this.videoValidationService.validateVideo(filePath);
     } catch (error) {
-      logger.error(`Failed to validate ${context} file`, {
-        filePath,
+      logger.error(`Failed to validate ${context}`, {
+        path: filePath,
         error: error instanceof Error ? error.message : "Unknown error",
       });
       throw error;
@@ -1258,55 +1207,26 @@ export class VideoProcessingService {
   }
 
   public async getVideoDuration(filePath: string): Promise<number> {
-    return new Promise((resolve, reject) => {
-      // Add file existence check
-      if (!existsSync(filePath)) {
-        logger.error("File not found when getting duration:", {
-          path: filePath,
-        });
-        reject(new Error(`File not found: ${filePath}`));
-        return;
-      }
-
-      ffmpeg.ffprobe(filePath, (err, metadata) => {
-        if (err) {
-          logger.error("Failed to get video duration:", {
-            path: filePath,
-            error: err.message,
-            command: err.code, // Log the ffmpeg command that failed
-          });
-          reject(err);
-          return;
-        }
-
-        // Add more robust duration extraction and ensure number type
-        const duration = Number(
-          metadata?.format?.duration || metadata?.streams?.[0]?.duration || 0
-        );
-
-        if (!duration || duration <= 0) {
-          logger.warn(`Invalid duration (${duration}) found for file:`, {
-            path: filePath,
-          });
-          reject(new Error(`Invalid duration found for file: ${filePath}`));
-          return;
-        }
-
-        logger.debug("Successfully got duration", { path: filePath, duration });
-        resolve(duration);
+    try {
+      const metadata = await this.videoValidationService.validateVideo(
+        filePath
+      );
+      return metadata.duration;
+    } catch (error) {
+      logger.error("Failed to get video duration", {
+        path: filePath,
+        error: error instanceof Error ? error.message : "Unknown error",
       });
-    });
+      throw error;
+    }
   }
 
   public async validateVideoIntegrity(filePath: string): Promise<boolean> {
     try {
-      const duration = await this.getVideoDuration(filePath);
-      if (duration <= 0) return false;
-
-      // Add additional integrity checks as needed
-      // For example, check if the file has valid video/audio streams
-
-      return true;
+      const metadata = await this.videoValidationService.validateVideo(
+        filePath
+      );
+      return metadata.hasVideo && metadata.duration > 0;
     } catch (error) {
       logger.error("Video integrity check failed", {
         error: error instanceof Error ? error.message : "Unknown error",
@@ -1327,53 +1247,25 @@ export class VideoProcessingService {
     codec?: string;
     fps?: number;
   }> {
-    return new Promise((resolve, reject) => {
-      if (!existsSync(filePath)) {
-        logger.error("File not found when getting metadata:", {
-          path: filePath,
-        });
-        reject(new Error(`File not found: ${filePath}`));
-        return;
-      }
-
-      ffmpeg.ffprobe(filePath, (err, metadata) => {
-        if (err) {
-          logger.error("Failed to get video metadata:", {
-            path: filePath,
-            error: err.message,
-          });
-          reject(err);
-          return;
-        }
-
-        const videoStream = metadata.streams?.find(
-          (stream) => stream.codec_type === "video"
-        );
-
-        if (!videoStream) {
-          resolve({ hasVideo: false });
-          return;
-        }
-
-        // Extract frame rate as a number
-        let fps: number | undefined;
-        if (videoStream.r_frame_rate) {
-          const [num, den] = videoStream.r_frame_rate.split("/").map(Number);
-          if (!isNaN(num) && !isNaN(den) && den !== 0) {
-            fps = num / den;
-          }
-        }
-
-        resolve({
-          hasVideo: true,
-          width: videoStream.width,
-          height: videoStream.height,
-          duration: Number(metadata.format?.duration || videoStream.duration),
-          codec: videoStream.codec_name,
-          fps,
-        });
+    try {
+      const metadata = await this.videoValidationService.validateVideo(
+        filePath
+      );
+      return {
+        hasVideo: metadata.hasVideo,
+        width: metadata.width,
+        height: metadata.height,
+        duration: metadata.duration,
+        codec: metadata.codec,
+        fps: metadata.fps,
+      };
+    } catch (error) {
+      logger.error("Failed to get video metadata", {
+        path: filePath,
+        error: error instanceof Error ? error.message : "Unknown error",
       });
-    });
+      throw error;
+    }
   }
 
   public async validateMusicFile(filePath: string): Promise<boolean> {
