@@ -56,34 +56,12 @@ export const MAP_CAPTURE_CONFIG = {
    * FFmpeg configuration settings for video generation
    */
   FFMPEG: {
-    /** Video codec to use */
-    CODEC: "libx264",
-    /** Encoding preset (faster = lower quality but more reliable) */
-    PRESET: "medium", // Changed from "slow" to more reliable "medium"
-    /** Constant Rate Factor (lower = better quality, 18-23 is good range) */
-    CRF: "23", // Less aggressive quality setting
-    /** Frame rate for output video */
     FPS: "30",
-    /** Output format */
-    FORMAT: "mp4",
-    /** Pixel format */
+    DURATION: "2", // Update to match 60 frames at 30 FPS (2 seconds)
+    CODEC: "libx264",
+    PRESET: "medium",
+    CRF: "23",
     PIXEL_FORMAT: "yuv420p",
-    /** Additional output options */
-    OUTPUT_OPTIONS: [
-      "-movflags",
-      "+faststart",
-      "-profile:v",
-      "main", // Changed from high to more compatible main profile
-      "-level",
-      "4.0",
-      "-max_muxing_queue_size",
-      "9999", // Prevents muxing errors
-      "-tune",
-      "fastdecode", // Optimizes for playback compatibility
-    ],
-    /** Video duration in seconds */
-    DURATION: "3",
-    /** Bitrate for better compatibility */
-    BITRATE: "2M", // Fixed bitrate option for better compatibility
+    BITRATE: "2M",
   },
 };

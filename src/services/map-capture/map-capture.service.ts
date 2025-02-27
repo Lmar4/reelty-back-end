@@ -26,6 +26,7 @@ import puppeteer, { Browser, Page } from "puppeteer";
 import { logger } from "../../utils/logger.js";
 import { tempFileManager } from "../storage/temp-file.service.js";
 import { MAP_CAPTURE_CONFIG } from "./map-capture.config.js";
+import { videoValidationService } from "../video/video-validation.service.js";
 
 // Declare types for Google Maps objects
 declare global {
@@ -416,20 +417,26 @@ export class MapCaptureService {
       const tempOutputPath = await tempFileManager.createFile("map_temp.mp4");
       const { FFMPEG } = MAP_CAPTURE_CONFIG;
 
+      // Calculate total frames for progress tracking
+      const frames = await fsPromises.readdir(framesDir);
+      const totalFrames = frames.filter((f) => f.startsWith("frame_")).length;
+      const expectedDuration = parseInt(FFMPEG.DURATION);
+
       return new Promise((resolve, reject) => {
         logger.info("Starting FFmpeg processing", {
           framesDir,
           outputPath: outputPath.path,
+          totalFrames,
+          expectedDuration,
           ffmpegConfig: {
             fps: FFMPEG.FPS,
             codec: FFMPEG.CODEC,
             preset: FFMPEG.PRESET,
             crf: FFMPEG.CRF,
-            duration: FFMPEG.DURATION,
           },
         });
 
-        // First pass - create video with consistent settings
+        // First pass - create video with more explicit settings
         ffmpeg()
           .input(path.join(framesDir, "frame_%02d.jpg"))
           .inputFPS(parseInt(FFMPEG.FPS))
@@ -447,25 +454,38 @@ export class MapCaptureService {
             FFMPEG.PIXEL_FORMAT,
             "-t",
             FFMPEG.DURATION,
-            ...FFMPEG.OUTPUT_OPTIONS,
+            "-vf",
+            "format=yuv420p", // Explicitly force pixel format
+            "-movflags",
+            "+faststart",
+            "-profile:v",
+            "main",
+            "-level",
+            "4.0",
+            "-frames:v",
+            totalFrames.toString(), // Explicitly set frame count
+            "-vsync",
+            "1", // Force frame sync
           ])
           .on("progress", (progress) => {
+            // Calculate progress based on frames
+            const percent = Math.min(
+              100,
+              (progress.frames / totalFrames) * 100
+            );
             logger.info("FFmpeg progress", {
               frames: progress.frames,
+              totalFrames,
               currentFps: progress.currentFps,
-              percent: progress.percent,
+              percent: percent.toFixed(1) + "%",
               targetSize: progress.targetSize,
             });
           })
           .on("end", async () => {
             try {
-              // Validate the video exists and has proper size
+              // Validate the intermediate output
               const stats = await fsPromises.stat(tempOutputPath.path);
               if (stats.size < 10000) {
-                logger.error("Generated video file too small", {
-                  path: tempOutputPath.path,
-                  size: stats.size,
-                });
                 reject(new Error("Generated video file too small"));
                 return;
               }
@@ -478,10 +498,20 @@ export class MapCaptureService {
                   FFMPEG.CODEC,
                   "-b:v",
                   FFMPEG.BITRATE,
+                  "-maxrate",
+                  FFMPEG.BITRATE,
+                  "-bufsize",
+                  "2M",
                   "-movflags",
                   "+faststart",
                   "-pix_fmt",
                   FFMPEG.PIXEL_FORMAT,
+                  "-vf",
+                  "format=yuv420p", // Force format again
+                  "-frames:v",
+                  totalFrames.toString(),
+                  "-vsync",
+                  "1",
                 ])
                 .on("end", async () => {
                   try {
@@ -490,13 +520,6 @@ export class MapCaptureService {
                     await fsPromises
                       .unlink(tempOutputPath.path)
                       .catch(() => {});
-
-                    // Validate final output
-                    const finalStats = await fsPromises.stat(outputPath.path);
-                    logger.info("Map video created successfully", {
-                      outputPath: outputPath.path,
-                      fileSize: finalStats.size,
-                    });
 
                     // Close browser resources
                     if (page)
@@ -558,13 +581,22 @@ export class MapCaptureService {
     try {
       const stats = await fsPromises.stat(filePath);
       const age = Date.now() - stats.mtime.getTime();
-      const isValid = age < this.CACHE_DURATION_MS;
+      const isValidAge = age < this.CACHE_DURATION_MS;
+
+      // Validate video content
+      const metadata = await videoValidationService.validateVideo(filePath);
+      const isValidContent = Boolean(
+        metadata.hasVideo && metadata.width && metadata.height
+      );
+
+      const isValid = Boolean(isValidAge && isValidContent);
 
       logger.info("Cache validation result:", {
         filePath,
-        age: Math.round(age / 1000), // Convert to seconds for readability
+        age: Math.round(age / 1000),
         maxAge: Math.round(this.CACHE_DURATION_MS / 1000),
         isValid,
+        metadata, // Log metadata for debugging
       });
 
       return isValid;
@@ -589,67 +621,104 @@ export class MapCaptureService {
    */
   public async generateMapVideo(
     coordinates: { lat: number; lng: number },
-    jobId: string
+    jobId: string,
+    maxRetries = 3
   ): Promise<string> {
     const cacheKey = this.generateMapCacheKey(coordinates);
     const cachedPath = path.join(this.CACHE_DIR, `map-${cacheKey}.mp4`);
     const framesDir = path.join(this.CACHE_DIR, `frames-${cacheKey}`);
 
-    try {
-      // Check if cached file exists and is valid
-      if (await this.validateCachedFile(cachedPath)) {
-        logger.info(`[${jobId}] Cache hit for map video`, {
-          cacheKey,
-          coordinates,
-          cachedPath,
-        });
-        return cachedPath;
-      }
-
-      logger.info(`[${jobId}] Cache miss for map video, generating new`, {
-        cacheKey,
-        coordinates,
-      });
-
-      // Ensure frames directory exists
-      await fsPromises.mkdir(framesDir, { recursive: true });
-
-      // Generate new map video
-      const browser = await puppeteer.launch({
-        headless: true,
-        args: MAP_CAPTURE_CONFIG.BROWSER_ARGS,
-      });
-      const page = await browser.newPage();
-
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        await this.captureMapFrames(coordinates, page);
-        const videoPath = await this.createVideo(framesDir, browser, page);
+        if (await this.validateCachedFile(cachedPath)) {
+          logger.info(`[${jobId}] Cache hit for map video`, {
+            cacheKey,
+            coordinates,
+            cachedPath,
+          });
+          return cachedPath;
+        }
 
-        // Copy to cache location
-        await fsPromises.copyFile(videoPath, cachedPath);
+        logger.info(
+          `[${jobId}] Cache miss for map video, generating new (attempt ${attempt}/${maxRetries})`,
+          {
+            cacheKey,
+            coordinates,
+          }
+        );
 
-        return cachedPath;
-      } finally {
-        // Cleanup resources
-        await this.clearPageResources(page).catch((err) => {
-          logger.warn("Error clearing page resources:", {
+        const browser = await puppeteer.launch({
+          headless: true,
+          args: MAP_CAPTURE_CONFIG.BROWSER_ARGS,
+        });
+        const page = await browser.newPage();
+
+        try {
+          await this.captureMapFrames(coordinates, page);
+          const videoPath = await this.createVideo(framesDir, browser, page);
+
+          // Validate the video immediately
+          const metadata = await videoValidationService.validateVideo(
+            videoPath
+          );
+          if (!metadata.hasVideo || !metadata.width || !metadata.height) {
+            throw new Error("Generated video has no valid content");
+          }
+
+          await fsPromises.copyFile(videoPath, cachedPath);
+          return cachedPath;
+        } finally {
+          await this.clearPageResources(page).catch((err) => {
+            logger.warn("Error clearing page resources:", {
+              error: err instanceof Error ? err.message : "Unknown error",
+            });
+          });
+          await browser.close().catch((err) => {
+            logger.warn("Error closing browser:", {
+              error: err instanceof Error ? err.message : "Unknown error",
+            });
+          });
+        }
+      } catch (error) {
+        logger.warn(
+          `[${jobId}] Map video generation attempt ${attempt} failed`,
+          {
+            error: error instanceof Error ? error.message : "Unknown error",
+            coordinates,
+            cacheKey,
+          }
+        );
+
+        if (attempt === maxRetries) {
+          throw error;
+        }
+
+        // Cleanup any temporary files from this attempt
+        await this.cleanupFrames(framesDir).catch((err) => {
+          logger.warn("Failed to cleanup frames after retry:", {
             error: err instanceof Error ? err.message : "Unknown error",
+            framesDir,
           });
         });
-        await browser.close().catch((err) => {
-          logger.warn("Error closing browser:", {
+        await fsPromises.unlink(cachedPath).catch((err) => {
+          logger.warn("Failed to cleanup cached file after retry:", {
             error: err instanceof Error ? err.message : "Unknown error",
+            cachedPath,
           });
         });
+
+        // Wait with exponential backoff before retry
+        const delay = Math.min(
+          1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random()),
+          5000
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
-    } catch (error) {
-      logger.error(`[${jobId}] Error generating map video`, {
-        error: error instanceof Error ? error.message : "Unknown error",
-        coordinates,
-        cacheKey,
-      });
-      throw error;
     }
+
+    throw new Error(
+      `Failed to generate valid map video after ${maxRetries} attempts`
+    );
   }
 
   /**
@@ -684,6 +753,50 @@ export class MapCaptureService {
         },
       };
     }
+  }
+
+  private async validateWithRetry(
+    filePath: string,
+    maxRetries = 3,
+    delayMs = 1000
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const validationResult = await videoValidationService.validateVideo(
+          filePath
+        );
+
+        if (validationResult.hasVideo) {
+          logger.info("Video validation successful", {
+            attempt,
+            path: filePath,
+            metadata: validationResult,
+          });
+          return true;
+        }
+
+        logger.warn("Video validation attempt failed", {
+          attempt,
+          path: filePath,
+          metadata: validationResult,
+        });
+
+        if (attempt < maxRetries) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      } catch (error) {
+        logger.error("Video validation error", {
+          attempt,
+          path: filePath,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+
+        if (attempt === maxRetries) throw error;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    return false;
   }
 }
 
