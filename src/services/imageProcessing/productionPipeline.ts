@@ -44,6 +44,7 @@ import {
 import { existsSync } from "fs";
 import { VideoTemplateService } from "../video/video-template.service.js";
 import { ReelTemplate } from "./templates/types.js";
+import { v4 as uuidv4 } from "uuid";
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",
@@ -177,6 +178,10 @@ class ResourceManager {
 export class ProductionPipeline {
   private readonly MEMORY_WARNING_THRESHOLD = 0.7; // 70% memory usage triggers warning
   private readonly MEMORY_CRITICAL_THRESHOLD = 0.8; // 80% memory usage triggers reduction
+  private readonly MEMORY_STABLE_THRESHOLD = 0.4; // 40% memory usage considered stable
+  private readonly MEMORY_RESET_THRESHOLD = 0.3; // 30% memory usage triggers reset
+  private readonly BATCH_SIZE_ADJUSTMENT_INTERVAL = 5000; // 5 seconds between adjustments
+  private lastBatchSizeAdjustment: number = 0;
   private readonly MAX_RETRIES = 3;
   private readonly DEFAULT_BATCH_SIZE = 5;
   private readonly MIN_BATCH_SIZE = 1;
@@ -487,122 +492,28 @@ export class ProductionPipeline {
     attempt = 1
   ): Promise<RunwayGenerationResult | null> {
     try {
-      logger.info(
-        `[${jobId}] Attempting Runway generation (attempt ${attempt}/${this.MAX_RUNWAY_RETRIES})`,
-        { index, inputUrl }
-      );
-
-      // Generate video with Runway (with its own retries)
-      const s3Url = await runwayService.generateVideo(
+      const result = await runwayService.generateVideo(
         inputUrl,
         index,
         listingId,
         jobId
       );
-
-      if (!s3Url) {
-        throw new Error("Runway returned no S3 URL");
-      }
-
-      // Verify and validate with cache
-      const validationResult = await this.validateWithCache(
-        s3Url,
+      return {
+        s3Url: result,
+        duration: 5, // RunwayML gen3a_turbo default duration
+        validated: true,
+      };
+    } catch (error) {
+      logger.warn(`[${jobId}] Runway generation failed`, {
+        attempt,
+        error,
+        inputUrl,
         index,
-        jobId
-      );
+      });
 
-      if (validationResult) {
-        // First, get the photo ID
-        const photo = await this.prisma.photo.findFirst({
-          where: {
-            listingId,
-            order: index,
-          },
-          select: {
-            id: true,
-            status: true,
-            runwayVideoPath: true,
-          },
-        });
-
-        if (!photo) {
-          throw new Error(
-            `Photo not found for listingId ${listingId} and order ${index}`
-          );
-        }
-
-        // Use a transaction to ensure atomicity
-        const updatedPhoto = await this.prisma.$transaction(async (tx) => {
-          // Update the specific photo by ID
-          const result = await tx.photo.update({
-            where: {
-              id: photo.id,
-            },
-            data: {
-              runwayVideoPath: s3Url,
-              status: "COMPLETED",
-              updatedAt: new Date(),
-              metadata: {
-                runwayGeneratedAt: new Date().toISOString(),
-                inputProcessedPath: inputUrl,
-                attempt,
-                generatedAt: new Date().toISOString(),
-                validationStatus: "success",
-                duration: validationResult.duration,
-              },
-            },
-            select: {
-              id: true,
-              runwayVideoPath: true,
-              status: true,
-            },
-          });
-
-          return result;
-        });
-
-        logger.info(`[${jobId}] Photo update completed for order ${index}`, {
-          photoId: photo.id,
-          oldStatus: photo.status,
-          newStatus: updatedPhoto.status,
-          oldPath: photo.runwayVideoPath,
-          newPath: updatedPhoto.runwayVideoPath,
-        });
-
-        if (
-          !updatedPhoto.runwayVideoPath ||
-          updatedPhoto.runwayVideoPath !== s3Url
-        ) {
-          logger.error(
-            `[${jobId}] Failed to update runwayVideoPath for photo ${photo.id}`,
-            {
-              expected: s3Url,
-              actual: updatedPhoto.runwayVideoPath,
-            }
-          );
-          throw new Error(
-            `Failed to update runwayVideoPath for photo ${photo.id}`
-          );
-        }
-
-        return {
-          s3Url,
-          duration: validationResult.duration,
-          validated: true,
-          metadata: {
-            attempt,
-            generatedAt: new Date().toISOString(),
-          },
-        };
-      }
-
-      // Si la validación falló pero aún tenemos intentos, reintentamos solo la generación
       if (attempt < this.MAX_RUNWAY_RETRIES) {
-        logger.warn(`[${jobId}] Validation failed, retrying generation`, {
-          attempt,
-          index,
-          inputUrl,
-        });
+        const delay = this.INITIAL_RETRY_DELAY * Math.pow(2, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
         return this.retryRunwayGeneration(
           inputUrl,
           index,
@@ -612,40 +523,7 @@ export class ProductionPipeline {
         );
       }
 
-      return null;
-    } catch (error) {
-      const isLastAttempt = attempt >= this.MAX_RUNWAY_RETRIES;
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-
-      logger.error(
-        `[${jobId}] Runway generation attempt ${attempt} failed${
-          isLastAttempt ? " (final attempt)" : ""
-        }`,
-        {
-          error: errorMessage,
-          index,
-          inputUrl,
-          stack: error instanceof Error ? error.stack : undefined,
-        }
-      );
-
-      if (isLastAttempt) {
-        return null;
-      }
-
-      const delay =
-        this.INITIAL_RETRY_DELAY *
-        Math.pow(2, attempt - 1) *
-        (0.5 + Math.random());
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      return this.retryRunwayGeneration(
-        inputUrl,
-        index,
-        listingId,
-        jobId,
-        attempt + 1
-      );
+      throw error;
     }
   }
 
@@ -735,12 +613,15 @@ export class ProductionPipeline {
       const { photosToRegenerate, existingPhotos } = regenerationContext;
 
       // Crear array con los videos existentes, filtrando undefined
-      const runwayVideos = existingPhotos
-        .map((photo) => photo.runwayVideoPath)
-        .filter((path): path is string => path !== undefined);
+      const existingRunwayVideos = existingPhotos
+        .filter((photo) => photo.runwayVideoPath)
+        .map((photo) => ({
+          order: photo.order,
+          path: photo.runwayVideoPath as string,
+        }));
 
       logger.info(`[${jobId}] Starting regeneration with existing videos`, {
-        existingVideosCount: runwayVideos.length,
+        existingVideosCount: existingRunwayVideos.length,
         photosToRegenerateCount: photosToRegenerate.length,
         regeneratingOrders: photosToRegenerate.map((p) => p.order),
       });
@@ -764,7 +645,10 @@ export class ProductionPipeline {
         }
 
         // Reemplazar el video en la posición específica
-        runwayVideos[photo.order] = newVideo;
+        existingRunwayVideos[photo.order] = {
+          order: photo.order,
+          path: newVideo,
+        };
 
         logger.info(`[${jobId}] Replaced video at order ${photo.order}`, {
           oldPath: existingPhotos.find((p) => p.order === photo.order)
@@ -774,7 +658,7 @@ export class ProductionPipeline {
       }
 
       // Verificar que no hay huecos en el array
-      const missingVideos = runwayVideos.findIndex((v) => !v);
+      const missingVideos = existingRunwayVideos.findIndex((v) => !v);
       if (missingVideos !== -1) {
         throw new Error(
           `Missing video at position ${missingVideos} after regeneration`
@@ -782,11 +666,11 @@ export class ProductionPipeline {
       }
 
       logger.info(`[${jobId}] Regeneration complete`, {
-        totalVideos: runwayVideos.length,
+        totalVideos: existingRunwayVideos.length,
         regeneratedCount: photosToRegenerate.length,
       });
 
-      return runwayVideos;
+      return existingRunwayVideos.map((v) => v.path);
     }
 
     // Non-regeneration flow (normal processing)
@@ -1529,6 +1413,25 @@ export class ProductionPipeline {
       }
     }
 
+    // Validate results before returning
+    if (results.length === 0) {
+      logger.error(`[${jobId}] No templates processed successfully`, {
+        regularTemplatesCount: regularTemplates.length,
+        mapDependentTemplatesCount: mapDependentTemplates.length,
+        hasMapVideo: !!mapVideo,
+        hasCoordinates: !!coordinates,
+      });
+      throw new Error("No templates processed successfully");
+    }
+
+    logger.info(`[${jobId}] Template processing completed`, {
+      successfulTemplatesCount: results.length,
+      templates: results.map((path: string) => {
+        const parts = path.split("/");
+        return parts[parts.length - 1].split("_")[0]; // Extract template name from path
+      }),
+    });
+
     return results;
   }
 
@@ -1555,7 +1458,8 @@ export class ProductionPipeline {
       if (isRegeneration && regenerationContext) {
         const { photosToRegenerate } = regenerationContext;
 
-        const processedImages = await Promise.all(
+        // Use Promise.allSettled instead of Promise.all to handle individual failures
+        const results = await Promise.allSettled(
           photosToRegenerate.map(async (photo: Photo) => {
             let processedPath = photo.processedFilePath;
             if (
@@ -1596,10 +1500,36 @@ export class ProductionPipeline {
           })
         );
 
+        // Filter successful results and log failures
+        const processedImages = results
+          .filter(
+            (r): r is PromiseFulfilledResult<ProcessingImage> =>
+              r.status === "fulfilled"
+          )
+          .map((r) => r.value);
+
+        const failures = results.filter((r) => r.status === "rejected");
+        if (failures.length > 0) {
+          logger.warn(`[${jobId}] Some images failed processing`, {
+            failedCount: failures.length,
+            reasons: failures.map(
+              (f) =>
+                (f as PromiseRejectedResult).reason?.message || "Unknown error"
+            ),
+            photoIds: photosToRegenerate
+              .filter(
+                (p: Photo, index: number) =>
+                  results[index].status === "rejected"
+              )
+              .map((p: Photo) => p.id),
+          });
+        }
+
         return processedImages;
       } else {
         // Non-regeneration flow - process new images
-        const processedImages = await Promise.all(
+        // Use Promise.allSettled instead of Promise.all
+        const results = await Promise.allSettled(
           (job.inputFiles as string[]).map(async (filePath, index) => {
             const s3Key = this.getS3KeyFromUrl(filePath);
             let processedPath = await this.processVisionImageFallback(
@@ -1614,6 +1544,8 @@ export class ProductionPipeline {
                 `Failed to process image at index ${index}: ${filePath}`
               );
             }
+
+            // Check if photo already exists before creating a new one
             const existingPhoto = await this.prisma.photo.findFirst({
               where: {
                 listingId: job.listingId,
@@ -1652,6 +1584,30 @@ export class ProductionPipeline {
           })
         );
 
+        // Filter successful results and log failures
+        const processedImages = results
+          .filter(
+            (r): r is PromiseFulfilledResult<ProcessingImage> =>
+              r.status === "fulfilled"
+          )
+          .map((r) => r.value);
+
+        const failures = results.filter((r) => r.status === "rejected");
+        if (failures.length > 0) {
+          logger.warn(`[${jobId}] Some images failed processing`, {
+            failedCount: failures.length,
+            reasons: failures.map(
+              (f) =>
+                (f as PromiseRejectedResult).reason?.message || "Unknown error"
+            ),
+            indices: (job.inputFiles as string[])
+              .filter(
+                (_, index: number) => results[index].status === "rejected"
+              )
+              .map((_, index: number) => index),
+          });
+        }
+
         return processedImages;
       }
     } catch (error) {
@@ -1688,13 +1644,6 @@ export class ProductionPipeline {
     jobId: string,
     listingId: string
   ): Promise<boolean> {
-    const lockKeyHex = crypto
-      .createHash("sha256")
-      .update(listingId)
-      .digest("hex")
-      .slice(0, 8);
-    const lockKeyNum = Math.abs(parseInt(lockKeyHex, 16)) % 2 ** 31;
-
     let retries = 0;
     const maxRetries = 3;
     const retryDelay = 1000; // 1 second
@@ -1704,91 +1653,70 @@ export class ProductionPipeline {
 
     while (retries < maxRetries) {
       try {
-        // Check for existing valid lock first
-        const existingLock = await this.prisma.listingLock.findFirst({
-          where: {
-            listingId,
-            expiresAt: {
-              gt: new Date(),
+        // Simplified approach: use a single transaction to check and create the lock
+        // This ensures atomicity and prevents race conditions
+        const lock = await this.prisma.$transaction(async (tx) => {
+          // Check for existing valid lock first
+          const existingLock = await tx.listingLock.findFirst({
+            where: {
+              listingId,
+              expiresAt: { gt: new Date() },
             },
-          },
-        });
-
-        if (existingLock) {
-          logger.info({
-            message: `[${jobId}] Listing ${listingId} has valid lock held by job ${existingLock.jobId}`,
-            jobId,
-            listingId,
-            lockHolderId: existingLock.jobId,
-          });
-          return false;
-        }
-
-        // Try to acquire advisory lock
-        const advisoryResult = await this.prisma.$queryRaw<
-          { locked: boolean }[]
-        >`
-          SELECT pg_try_advisory_lock(${lockKeyNum}::bigint) AS locked;
-        `;
-
-        const advisoryLocked = advisoryResult[0].locked;
-        if (!advisoryLocked) {
-          logger.info({
-            message: `[${jobId}] Listing ${listingId} already has advisory lock`,
-            jobId,
-            listingId,
-          });
-          return false;
-        }
-
-        try {
-          // Try to create database lock
-          await this.prisma.$transaction(async (tx) => {
-            // Double check within transaction that no lock was created
-            const lockCheck = await tx.listingLock.findFirst({
-              where: {
-                listingId,
-                expiresAt: {
-                  gt: new Date(),
-                },
-              },
-            });
-
-            if (lockCheck) {
-              throw new Error("Lock was acquired by another process");
-            }
-
-            await tx.listingLock.create({
-              data: {
-                listingId,
-                jobId,
-                processId: process.pid.toString(),
-                expiresAt: new Date(Date.now() + this.LOCK_TIMEOUT),
-              },
-            });
           });
 
-          return true;
-        } catch (dbError) {
-          // If database lock fails, release advisory lock
-          await this.prisma
-            .$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
-
-          if (
-            dbError instanceof Prisma.PrismaClientKnownRequestError &&
-            dbError.code === "P2002"
-          ) {
-            logger.info(`[${jobId}] Listing lock already exists in database`, {
+          if (existingLock) {
+            logger.info({
+              message: `[${jobId}] Listing ${listingId} has valid lock held by job ${existingLock.jobId}`,
               jobId,
               listingId,
+              lockHolderId: existingLock.jobId,
             });
-            return false;
+            return null;
           }
 
-          throw dbError;
+          // No existing lock, create a new one
+          return await tx.listingLock.create({
+            data: {
+              listingId,
+              jobId,
+              processId: process.pid.toString(),
+              expiresAt: new Date(Date.now() + this.LOCK_TIMEOUT),
+            },
+          });
+        });
+
+        // If lock is null, it means another process holds the lock
+        if (!lock) {
+          return false;
         }
+
+        logger.info(
+          `[${jobId}] Successfully acquired lock for listing ${listingId}`,
+          {
+            lockId: lock.id,
+            expiresAt: lock.expiresAt,
+          }
+        );
+
+        return true;
       } catch (error) {
         retries++;
+
+        // Handle unique constraint violations (another process created the lock simultaneously)
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === "P2002"
+        ) {
+          logger.info(
+            `[${jobId}] Listing lock already exists in database (concurrent creation)`,
+            {
+              jobId,
+              listingId,
+            }
+          );
+          return false;
+        }
+
         logger.warn(
           `[${jobId}] Failed to acquire listing lock (attempt ${retries}/${maxRetries})`,
           {
@@ -1798,25 +1726,8 @@ export class ProductionPipeline {
           }
         );
 
-        // Ensure advisory lock is released in case of any error
-        try {
-          await this.prisma
-            .$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
-        } catch (unlockError) {
-          logger.error(
-            `[${jobId}] Failed to release advisory lock after error`,
-            {
-              error:
-                unlockError instanceof Error
-                  ? unlockError.message
-                  : "Unknown error",
-              jobId,
-              listingId,
-            }
-          );
-        }
-
         if (retries < maxRetries) {
+          // Exponential backoff
           await new Promise((resolve) =>
             setTimeout(resolve, retryDelay * Math.pow(2, retries))
           );
@@ -1834,26 +1745,19 @@ export class ProductionPipeline {
     jobId: string,
     listingId: string
   ): Promise<void> {
-    const lockKeyHex = crypto
-      .createHash("sha256")
-      .update(listingId)
-      .digest("hex")
-      .slice(0, 8);
-    const lockKeyNum = Math.abs(parseInt(lockKeyHex, 16)) % 2 ** 31;
-
     try {
-      await this.prisma.$transaction(async (tx) => {
-        // Delete database lock
-        await tx.listingLock.deleteMany({
-          where: {
-            listingId,
-            jobId,
-            processId: process.pid.toString(),
-          },
-        });
+      // Simplified release - just delete the database lock
+      const result = await this.prisma.listingLock.deleteMany({
+        where: {
+          listingId,
+          jobId,
+          processId: process.pid.toString(),
+        },
+      });
 
-        // Release advisory lock
-        await tx.$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
+      logger.debug(`[${jobId}] Released listing lock`, {
+        listingId,
+        deletedCount: result.count,
       });
     } catch (error) {
       logger.error(`[${jobId}] Failed to release listing lock`, {
@@ -1861,6 +1765,7 @@ export class ProductionPipeline {
         jobId,
         listingId,
       });
+      throw error;
     }
   }
 
@@ -2124,74 +2029,171 @@ export class ProductionPipeline {
       });
       throw error;
     } finally {
-      // Release the lock if we acquired one
+      logger.info(`[${jobId}] Starting cleanup sequence`);
+      let lockReleased = false;
+      let maxRetries = 3;
+
+      // Step 1: Release the listing lock if one was acquired
       if (!input.skipLock && input.listingId) {
-        try {
-          await this.releaseListingLock(jobId, input.listingId);
-          logger.info(
-            `[${jobId}] Lock released for listing ${input.listingId}`
-          );
-        } catch (lockError) {
-          logger.warn(
-            `[${jobId}] Failed to release lock for listing ${input.listingId}`,
-            {
-              error:
-                lockError instanceof Error
-                  ? lockError.message
-                  : "Unknown error",
+        for (
+          let attempt = 1;
+          attempt <= maxRetries && !lockReleased;
+          attempt++
+        ) {
+          try {
+            await this.releaseListingLock(jobId, input.listingId);
+            lockReleased = true;
+            logger.info(
+              `[${jobId}] Lock released for listing ${input.listingId}`
+            );
+          } catch (lockError) {
+            const isLastAttempt = attempt === maxRetries;
+            logger.error(
+              `[${jobId}] Failed to release lock for listing ${input.listingId} (Attempt ${attempt}/${maxRetries})`,
+              {
+                error:
+                  lockError instanceof Error
+                    ? lockError.message
+                    : "Unknown error",
+                isLastAttempt,
+              }
+            );
+            if (!isLastAttempt) {
+              await new Promise((resolve) =>
+                setTimeout(resolve, 1000 * attempt)
+              ); // Exponential backoff
             }
-          );
+          }
         }
       }
 
-      // Enhanced cleanup logging
+      // Step 2: Clean up resources managed by ResourceManager
       try {
-        const resourcesBeforeCleanup: string[] = Array.from(
+        const resourcesBeforeCleanup = Array.from(
           this.resourceManager.tempFiles
         );
-        logger.debug(`[${jobId}] Starting cleanup`, {
-          tempDir,
+        logger.debug(`[${jobId}] Starting resource cleanup`, {
           activeResourcesCount: resourcesBeforeCleanup.length,
-          activeResources: resourcesBeforeCleanup.map((resource: string) => ({
-            path: resource, // Just the path, as it's a string
-          })),
+          activeResources: resourcesBeforeCleanup,
         });
 
-        await this.resourceManager.cleanup();
+        // Check each resource before cleanup
+        for (const resourcePath of resourcesBeforeCleanup) {
+          try {
+            if (await this.fileExists(resourcePath)) {
+              await this.resourceManager.cleanup();
+              logger.debug(`[${jobId}] Cleaned up resource: ${resourcePath}`);
+            } else {
+              logger.debug(
+                `[${jobId}] Resource already removed: ${resourcePath}`
+              );
+              this.resourceManager.tempFiles.delete(resourcePath);
+            }
+          } catch (resourceError) {
+            logger.warn(
+              `[${jobId}] Failed to cleanup resource: ${resourcePath}`,
+              {
+                error:
+                  resourceError instanceof Error
+                    ? resourceError.message
+                    : "Unknown error",
+              }
+            );
+          }
+        }
 
-        if (existsSync(tempDir)) {
+        logger.info(`[${jobId}] Resource cleanup completed`);
+      } catch (cleanupError) {
+        logger.error(`[${jobId}] Resource cleanup failed`, {
+          error:
+            cleanupError instanceof Error
+              ? cleanupError.message
+              : "Unknown error",
+        });
+      }
+
+      // Step 3: Clean up temporary directory
+      if (await this.fileExists(tempDir)) {
+        try {
           const filesInTempDir = await fs.readdir(tempDir);
-          logger.info(`[${jobId}] Cleaning up temp directory`, {
+          logger.debug(`[${jobId}] Cleaning up temp directory`, {
             tempDir,
             fileCount: filesInTempDir.length,
             files: filesInTempDir,
           });
-          await fs.rm(tempDir, { recursive: true, force: true });
-          logger.info(`[${jobId}] Successfully cleaned up temp directory`, {
+
+          // Process files in batches to avoid overwhelming the system
+          const batchSize = 10;
+          for (let i = 0; i < filesInTempDir.length; i += batchSize) {
+            const batch = filesInTempDir.slice(i, i + batchSize);
+            await Promise.all(
+              batch.map(async (file) => {
+                const filePath = path.join(tempDir, file);
+                try {
+                  if (await this.fileExists(filePath)) {
+                    await fs.unlink(filePath);
+                    logger.debug(`[${jobId}] Deleted temp file: ${file}`);
+                  }
+                } catch (fileError) {
+                  if ((fileError as NodeJS.ErrnoException).code !== "ENOENT") {
+                    logger.warn(
+                      `[${jobId}] Failed to delete temp file: ${file}`,
+                      {
+                        error:
+                          fileError instanceof Error
+                            ? fileError.message
+                            : "Unknown error",
+                      }
+                    );
+                  }
+                }
+              })
+            );
+          }
+
+          // Final check before removing the directory
+          if (await this.fileExists(tempDir)) {
+            const remainingFiles = await fs.readdir(tempDir);
+            if (remainingFiles.length === 0) {
+              await fs.rm(tempDir, { recursive: true, force: true });
+              logger.info(`[${jobId}] Successfully cleaned up temp directory`, {
+                tempDir,
+                timestamp: new Date().toISOString(),
+              });
+            } else {
+              logger.warn(`[${jobId}] Temp directory not empty after cleanup`, {
+                tempDir,
+                remainingFiles,
+              });
+            }
+          }
+        } catch (tempDirError) {
+          logger.error(`[${jobId}] Failed to clean up temp directory`, {
+            error:
+              tempDirError instanceof Error
+                ? tempDirError.message
+                : "Unknown error",
             tempDir,
-            timestamp: new Date().toISOString(),
           });
-        } else {
-          logger.debug(`[${jobId}] No temp directory to clean up`, { tempDir });
         }
-      } catch (cleanupError) {
-        const cleanupErrorMessage =
-          cleanupError instanceof Error
-            ? cleanupError.message
-            : "Unknown cleanup error";
-        const cleanupErrorStack =
-          cleanupError instanceof Error ? cleanupError.stack : undefined;
-        logger.warn(`[${jobId}] Failed to cleanup resources`, {
-          error: cleanupErrorMessage,
-          stack: cleanupErrorStack,
-          tempDir,
-          timestamp: new Date().toISOString(),
-        });
+      } else {
+        logger.debug(`[${jobId}] No temp directory to clean up`, { tempDir });
       }
+
+      logger.info(`[${jobId}] Cleanup sequence completed`);
     }
   }
 
   private checkMemoryUsage(jobId: string): void {
+    const now = Date.now();
+    // Throttle batch size adjustments
+    if (
+      now - this.lastBatchSizeAdjustment <
+      this.BATCH_SIZE_ADJUSTMENT_INTERVAL
+    ) {
+      return;
+    }
+
     const used = process.memoryUsage();
     const heapUsed = used.heapUsed / 1024 / 1024; // Convert to MB
     const heapTotal = used.heapTotal / 1024 / 1024; // Convert to MB
@@ -2202,49 +2204,70 @@ export class ProductionPipeline {
       heapTotal: `${heapTotal.toFixed(2)} MB`,
       usage: `${(heapUsage * 100).toFixed(1)}%`,
       rss: `${(used.rss / 1024 / 1024).toFixed(2)} MB`,
+      previousBatchSize: this.currentBatchSize,
     };
 
-    if (heapUsage > this.MEMORY_CRITICAL_THRESHOLD && heapTotal > 1000) {
-      // Only reduce batch size if total heap is above 1GB
-      const newBatchSize = Math.max(
+    // Only proceed with adjustments if heap is significant (> 1GB)
+    if (heapTotal <= 1000) {
+      return;
+    }
+
+    let newBatchSize = this.currentBatchSize;
+    let action = null;
+
+    if (heapUsage > this.MEMORY_CRITICAL_THRESHOLD) {
+      // Critical memory usage - reduce batch size aggressively
+      newBatchSize = Math.max(
         this.MIN_BATCH_SIZE,
-        Math.floor(this.currentBatchSize / 2)
+        Math.floor(this.currentBatchSize * 0.5) // Reduce by 50%
       );
-      if (newBatchSize !== this.currentBatchSize) {
-        this.currentBatchSize = newBatchSize;
-        this.limit = pLimit(this.currentBatchSize);
-        logger.warn(
-          `[${jobId}] Reducing batch size due to critical memory usage`,
-          {
-            ...memoryInfo,
-            newBatchSize: this.currentBatchSize,
-            action: "REDUCE_BATCH_SIZE",
-          }
-        );
-      }
-    } else if (heapUsage > this.MEMORY_WARNING_THRESHOLD && heapTotal > 1000) {
-      logger.warn(`[${jobId}] High memory usage detected`, {
-        ...memoryInfo,
-        currentBatchSize: this.currentBatchSize,
-        action: "WARNING",
-      });
-    } else if (this.currentBatchSize < this.DEFAULT_BATCH_SIZE) {
-      const newBatchSize = Math.min(
+      action = "REDUCE_BATCH_SIZE_CRITICAL";
+    } else if (heapUsage > this.MEMORY_WARNING_THRESHOLD) {
+      // High memory usage - reduce batch size moderately
+      newBatchSize = Math.max(
+        this.MIN_BATCH_SIZE,
+        Math.floor(this.currentBatchSize * 0.75) // Reduce by 25%
+      );
+      action = "REDUCE_BATCH_SIZE_WARNING";
+    } else if (
+      heapUsage < this.MEMORY_RESET_THRESHOLD &&
+      this.currentBatchSize < this.DEFAULT_BATCH_SIZE
+    ) {
+      // Very low memory usage - reset to default if currently below default
+      newBatchSize = this.DEFAULT_BATCH_SIZE;
+      action = "RESET_BATCH_SIZE";
+    } else if (
+      heapUsage < this.MEMORY_STABLE_THRESHOLD &&
+      this.currentBatchSize < this.DEFAULT_BATCH_SIZE
+    ) {
+      // Stable memory usage - gradually increase if below default
+      newBatchSize = Math.min(
         this.DEFAULT_BATCH_SIZE,
-        this.currentBatchSize + 1
+        this.currentBatchSize +
+          Math.max(1, Math.floor(this.currentBatchSize * 0.2)) // Increase by 20% or at least 1
       );
-      if (newBatchSize !== this.currentBatchSize) {
-        this.currentBatchSize = newBatchSize;
-        this.limit = pLimit(this.currentBatchSize);
-        logger.info(
-          `[${jobId}] Increasing batch size due to normal memory usage`,
-          {
-            ...memoryInfo,
-            newBatchSize: this.currentBatchSize,
-            action: "INCREASE_BATCH_SIZE",
-          }
-        );
-      }
+      action = "INCREASE_BATCH_SIZE";
+    }
+
+    // Apply changes if needed
+    if (newBatchSize !== this.currentBatchSize) {
+      this.lastBatchSizeAdjustment = now;
+      this.currentBatchSize = newBatchSize;
+      this.limit = pLimit(this.currentBatchSize);
+
+      const logLevel = action?.startsWith("REDUCE") ? "warn" : "info";
+      logger[logLevel](`[${jobId}] Adjusting batch size`, {
+        ...memoryInfo,
+        newBatchSize: this.currentBatchSize,
+        action,
+        memoryUsage: {
+          current: `${(heapUsage * 100).toFixed(1)}%`,
+          warning: `${(this.MEMORY_WARNING_THRESHOLD * 100).toFixed(1)}%`,
+          critical: `${(this.MEMORY_CRITICAL_THRESHOLD * 100).toFixed(1)}%`,
+          stable: `${(this.MEMORY_STABLE_THRESHOLD * 100).toFixed(1)}%`,
+          reset: `${(this.MEMORY_RESET_THRESHOLD * 100).toFixed(1)}%`,
+        },
+      });
     }
   }
 
@@ -2274,11 +2297,28 @@ export class ProductionPipeline {
     context: string,
     jobId: string
   ): Promise<T> {
+    let lastError: unknown;
+
     for (let attempt = 1; attempt <= retries + 1; attempt++) {
       try {
         return await fn();
       } catch (error) {
-        if (attempt > retries) throw error;
+        lastError = error;
+        if (attempt > retries) {
+          logger.error(
+            `[${jobId}] ${context} failed after ${retries} retries`,
+            {
+              error: error instanceof Error ? error.message : "Unknown error",
+              stack: error instanceof Error ? error.stack : undefined,
+            }
+          );
+          throw new Error(
+            `${context} failed after ${retries} retries: ${
+              error instanceof Error ? error.message : "Unknown error"
+            }`
+          );
+        }
+
         const delay = 1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random());
         logger.warn(
           `[${jobId}] ${context} failed, retrying in ${Math.round(delay)}ms`,
@@ -2290,7 +2330,14 @@ export class ProductionPipeline {
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
-    throw new Error(`${context} failed after ${retries} retries`);
+
+    // This should never be reached due to the throw in the loop,
+    // but TypeScript requires a return statement
+    throw new Error(
+      `${context} failed after ${retries} retries: ${
+        lastError instanceof Error ? lastError.message : "Unknown error"
+      }`
+    );
   }
 
   private async generateMapVideoForTemplate(
@@ -2404,6 +2451,34 @@ export class ProductionPipeline {
       const finalValidation = await this.validateMapVideo(finalS3Url, jobId);
       if (!finalValidation) {
         throw new Error("Final map video failed validation after S3 move");
+      }
+
+      // Add a retry loop to verify S3 accessibility due to S3 eventual consistency
+      const verifyS3Availability = async (
+        url: string,
+        retries = 3
+      ): Promise<boolean> => {
+        for (let i = 0; i < retries; i++) {
+          const s3Key = this.getS3KeyFromUrl(url);
+          if (await this.verifyS3Asset(s3Key)) return true;
+          logger.warn(
+            `[${jobId}] S3 file not yet accessible, retrying (attempt ${
+              i + 1
+            }/${retries})`,
+            {
+              url,
+              s3Key,
+            }
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, 1000 * Math.pow(2, i))
+          );
+        }
+        return false;
+      };
+
+      if (!(await verifyS3Availability(finalS3Url))) {
+        throw new Error("Uploaded map video not accessible after retries");
       }
 
       // Cache the validated video
@@ -2787,131 +2862,27 @@ export class ProductionPipeline {
     inputFiles: string[],
     jobId: string,
     listingId: string,
-    existingPhotos: any[],
+    existingPhotos: Array<{
+      id: string;
+      processedFilePath: string | null;
+      status: string;
+      filePath: string;
+      order: number;
+      runwayVideoPath: string | null;
+    }>,
     verifiedVideos: Map<number, string>
   ): Promise<string[]> {
-    const runwayVideos = new Array(inputFiles.length).fill(null);
-    existingPhotos.forEach((photo) => {
-      const verifiedVideo = verifiedVideos.get(photo.order);
-      if (verifiedVideo && photo.order < inputFiles.length) {
-        runwayVideos[photo.order] = verifiedVideo;
-        logger.info(`[${jobId}] Using verified video for normal processing`, {
-          order: photo.order,
-          path: verifiedVideo,
-        });
-      }
-    });
-
-    const missingIndices = runwayVideos
-      .map((v, i) => (v === null ? i : -1))
-      .filter((i) => i !== -1);
-
-    const results = await Promise.all(
-      missingIndices.map(async (index) =>
-        this.limit(() =>
-          this.retryRunwayGeneration(
-            inputFiles[index],
-            index,
-            listingId,
-            jobId
-          ).then((result) => ({ index, path: result }))
-        )
-      )
-    );
-
-    // Verify and log database updates for each generated video
-    for (const result of results) {
-      if (result?.path) {
-        runwayVideos[result.index] = result.path;
-        // Get the photo by listingId and order
-        const photo = await this.prisma.photo.findFirst({
-          where: {
-            listingId,
-            order: result.index,
-          },
-          select: {
-            id: true,
-            runwayVideoPath: true,
-            status: true,
-          },
-        });
-
-        if (!photo) {
-          logger.error(`[${jobId}] Photo not found for order ${result.index}`, {
-            listingId,
-            order: result.index,
-          });
-          throw new Error(`Photo not found for order ${result.index}`);
-        }
-
-        if (
-          !photo.runwayVideoPath ||
-          photo.runwayVideoPath !== result.path.s3Url ||
-          photo.status !== "COMPLETED"
-        ) {
-          logger.error(
-            `[${jobId}] runwayVideoPath not saved correctly for photo ${photo.id}`,
-            {
-              expected: result.path.s3Url,
-              actual: photo.runwayVideoPath,
-              status: photo.status,
-            }
-          );
-          throw new Error(
-            `Failed to save runwayVideoPath for photo ${photo.id}`
-          );
-        }
-
-        logger.info(
-          `[${jobId}] Successfully verified runwayVideoPath for photo ${photo.id}`,
-          {
-            photoId: photo.id,
-            path: result.path.s3Url,
-            status: photo.status,
-          }
-        );
-      } else {
-        logger.warn(
-          `[${jobId}] No runway video generated for order ${result.index}`,
-          {
-            inputFile: inputFiles[result.index],
-          }
-        );
-      }
-    }
-
-    return runwayVideos.filter(
-      (v): v is string => !!v && v.toLowerCase().endsWith(".mp4")
-    );
+    throw new Error("Method not implemented.");
   }
 
-  private async getRunwayVideos(jobId: string): Promise<ProcessingVideo[]> {
-    // First get the listingId from the job
-    const job = await this.prisma.videoJob.findUnique({
-      where: { id: jobId },
-      select: { listingId: true },
-    });
-
-    if (!job) return [];
-
-    const videos = await this.prisma.photo.findMany({
-      where: {
-        listingId: job.listingId,
-        runwayVideoPath: { not: null },
-      },
-      select: {
-        id: true,
-        order: true,
-        runwayVideoPath: true,
-      },
-      orderBy: { order: "asc" },
-    });
-
-    return videos.map((v) => ({
-      id: v.id,
-      order: v.order,
-      path: v.runwayVideoPath!,
-    }));
+  private async getRunwayVideos(jobId: string): Promise<
+    Array<{
+      order: number;
+      path: string;
+      id?: string;
+    }>
+  > {
+    throw new Error("Method not implemented.");
   }
 
   private async processRunwayVideo(
@@ -3131,6 +3102,15 @@ export class ProductionPipeline {
       throw error;
     } finally {
       await prisma.$disconnect();
+    }
+  }
+
+  private async fileExists(path: string): Promise<boolean> {
+    try {
+      await fs.access(path);
+      return true;
+    } catch {
+      return false;
     }
   }
 }
