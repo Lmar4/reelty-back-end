@@ -1589,18 +1589,23 @@ export class ProductionPipeline {
       .slice(0, 8);
     const lockKeyNum = Math.abs(parseInt(lockKeyHex, 16)) % 2 ** 31;
 
-    try {
-      // Start a transaction to make lock acquisition atomic
-      return await this.prisma.$transaction(async (tx) => {
-        // Try to acquire advisory lock
-        const result = await tx.$queryRaw<{ locked: boolean }[]>`
+    let retries = 0;
+    const maxRetries = 3;
+    const retryDelay = 1000; // 1 second
+
+    while (retries < maxRetries) {
+      try {
+        // Try to acquire advisory lock first, outside the transaction
+        const advisoryResult = await this.prisma.$queryRaw<
+          { locked: boolean }[]
+        >`
           SELECT pg_try_advisory_lock(${lockKeyNum}::bigint) AS locked;
         `;
 
-        const locked = result[0].locked;
-        if (!locked) {
+        const advisoryLocked = advisoryResult[0].locked;
+        if (!advisoryLocked) {
           logger.info({
-            message: `[${jobId}] Listing ${listingId} already locked`,
+            message: `[${jobId}] Listing ${listingId} already has advisory lock`,
             jobId,
             listingId,
           });
@@ -1608,47 +1613,79 @@ export class ProductionPipeline {
         }
 
         try {
-          // Try to create database lock
-          await tx.listingLock.create({
-            data: {
-              listingId,
-              jobId,
-              processId: process.pid.toString(),
-              expiresAt: new Date(Date.now() + this.LOCK_TIMEOUT),
-            },
+          // If advisory lock acquired, try to create database lock in a separate transaction
+          await this.prisma.$transaction(async (tx) => {
+            await tx.listingLock.create({
+              data: {
+                listingId,
+                jobId,
+                processId: process.pid.toString(),
+                expiresAt: new Date(Date.now() + this.LOCK_TIMEOUT),
+              },
+            });
           });
 
           return true;
         } catch (dbError) {
-          // If database lock fails, release advisory lock
-          await tx.$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
+          // If database lock fails, release advisory lock and maybe retry
+          await this.prisma
+            .$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
+
+          if (
+            dbError instanceof Prisma.PrismaClientKnownRequestError &&
+            dbError.code === "P2002"
+          ) {
+            // Unique constraint violation - lock already exists
+            logger.info(`[${jobId}] Listing lock already exists in database`, {
+              jobId,
+              listingId,
+            });
+            return false;
+          }
+
           throw dbError;
         }
-      });
-    } catch (error) {
-      logger.error(`[${jobId}] Failed to acquire listing lock`, {
-        error: error instanceof Error ? error.message : "Unknown error",
-        jobId,
-        listingId,
-      });
+      } catch (error) {
+        retries++;
+        logger.warn(
+          `[${jobId}] Failed to acquire listing lock (attempt ${retries}/${maxRetries})`,
+          {
+            error: error instanceof Error ? error.message : "Unknown error",
+            jobId,
+            listingId,
+          }
+        );
 
-      // Ensure advisory lock is released in case transaction failed
-      try {
-        await this.prisma
-          .$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
-      } catch (unlockError) {
-        logger.error(`[${jobId}] Failed to release advisory lock after error`, {
-          error:
-            unlockError instanceof Error
-              ? unlockError.message
-              : "Unknown error",
-          jobId,
-          listingId,
-        });
+        // Ensure advisory lock is released in case of any error
+        try {
+          await this.prisma
+            .$queryRaw`SELECT pg_advisory_unlock(${lockKeyNum}::bigint)`;
+        } catch (unlockError) {
+          logger.error(
+            `[${jobId}] Failed to release advisory lock after error`,
+            {
+              error:
+                unlockError instanceof Error
+                  ? unlockError.message
+                  : "Unknown error",
+              jobId,
+              listingId,
+            }
+          );
+        }
+
+        if (retries < maxRetries) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, retryDelay * Math.pow(2, retries))
+          );
+          continue;
+        }
+
+        return false;
       }
-
-      return false;
     }
+
+    return false;
   }
 
   private async releaseListingLock(
