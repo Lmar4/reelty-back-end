@@ -77,6 +77,7 @@ export class VideoProcessingService {
   private readonly TEMP_DIR = process.env.TEMP_OUTPUT_DIR || "./temp";
   private s3Service: S3Service;
   private readonly FFmpeg_TIMEOUT = 60 * 60 * 1000; // 1 hour timeout
+  private readonly progressEmitter: EventEmitter = new EventEmitter();
 
   private constructor() {
     this.s3Service = new S3Service();
@@ -548,67 +549,27 @@ export class VideoProcessingService {
     }
   }
 
-  private handleFFmpegError(error: FFmpegError, context: string): void {
-    // Extract all possible error details
-    const details: Record<string, unknown> = {
-      code: error.code,
-      exitCode: error.exitCode,
-      killed: error.killed,
-      message: error.message,
-      cmd: error.cmd,
-    };
+  private handleFFmpegError(error: any, jobId: string): never {
+    let enhancedMessage = "FFmpeg error in video-processing";
 
-    // Extract error lines from ffmpeg output
-    if (error.ffmpegOutput) {
-      const errorLines = error.ffmpegOutput
-        .split("\n")
-        .filter(
-          (line) =>
-            line.toLowerCase().includes("error") ||
-            line.toLowerCase().includes("failed")
-        );
-
-      details.ffmpegOutput =
-        errorLines.length > 0 ? errorLines : error.ffmpegOutput;
+    if (error.code) {
+      enhancedMessage += `: ffmpeg exited with code ${error.code}`;
     }
 
-    // Add stderr if available
     if (error.stderr) {
-      details.stderr = error.stderr;
+      enhancedMessage += `: ${error.stderr}`;
+      logger.error(`[${jobId}] FFmpeg stderr output`, {
+        stderr: error.stderr,
+        code: error.code,
+      });
     }
 
-    // Try to identify specific error patterns
-    const errorMessage = error.message || "";
-    if (errorMessage.includes("Error while opening encoder")) {
-      details.errorType = "ENCODER_INITIALIZATION_FAILED";
-      details.possibleCauses = [
-        "Missing codec libraries",
-        "Invalid encoding parameters",
-        "Insufficient permissions",
-        "Resource limitations",
-      ];
-    } else if (
-      errorMessage.includes("Invalid data found when processing input")
-    ) {
-      details.errorType = "INVALID_INPUT_DATA";
-    } else if (errorMessage.includes("No such file or directory")) {
-      details.errorType = "FILE_NOT_FOUND";
-    } else if (errorMessage.includes("Permission denied")) {
-      details.errorType = "PERMISSION_DENIED";
-    } else if (error.killed) {
-      details.errorType = "PROCESS_KILLED";
-    }
-
-    logger.error(`[${context}] FFmpeg processing failed`, details);
-
-    // Create a more informative error message
-    let enhancedMessage = `FFmpeg error in ${context}: ${error.message}`;
-    if (details.errorType) {
-      enhancedMessage += ` (Type: ${details.errorType})`;
-    }
-    if (error.exitCode) {
-      enhancedMessage += ` (Exit code: ${error.exitCode})`;
-    }
+    logger.error(`[${jobId}] FFmpeg processing failed`, {
+      error: error.message || error,
+      stack: error.stack,
+      code: error.code,
+      stderr: error.stderr,
+    });
 
     throw new Error(enhancedMessage);
   }
@@ -672,10 +633,9 @@ export class VideoProcessingService {
     outputPath: string,
     template: VideoTemplate,
     watermarkConfig?: WatermarkConfig,
-    progressEmitter?: EventEmitter
+    jobId?: string
   ): Promise<void> {
     const startTime = Date.now();
-    const jobId = crypto.randomUUID();
 
     // Enhanced validation and logging
     logger.info(
@@ -933,7 +893,7 @@ export class VideoProcessingService {
 
           command
             .on("progress", (progress) => {
-              if (progressEmitter) {
+              if (this.progressEmitter) {
                 // Convert timemark (HH:MM:SS) to seconds
                 const timeComponents = progress.timemark.split(":");
                 const currentSeconds =
@@ -947,7 +907,7 @@ export class VideoProcessingService {
                   Math.round((currentSeconds / totalDuration) * 100)
                 );
 
-                progressEmitter.emit("progress", {
+                this.progressEmitter.emit("progress", {
                   ...progress,
                   percent,
                   totalDuration,
