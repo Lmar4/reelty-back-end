@@ -533,6 +533,34 @@ export class ProductionPipeline {
     });
     if (!job?.listingId) throw new Error("Job or listingId not found");
 
+    // Add verification step before retrying
+    const verifyRunwayVideo = async (order: number): Promise<boolean> => {
+      const photo = await this.prisma.photo.findFirst({
+        where: { listingId: job.listingId, order },
+        select: { runwayVideoPath: true },
+      });
+      return !!photo?.runwayVideoPath;
+    };
+
+    // Modify the retry logic to check if video actually exists
+    const retryRunway = async (
+      inputUrl: string,
+      index: number
+    ): Promise<string | null> => {
+      const existingVideo = await verifyRunwayVideo(index);
+      if (existingVideo) {
+        logger.info(
+          `[${jobId}] Runway video already exists for order ${index}, skipping retry`
+        );
+        const photo = await this.prisma.photo.findFirst({
+          where: { listingId: job.listingId, order: index },
+          select: { runwayVideoPath: true },
+        });
+        return photo?.runwayVideoPath || null;
+      }
+      return this.retryRunwayGeneration(inputUrl, index, job.listingId, jobId);
+    };
+
     const isRegeneration = options?.isRegeneration ?? false;
     const forceRegeneration = options?.forceRegeneration ?? false;
     const regenerationContext = options?.regenerationContext;
@@ -632,12 +660,8 @@ export class ProductionPipeline {
             );
           }
           if (inputPath) {
-            const runwayVideo = await this.retryRunwayGeneration(
-              inputPath,
-              photo.order,
-              job.listingId,
-              jobId
-            );
+            // Use the new retryRunway function instead of retryRunwayGeneration
+            const runwayVideo = await retryRunway(inputPath, photo.order);
             if (!runwayVideo) {
               throw new Error(
                 `Failed to generate runway video for photo ${photo.id} at order ${photo.order}`
