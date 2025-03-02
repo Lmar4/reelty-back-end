@@ -42,15 +42,48 @@ export async function submitJob(
       },
     });
 
-    // Start processing pipeline asynchronously
+    // Start processing pipeline with proper error handling
     const pipeline = new ProductionPipeline();
-    pipeline
-      .execute({
-        jobId: job.id,
-        inputFiles: validatedData.images,
-        template: validatedData.template as TemplateKey,
-      })
-      .catch(console.error);
+
+    // Return the job ID immediately, but continue processing in the background
+    process.nextTick(async () => {
+      try {
+        // Update job status to PROCESSING
+        await prisma.videoJob.update({
+          where: { id: job.id },
+          data: { status: "PROCESSING" as VideoGenerationStatus },
+        });
+
+        // Execute the pipeline
+        await pipeline.execute({
+          jobId: job.id,
+          inputFiles: validatedData.images,
+          template: validatedData.template as TemplateKey,
+        });
+
+        // Update job status to COMPLETED on success
+        await prisma.videoJob.update({
+          where: { id: job.id },
+          data: {
+            status: "COMPLETED" as VideoGenerationStatus,
+            completedAt: new Date(),
+          },
+        });
+
+        console.log(`Job ${job.id} completed successfully`);
+      } catch (error) {
+        // Update job status to FAILED on error
+        await prisma.videoJob.update({
+          where: { id: job.id },
+          data: {
+            status: "FAILED" as VideoGenerationStatus,
+            error: error instanceof Error ? error.message : "Unknown error",
+          },
+        });
+
+        console.error(`Job ${job.id} failed:`, error);
+      }
+    });
 
     return {
       statusCode: 201,
