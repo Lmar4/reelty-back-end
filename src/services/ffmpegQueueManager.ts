@@ -28,6 +28,7 @@ class FFmpegQueueManager {
   public async enqueueJob<T>(job: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       const MAX_QUEUE_SIZE = 50; // Configurable limit
+      const JOB_TIMEOUT = 120 * 1000; // 2 minutes timeout
 
       if (this.queue.length >= MAX_QUEUE_SIZE) {
         logger.error("FFmpeg queue full, rejecting job", {
@@ -46,6 +47,7 @@ class FFmpegQueueManager {
       });
 
       this.queue.push(async () => {
+        let timeoutId: NodeJS.Timeout | null = null;
         try {
           this.activeFFmpegCount++;
           const memoryUsage = process.memoryUsage();
@@ -61,13 +63,22 @@ class FFmpegQueueManager {
             },
           });
 
+          timeoutId = setTimeout(() => {
+            logger.error(
+              `[${jobId}] FFmpeg job timed out after ${JOB_TIMEOUT}ms`
+            );
+            reject(new Error(`FFmpeg job timed out after ${JOB_TIMEOUT}ms`));
+          }, JOB_TIMEOUT);
+
           const result = await job();
+          if (timeoutId) clearTimeout(timeoutId);
           logger.info(`[${jobId}] FFmpeg job completed`, {
             activeJobs: this.activeFFmpegCount,
           });
           resolve(result);
           return result;
         } catch (error) {
+          if (timeoutId) clearTimeout(timeoutId);
           logger.error(`[${jobId}] FFmpeg job failed`, {
             error: error instanceof Error ? error.message : "Unknown error",
             activeJobs: this.activeFFmpegCount,
@@ -81,12 +92,10 @@ class FFmpegQueueManager {
             activeJobs: this.activeFFmpegCount,
             queuedJobs: this.queue.length,
           });
-          // Process next job in queue
           setTimeout(() => this.processQueue(), 100);
         }
       });
 
-      // Trigger queue processing
       if (
         !this.processingLock &&
         this.activeFFmpegCount < this.MAX_FFMPEG_JOBS
