@@ -1727,7 +1727,7 @@ export class VideoProcessingService {
     return tempDir;
   }
 
-  // Update the stitchVideoClips method to extract paths from VideoClip objects
+  // Update the stitchVideoClips method to handle video-only clips and add music as requested
   public async stitchVideoClips(
     clips: VideoClip[],
     outputPath: string,
@@ -1735,59 +1735,19 @@ export class VideoProcessingService {
     watermarkConfig?: WatermarkConfig,
     progressEmitter?: EventEmitter
   ): Promise<void> {
-    logger.info("Using legacy stitchVideoClips method", {
-      clipCount: clips.length,
-      templateName: template.name,
-    });
-
-    // Extract paths from clips
-    const inputPaths = await Promise.all(
-      clips.map(async (clip, index) => {
-        if (!clip.path) {
-          throw new Error(`Clip ${index} has no path`);
-        }
-
-        const resolvedPath =
-          clip.path.startsWith("http") || clip.path.startsWith("s3://")
-            ? await this.resolveAssetPath(clip.path, "video", true)
-            : clip.path;
-
-        return resolvedPath;
-      })
-    );
-
-    // Create options from template
-    const options: StitchOptions = {
-      outputOptions: template.outputOptions,
-    };
-
-    // Call the new stitchVideos method
-    return this.stitchVideos(inputPaths, outputPath, options);
-  }
-
-  // Update the createVideo method to use stitchVideoClips instead of stitchVideos
-  public async createVideo(
-    clips: VideoClip[],
-    outputPath: string,
-    template: VideoTemplate,
-    watermarkConfig?: WatermarkConfig,
-    progressEmitter?: EventEmitter
-  ): Promise<void> {
-    const startTime = Date.now();
     const jobId = crypto.randomUUID();
-    const tempFiles: string[] = []; // Track files for cleanup
-
-    logger.info(`[${jobId}] Starting video creation with enhanced validation`, {
+    logger.info(`[${jobId}] Starting stitchVideoClips`, {
       clipCount: clips.length,
-      outputPath,
       templateName: template.name,
+      outputPath,
+      hasMusic: !!template.music,
       hasWatermark: !!watermarkConfig,
-      hasMusic: !!template.music?.path,
     });
 
-    const validatedClips = await Promise.all(
-      clips.map(async (clip, index) => {
-        try {
+    try {
+      // Validate and resolve clip paths
+      const validatedClips = await Promise.all(
+        clips.map(async (clip, index) => {
           if (!clip.path) {
             throw new Error(`Clip ${index} has no path`);
           }
@@ -1796,139 +1756,303 @@ export class VideoProcessingService {
             clip.path.startsWith("http") || clip.path.startsWith("s3://")
               ? await this.resolveAssetPath(clip.path, "video", true)
               : clip.path;
-          tempFiles.push(resolvedPath);
 
-          await this.validateFile(resolvedPath, `Clip ${index}`);
-          if (!clip.duration || clip.duration <= 0) {
-            const duration = await this.getVideoDuration(resolvedPath);
-            if (duration <= 0) {
-              throw new Error(
-                `Invalid duration for clip ${index}: ${duration}`
-              );
-            }
-            clip.duration = duration;
+          const metadata = await this.getVideoMetadata(resolvedPath);
+          if (!metadata.hasVideo || !metadata.duration) {
+            throw new Error(
+              `Clip ${index} is invalid: no video or zero duration`
+            );
           }
-
-          if (clip.transition) {
-            if (
-              !["crossfade", "fade", "slide"].includes(clip.transition.type)
-            ) {
-              logger.warn(
-                `Invalid transition type for clip ${index}, defaulting to crossfade`,
-                { type: clip.transition.type }
-              );
-              clip.transition.type = "crossfade";
-            }
-            if (!clip.transition.duration || clip.transition.duration <= 0) {
-              logger.warn(
-                `Invalid transition duration for clip ${index}, defaulting to 0.5s`,
-                { duration: clip.transition.duration }
-              );
-              clip.transition.duration = 0.5;
-            }
-          }
+          clip.duration = clip.duration || metadata.duration;
 
           logger.info(`[${jobId}] Validated clip ${index}`, {
             path: resolvedPath,
             duration: clip.duration,
-            hasTransition: !!clip.transition,
+            hasAudio: metadata.hasAudio,
           });
-          return { ...clip, path: resolvedPath };
-        } catch (error) {
-          logger.error(`[${jobId}] Clip ${index} validation failed`, {
-            path: clip.path,
-            error: error instanceof Error ? error.message : "Unknown error",
-          });
-          throw error;
-        }
-      })
-    );
-
-    let validatedMusic = template.music;
-    if (template.music?.path) {
-      try {
-        const musicPath = await this.resolveAssetPath(
-          template.music.path,
-          "music",
-          true
-        );
-        tempFiles.push(musicPath);
-        await this.validateFile(musicPath, "Music");
-        validatedMusic = { ...template.music, path: musicPath };
-        logger.info(`[${jobId}] Validated music file`, { path: musicPath });
-      } catch (error) {
-        logger.warn(
-          `[${jobId}] Music validation failed, proceeding without music`,
-          {
-            path: template.music.path,
-            error: error instanceof Error ? error.message : "Unknown error",
-          }
-        );
-        validatedMusic = undefined;
-      }
-    }
-
-    let validatedWatermark = watermarkConfig;
-    if (watermarkConfig?.path) {
-      try {
-        const watermarkPath = await this.resolveAssetPath(
-          watermarkConfig.path,
-          "watermark",
-          true
-        );
-        tempFiles.push(watermarkPath);
-        await this.validateFile(watermarkPath, "Watermark");
-        validatedWatermark = { ...watermarkConfig, path: watermarkPath };
-        logger.info(`[${jobId}] Validated watermark file`, {
-          path: watermarkPath,
-        });
-      } catch (error) {
-        logger.warn(
-          `[${jobId}] Watermark validation failed, proceeding without watermark`,
-          {
-            path: watermarkConfig.path,
-            error: error instanceof Error ? error.message : "Unknown error",
-          }
-        );
-        validatedWatermark = undefined;
-      }
-    }
-
-    const localOutput = outputPath.startsWith("https://")
-      ? path.join(this.TEMP_DIR, `temp_output_${crypto.randomUUID()}.mp4`)
-      : outputPath;
-    tempFiles.push(localOutput);
-
-    try {
-      // Use the stitchVideoClips method instead of direct FFmpeg handling
-      await this.stitchVideoClips(
-        validatedClips,
-        localOutput,
-        template,
-        validatedWatermark,
-        progressEmitter
+          return { ...clip, path: resolvedPath, hasAudio: metadata.hasAudio };
+        })
       );
 
-      // Handle S3 upload if needed
-      if (outputPath.startsWith("https://")) {
-        const s3Key = this.getS3KeyFromUrl(outputPath);
-        await this.uploadToS3(localOutput, s3Key);
+      // Resolve music if present
+      let musicPath: string | undefined;
+      if (template.music?.path) {
+        try {
+          musicPath = await this.resolveAssetPath(
+            template.music.path,
+            "music",
+            false
+          );
+          if (musicPath) {
+            const musicMetadata = await this.getVideoMetadata(musicPath);
+            if (!musicMetadata.hasAudio) {
+              logger.warn(`[${jobId}] Music file has no audio, ignoring`, {
+                path: musicPath,
+              });
+              musicPath = undefined;
+            } else {
+              logger.info(`[${jobId}] Validated music`, {
+                path: musicPath,
+                duration: musicMetadata.duration,
+              });
+            }
+          }
+        } catch (error) {
+          logger.warn(
+            `[${jobId}] Failed to resolve music, continuing without`,
+            {
+              musicPath: template.music.path,
+              error: error instanceof Error ? error.message : String(error),
+            }
+          );
+          musicPath = undefined;
+        }
       }
 
-      logger.info(`[${jobId}] Video creation completed successfully`, {
-        outputPath,
-        durationMs: Date.now() - startTime,
-        clipCount: validatedClips.length,
+      // Resolve watermark if present
+      let watermarkPath: string | undefined;
+      if (watermarkConfig?.path) {
+        try {
+          watermarkPath = await this.resolveAssetPath(
+            watermarkConfig.path,
+            "watermark",
+            false
+          );
+          if (!watermarkPath) {
+            logger.warn(
+              `[${jobId}] Failed to resolve watermark, continuing without`,
+              {
+                path: watermarkConfig.path,
+              }
+            );
+          }
+        } catch (error) {
+          logger.warn(
+            `[${jobId}] Failed to resolve watermark, continuing without`,
+            {
+              path: watermarkConfig.path,
+              error: error instanceof Error ? error.message : String(error),
+            }
+          );
+        }
+      }
+
+      // Calculate total duration for audio trimming
+      const totalDuration = validatedClips.reduce(
+        (sum, clip) => sum + clip.duration,
+        0
+      );
+
+      // Build FFmpeg command
+      const command = ffmpeg();
+
+      // Add video inputs
+      validatedClips.forEach((clip) => {
+        command.input(clip.path);
       });
 
-      // Cleanup is handled by stitchVideoClips
-    } catch (error) {
-      logger.error(`[${jobId}] Video creation failed`, {
-        outputPath,
-        error: error instanceof Error ? error.message : "Unknown error",
-        durationMs: Date.now() - startTime,
+      // Add music input if present
+      const musicIndex = musicPath ? validatedClips.length : -1;
+      if (musicPath) {
+        command.input(musicPath);
+      }
+
+      // Add watermark input if present
+      const watermarkIndex = watermarkPath
+        ? musicIndex !== -1
+          ? musicIndex + 1
+          : validatedClips.length
+        : -1;
+      if (watermarkPath) {
+        command.input(watermarkPath);
+      }
+
+      // Build filter graph
+      const filterCommands: ffmpeg.FilterSpecification[] = [];
+
+      // Process each video clip
+      validatedClips.forEach((clip, i) => {
+        // Trim to exact duration
+        filterCommands.push({
+          filter: "trim",
+          options: `duration=${clip.duration}`,
+          inputs: [`${i}:v`],
+          outputs: [`v${i}`],
+        });
+
+        // Reset timestamps
+        filterCommands.push({
+          filter: "setpts",
+          options: "PTS-STARTPTS",
+          inputs: [`v${i}`],
+          outputs: [`pts${i}`],
+        });
+
+        // Apply color correction if specified
+        if (clip.colorCorrection?.ffmpegFilter) {
+          filterCommands.push({
+            filter: "eq",
+            options: clip.colorCorrection.ffmpegFilter,
+            inputs: [`pts${i}`],
+            outputs: [`color${i}`],
+          });
+        } else {
+          filterCommands.push({
+            filter: "null",
+            inputs: [`pts${i}`],
+            outputs: [`color${i}`],
+          });
+        }
       });
-      throw error;
+
+      // Concatenate video streams
+      const concatInputs = validatedClips.map((_, i) => `color${i}`);
+      filterCommands.push({
+        filter: "concat",
+        options: `n=${validatedClips.length}:v=1:a=0`,
+        inputs: concatInputs,
+        outputs: ["vconcat"],
+      });
+
+      // Process music if present
+      if (musicIndex !== -1) {
+        // Trim audio to match total video duration
+        filterCommands.push({
+          filter: "atrim",
+          options: `duration=${totalDuration}`,
+          inputs: [`${musicIndex}:a`],
+          outputs: ["atrimmed"],
+        });
+
+        // Reset audio timestamps
+        filterCommands.push({
+          filter: "asetpts",
+          options: "PTS-STARTPTS",
+          inputs: ["atrimmed"],
+          outputs: ["apts"],
+        });
+
+        // Format audio
+        filterCommands.push({
+          filter: "aformat",
+          options: "sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+          inputs: ["apts"],
+          outputs: ["aout"],
+        });
+      }
+
+      // Add watermark if present
+      let finalVideoOutput = "vconcat";
+      if (watermarkIndex !== -1) {
+        const position = watermarkConfig?.position || {
+          x: "(main_w-overlay_w)/2",
+          y: "main_h-overlay_h-20",
+        };
+
+        filterCommands.push({
+          filter: "overlay",
+          options: `${position.x}:${position.y}`,
+          inputs: ["vconcat", `${watermarkIndex}:v`],
+          outputs: ["vout"],
+        });
+
+        finalVideoOutput = "vout";
+      }
+
+      // Apply filter graph
+      command.complexFilter(filterCommands);
+
+      // Map outputs
+      command.outputOptions(["-map", `[${finalVideoOutput}]`]);
+      if (musicIndex !== -1) {
+        command.outputOptions(["-map", "[aout]"]);
+      }
+
+      // Set codec options
+      command.outputOptions([
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "22",
+      ]);
+      if (musicIndex !== -1) {
+        command.outputOptions(["-c:a", "aac", "-b:a", "128k"]);
+      }
+
+      // Add template output options if any
+      if (template.outputOptions) {
+        template.outputOptions.forEach((opt) => {
+          command.outputOptions(opt);
+        });
+      }
+
+      // Set output
+      command.output(outputPath);
+
+      // Execute FFmpeg
+      await new Promise<void>((resolve, reject) => {
+        const stderrBuffer: string[] = [];
+
+        command
+          .on("start", (commandLine) => {
+            logger.info(`[${jobId}] FFmpeg started`, { commandLine });
+          })
+          .on("progress", (progress) => {
+            if (progress.percent !== undefined) {
+              logger.debug(
+                `[${jobId}] FFmpeg progress: ${progress.percent.toFixed(1)}%`
+              );
+              progressEmitter?.emit("progress", progress);
+            }
+          })
+          .on("end", () => {
+            logger.info(`[${jobId}] Video stitching completed`, { outputPath });
+            resolve();
+          })
+          .on("error", (err: FFmpegError) => {
+            // Ensure we have the full stderr output
+            err.stderr = stderrBuffer.join("\n") || err.stderr;
+
+            logger.error(`[${jobId}] FFmpeg error in stitchVideoClips`, {
+              error: err.message,
+              stderr: err.stderr,
+              code: err.code,
+              exitCode: err.exitCode,
+            });
+            reject(err);
+          })
+          .on("stderr", (stderrLine) => {
+            // Capture all stderr output in real-time
+            stderrBuffer.push(stderrLine);
+
+            // Log critical errors immediately
+            if (
+              stderrLine.includes("Error") ||
+              stderrLine.includes("Invalid") ||
+              stderrLine.includes("Cannot") ||
+              stderrLine.includes("failed") ||
+              stderrLine.includes("unable to")
+            ) {
+              logger.warn(`[${jobId}] FFmpeg stderr critical message`, {
+                line: stderrLine,
+                timestamp: new Date().toISOString(),
+              });
+            }
+          })
+          .run();
+      });
+
+      // Verify the output file exists and is valid
+      await this.validateFile(outputPath, "Output video");
+      logger.info(`[${jobId}] Successfully created video`, { outputPath });
+    } catch (error) {
+      logger.error(`[${jobId}] stitchVideoClips failed`, {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      throw error; // Propagate to caller
     }
   }
 
@@ -2061,6 +2185,76 @@ export class VideoProcessingService {
         error: error instanceof Error ? error.message : String(error),
       });
       throw error;
+    }
+  }
+
+  // Update the createVideo method to use stitchVideoClips instead of stitchVideos
+  public async createVideo(
+    clips: VideoClip[],
+    outputPath: string,
+    template: VideoTemplate,
+    watermarkConfig?: WatermarkConfig,
+    progressEmitter?: EventEmitter
+  ): Promise<void> {
+    const startTime = Date.now();
+    const jobId = crypto.randomUUID();
+    const tempFiles: string[] = []; // Track files for cleanup
+
+    logger.info(`[${jobId}] Starting video creation with enhanced validation`, {
+      clipCount: clips.length,
+      outputPath,
+      templateName: template.name,
+      hasWatermark: !!watermarkConfig,
+      hasMusic: !!template.music?.path,
+    });
+
+    const localOutput = outputPath.startsWith("https://")
+      ? path.join(this.TEMP_DIR, `temp_output_${crypto.randomUUID()}.mp4`)
+      : outputPath;
+    tempFiles.push(localOutput);
+
+    try {
+      // Use the stitchVideoClips method for processing
+      await this.stitchVideoClips(
+        clips,
+        localOutput,
+        template,
+        watermarkConfig,
+        progressEmitter
+      );
+
+      // Handle S3 upload if needed
+      if (outputPath.startsWith("https://")) {
+        const s3Key = this.getS3KeyFromUrl(outputPath);
+        await this.uploadToS3(localOutput, s3Key);
+      }
+
+      logger.info(`[${jobId}] Video creation completed successfully`, {
+        outputPath,
+        durationMs: Date.now() - startTime,
+        clipCount: clips.length,
+      });
+    } catch (error) {
+      logger.error(`[${jobId}] Video creation failed`, {
+        outputPath,
+        error: error instanceof Error ? error.message : "Unknown error",
+        durationMs: Date.now() - startTime,
+      });
+      throw error;
+    } finally {
+      // Clean up temporary files
+      for (const file of tempFiles) {
+        if (file !== outputPath && existsSync(file)) {
+          await fs.unlink(file).catch((err) => {
+            logger.warn(
+              `[${jobId}] Failed to clean up temporary file: ${file}`,
+              {
+                error: err instanceof Error ? err.message : String(err),
+              }
+            );
+          });
+        }
+      }
     }
   }
 }
