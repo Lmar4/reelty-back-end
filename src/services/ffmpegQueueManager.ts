@@ -27,8 +27,8 @@ class FFmpegQueueManager {
 
   public async enqueueJob<T>(job: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const MAX_QUEUE_SIZE = 50; // Configurable limit
-      const JOB_TIMEOUT = 120 * 1000; // 2 minutes timeout
+      const MAX_QUEUE_SIZE = 50;
+      const JOB_TIMEOUT = 120 * 1000;
 
       if (this.queue.length >= MAX_QUEUE_SIZE) {
         logger.error("FFmpeg queue full, rejecting job", {
@@ -49,6 +49,11 @@ class FFmpegQueueManager {
       this.queue.push(async () => {
         let timeoutId: NodeJS.Timeout | null = null;
         try {
+          // Wait for an available slot
+          while (this.activeFFmpegCount >= this.MAX_FFMPEG_JOBS) {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+
           this.activeFFmpegCount++;
           const memoryUsage = process.memoryUsage();
           logger.info(`[${jobId}] Starting FFmpeg job`, {
@@ -92,14 +97,13 @@ class FFmpegQueueManager {
             activeJobs: this.activeFFmpegCount,
             queuedJobs: this.queue.length,
           });
-          setTimeout(() => this.processQueue(), 100);
+          if (this.queue.length > 0) {
+            setTimeout(() => this.processQueue(), 100);
+          }
         }
       });
 
-      if (
-        !this.processingLock &&
-        this.activeFFmpegCount < this.MAX_FFMPEG_JOBS
-      ) {
+      if (!this.processingLock) {
         logger.debug(`[${jobId}] Triggering queue processing`, {
           activeJobs: this.activeFFmpegCount,
           queuedJobs: this.queue.length,
