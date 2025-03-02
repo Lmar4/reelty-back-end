@@ -1,8 +1,9 @@
 import ffmpeg from "fluent-ffmpeg";
 import { promises as fs } from "fs";
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, statSync } from "fs";
 import { createReadStream } from "fs";
 import * as path from "path";
+import * as crypto from "crypto";
 import { logger } from "../../utils/logger.js";
 import { S3Service } from "../storage/s3.service.js";
 import { ReelTemplate } from "../imageProcessing/templates/types.js";
@@ -60,6 +61,8 @@ export interface VideoClip {
       y: string;
     };
   };
+  hasAudio?: boolean;
+  isMapVideo?: boolean;
 }
 
 interface VideoProcessingOptions {
@@ -113,6 +116,7 @@ export class VideoProcessingService {
   );
   private ffmpegQueue: Array<() => Promise<void>> = [];
   private processingLock = false;
+  private segmentCache: Map<string, string> = new Map(); // Cache for downloaded segments
 
   // Add a private property to cache the codec
   private _cachedCodec: string | null = null;
@@ -129,6 +133,9 @@ export class VideoProcessingService {
     // Start the queue processor
     this.processFFmpegQueue();
 
+    // Set up periodic cache cleanup (every 30 minutes)
+    setInterval(() => this.cleanupSegmentCache(), 30 * 60 * 1000);
+
     // Add uncaught exception handler for cleanup
     process.on("uncaughtException", async (error) => {
       logger.error(
@@ -139,6 +146,9 @@ export class VideoProcessingService {
           globalFFmpegCount: VideoProcessingService.activeFFmpegCount,
         }
       );
+
+      // Clear segment cache
+      this.cleanupSegmentCache(true);
 
       // Attempt to clean up temp directory
       try {
@@ -204,15 +214,93 @@ export class VideoProcessingService {
     filePath: string,
     context: string = "file"
   ): Promise<void> {
+    const tempValidationPath = `${filePath}_${crypto.randomUUID()}_validate.mp4`; // Unique temp path
     try {
-      // Use the new validation service
-      await this.videoValidationService.validateVideo(filePath);
+      // Copy file to avoid race condition with cleanup
+      await fs.copyFile(filePath, tempValidationPath);
+
+      // Attempt repair only if initial validation fails
+      let metadata = await this.videoValidationService.validateVideo(
+        tempValidationPath
+      );
+      let finalPath = tempValidationPath;
+      if (!metadata.hasVideo || metadata.duration <= 0) {
+        const repairedPath = await this.repairVideo(
+          tempValidationPath,
+          context
+        );
+        if (repairedPath) {
+          finalPath = repairedPath;
+          metadata = await this.videoValidationService.validateVideo(finalPath);
+        }
+      }
+
+      if (!metadata.hasVideo) {
+        throw new Error(`${context} has no video stream`);
+      }
+      if (metadata.duration <= 0) {
+        throw new Error(
+          `${context} has invalid duration: ${metadata.duration}`
+        );
+      }
+      logger.info("Video validation result", { path: finalPath, ...metadata });
     } catch (error) {
-      logger.error(`Failed to validate ${context}`, {
+      logger.error(`Validation failed for ${context}`, {
         path: filePath,
         error: error instanceof Error ? error.message : "Unknown error",
       });
       throw error;
+    } finally {
+      // Cleanup temp file
+      if (existsSync(tempValidationPath)) {
+        await fs.unlink(tempValidationPath).catch((err) =>
+          logger.warn(`Failed to cleanup temp validation file`, {
+            path: tempValidationPath,
+            error: err.message,
+          })
+        );
+      }
+    }
+  }
+
+  private async repairVideo(
+    filePath: string,
+    context: string
+  ): Promise<string | null> {
+    const repairedPath = `${this.TEMP_DIR}/repaired_${crypto.randomUUID()}.mp4`;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ffmpeg(filePath)
+          .outputOptions([
+            "-c:v",
+            "copy",
+            "-c:a",
+            "copy",
+            "-map",
+            "0",
+            "-f",
+            "mp4",
+          ])
+          .output(repairedPath)
+          .on("end", () => resolve())
+          .on("error", (err) =>
+            reject(new Error(`Repair failed for ${context}: ${err.message}`))
+          )
+          .run();
+      });
+      logger.info(`Repaired potentially corrupted video`, {
+        original: filePath,
+        repaired: repairedPath,
+      });
+      return repairedPath;
+    } catch (error) {
+      logger.warn(`Repair attempt failed for ${context}`, {
+        path: filePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (existsSync(repairedPath))
+        await fs.unlink(repairedPath).catch(() => {});
+      return null;
     }
   }
 
@@ -222,20 +310,38 @@ export class VideoProcessingService {
     isRequired: boolean = false
   ): Promise<string> {
     logger.debug(`Resolving ${type} asset path`, { assetPath });
-    if (assetPath.startsWith("https://")) {
+
+    // Handle S3/HTTPS URLs
+    if (assetPath.startsWith("https://") || assetPath.startsWith("s3://")) {
+      const normalizedPath = assetPath.startsWith("s3://")
+        ? assetPath.replace("s3://", "https://")
+        : assetPath;
+
+      // Check if we already have this asset cached
+      const cachedPath = this.segmentCache.get(normalizedPath);
+      if (cachedPath && existsSync(cachedPath)) {
+        logger.debug(`Using cached ${type} asset`, {
+          assetPath: normalizedPath,
+          cachedPath,
+        });
+        return cachedPath;
+      }
+
+      // Not in cache, need to download
+      const cacheKey = crypto
+        .createHash("md5")
+        .update(normalizedPath)
+        .digest("hex");
       const localPath = path.join(
         this.TEMP_DIR,
-        `temp_${crypto.randomUUID()}_${path.basename(assetPath)}`
+        `temp_${cacheKey}_${path.basename(assetPath)}`
       );
-      const repairedPath = path.join(
-        this.TEMP_DIR,
-        `repaired_${crypto.randomUUID()}.mp4`
-      );
+      const repairedPath = path.join(this.TEMP_DIR, `repaired_${cacheKey}.mp4`);
       const maxRetries = 3;
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-          await this.s3Service.downloadFile(assetPath, localPath);
+          await this.s3Service.downloadFile(normalizedPath, localPath);
           await new Promise((r) => setTimeout(r, 500)); // Ensure file is written
           await fs.access(localPath, fs.constants.R_OK);
 
@@ -291,24 +397,30 @@ export class VideoProcessingService {
             );
           }
 
-          logger.info(`Downloaded and validated ${type} asset from S3`, {
-            assetPath,
-            finalPath,
-            attempt,
-          });
+          // Add to cache
+          this.segmentCache.set(normalizedPath, finalPath);
+
+          logger.info(
+            `Downloaded, validated, and cached ${type} asset from S3`,
+            {
+              assetPath: normalizedPath,
+              finalPath,
+              attempt,
+            }
+          );
           return finalPath; // Cleanup deferred to stitchVideos
         } catch (error) {
           logger.warn(
             `Failed to download/repair ${type} asset, attempt ${attempt}/${maxRetries}`,
             {
-              assetPath,
+              assetPath: normalizedPath,
               localPath,
               error: error instanceof Error ? error.message : "Unknown error",
             }
           );
           if (attempt === maxRetries) {
             throw new Error(
-              `Failed to resolve ${type} asset after ${maxRetries} attempts: ${assetPath}`
+              `Failed to resolve ${type} asset after ${maxRetries} attempts: ${normalizedPath}`
             );
           }
           await fs.unlink(localPath).catch(() => {});
@@ -317,6 +429,8 @@ export class VideoProcessingService {
         }
       }
     }
+
+    // Handle local files
     try {
       await fs.access(assetPath, fs.constants.R_OK);
       const metadata = await this.videoValidationService.validateVideo(
@@ -344,6 +458,27 @@ export class VideoProcessingService {
       });
       return "";
     }
+  }
+
+  // Helper method to copy a file to a temporary location if needed
+  private async copyToTempIfNeeded(
+    sourcePath: string,
+    needsCopy: boolean
+  ): Promise<string> {
+    if (!needsCopy) return sourcePath;
+
+    const tempPath = path.join(
+      this.TEMP_DIR,
+      `temp_copy_${crypto.randomUUID()}_${path.basename(sourcePath)}`
+    );
+
+    await fs.copyFile(sourcePath, tempPath);
+    logger.debug("Copied file to temporary location", {
+      source: sourcePath,
+      temp: tempPath,
+    });
+
+    return tempPath;
   }
 
   private buildFilterGraph(
@@ -1727,11 +1862,11 @@ export class VideoProcessingService {
     return tempDir;
   }
 
-  // Update the stitchVideoClips method to handle video-only clips and add music as requested
+  // Update the stitchVideoClips method to use the cached segments and the copyToTempIfNeeded helper.
   public async stitchVideoClips(
     clips: VideoClip[],
     outputPath: string,
-    template: VideoTemplate,
+    template: VideoTemplate | ReelTemplate,
     watermarkConfig?: WatermarkConfig,
     progressEmitter?: EventEmitter
   ): Promise<void> {
@@ -1745,11 +1880,48 @@ export class VideoProcessingService {
     });
 
     try {
-      // Validate and resolve clip paths
+      const isReelTemplate = "sequence" in template && "durations" in template;
+
+      let sequenceClips = [...clips];
+      if (isReelTemplate) {
+        const reelTemplate = template as ReelTemplate;
+        if (reelTemplate.sequence && Array.isArray(reelTemplate.sequence)) {
+          sequenceClips = reelTemplate.sequence
+            .map((seq, index) => {
+              const clipIndex =
+                typeof seq === "string"
+                  ? seq === "map"
+                    ? 0
+                    : parseInt(seq, 10)
+                  : seq;
+              const clip = clips[clipIndex];
+              if (!clip) {
+                logger.warn(`[${jobId}] Missing clip at sequence ${index}`, {
+                  sequence: seq,
+                });
+                return null;
+              }
+              const duration = Array.isArray(reelTemplate.durations)
+                ? reelTemplate.durations[index]
+                : reelTemplate.durations[seq];
+              return { ...clip, duration: duration || clip.duration };
+            })
+            .filter(Boolean) as VideoClip[];
+        }
+      }
+
       const validatedClips = await Promise.all(
-        clips.map(async (clip, index) => {
-          if (!clip.path) {
-            throw new Error(`Clip ${index} has no path`);
+        sequenceClips.map(async (clip, index) => {
+          if (!clip || !clip.path) {
+            logger.warn(
+              `[${jobId}] Skipping missing clip at sequence ${index}`,
+              {
+                sequence: isReelTemplate
+                  ? (template as ReelTemplate).sequence[index]
+                  : index,
+              }
+            );
+            return null;
           }
 
           const resolvedPath =
@@ -1759,22 +1931,47 @@ export class VideoProcessingService {
 
           const metadata = await this.getVideoMetadata(resolvedPath);
           if (!metadata.hasVideo || !metadata.duration) {
-            throw new Error(
-              `Clip ${index} is invalid: no video or zero duration`
-            );
+            logger.warn(`[${jobId}] Skipping invalid clip ${index}`, {
+              path: resolvedPath,
+            });
+            return null;
           }
           clip.duration = clip.duration || metadata.duration;
+
+          const isMapVideo =
+            resolvedPath.includes("/maps/") ||
+            resolvedPath.includes("map") ||
+            (isReelTemplate &&
+              (template as ReelTemplate).sequence[index] === "map") ||
+            (template.name.toLowerCase().includes("google zoom") &&
+              index === 0);
 
           logger.info(`[${jobId}] Validated clip ${index}`, {
             path: resolvedPath,
             duration: clip.duration,
             hasAudio: metadata.hasAudio,
+            isMapVideo,
+            sequence: isReelTemplate
+              ? (template as ReelTemplate).sequence[index]
+              : index,
           });
-          return { ...clip, path: resolvedPath, hasAudio: metadata.hasAudio };
+
+          return {
+            ...clip,
+            path: resolvedPath,
+            hasAudio: metadata.hasAudio,
+            isMapVideo,
+          };
         })
       );
 
-      // Resolve music if present
+      const validClips = validatedClips.filter(
+        (clip): clip is NonNullable<typeof clip> => clip !== null
+      );
+      if (validClips.length === 0) {
+        throw new Error("No valid clips to stitch");
+      }
+
       let musicPath: string | undefined;
       if (template.music?.path) {
         try {
@@ -1805,11 +2002,9 @@ export class VideoProcessingService {
               error: error instanceof Error ? error.message : String(error),
             }
           );
-          musicPath = undefined;
         }
       }
 
-      // Resolve watermark if present
       let watermarkPath: string | undefined;
       if (watermarkConfig?.path) {
         try {
@@ -1825,6 +2020,10 @@ export class VideoProcessingService {
                 path: watermarkConfig.path,
               }
             );
+          } else {
+            logger.info(`[${jobId}] Validated watermark`, {
+              path: watermarkPath,
+            });
           }
         } catch (error) {
           logger.warn(
@@ -1837,50 +2036,30 @@ export class VideoProcessingService {
         }
       }
 
-      // Calculate total duration for audio trimming
-      const totalDuration = validatedClips.reduce(
+      const command = this.createFFmpegCommand();
+      const totalDuration = validClips.reduce(
         (sum, clip) => sum + clip.duration,
         0
       );
 
-      // Build FFmpeg command
-      const command = ffmpeg();
-
-      // Add video inputs
-      validatedClips.forEach((clip) => {
-        command.input(clip.path);
-      });
-
-      // Add music input if present
-      const musicIndex = musicPath ? validatedClips.length : -1;
-      if (musicPath) {
-        command.input(musicPath);
-      }
-
-      // Add watermark input if present
+      validClips.forEach((clip) => command.input(clip.path));
+      const musicIndex = musicPath ? validClips.length : -1;
+      if (musicPath) command.input(musicPath);
       const watermarkIndex = watermarkPath
         ? musicIndex !== -1
           ? musicIndex + 1
-          : validatedClips.length
+          : validClips.length
         : -1;
-      if (watermarkPath) {
-        command.input(watermarkPath);
-      }
+      if (watermarkPath) command.input(watermarkPath);
 
-      // Build filter graph
       const filterCommands: ffmpeg.FilterSpecification[] = [];
-
-      // Process each video clip
-      validatedClips.forEach((clip, i) => {
-        // Trim to exact duration
+      validClips.forEach((clip, i) => {
         filterCommands.push({
           filter: "trim",
           options: `duration=${clip.duration}`,
           inputs: [`${i}:v`],
           outputs: [`v${i}`],
         });
-
-        // Reset timestamps
         filterCommands.push({
           filter: "setpts",
           options: "PTS-STARTPTS",
@@ -1888,51 +2067,106 @@ export class VideoProcessingService {
           outputs: [`pts${i}`],
         });
 
-        // Apply color correction if specified
-        if (clip.colorCorrection?.ffmpegFilter) {
+        let currentInput = `pts${i}`;
+        let currentOutput = `color${i}`;
+
+        // Special handling for Wes Anderson template
+        if (template.name.toLowerCase() === "wesanderson") {
+          // Apply eq filter
+          filterCommands.push({
+            filter: "eq",
+            options: "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
+            inputs: [currentInput],
+            outputs: [`eq${i}`],
+          });
+          currentInput = `eq${i}`;
+
+          // Apply hue filter
+          filterCommands.push({
+            filter: "hue",
+            options: "h=5:s=1.2",
+            inputs: [currentInput],
+            outputs: [`hue${i}`],
+          });
+          currentInput = `hue${i}`;
+
+          // Apply colorbalance filter
+          filterCommands.push({
+            filter: "colorbalance",
+            options: "rm=0.1:gm=-0.05:bm=-0.1",
+            inputs: [currentInput],
+            outputs: [`cb${i}`],
+          });
+          currentInput = `cb${i}`;
+
+          // Apply curves filter
+          filterCommands.push({
+            filter: "curves",
+            options: "master=0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1",
+            inputs: [currentInput],
+            outputs: [`curves${i}`],
+          });
+          currentInput = `curves${i}`;
+
+          // Apply unsharp filter
+          filterCommands.push({
+            filter: "unsharp",
+            options: "5:5:1.5:5:5:0.0",
+            inputs: [currentInput],
+            outputs: [currentOutput],
+          });
+        } else if (
+          "colorCorrection" in template &&
+          template.colorCorrection?.ffmpegFilter
+        ) {
+          // For other templates with color correction
+          filterCommands.push({
+            filter: "eq",
+            options: template.colorCorrection.ffmpegFilter,
+            inputs: [currentInput],
+            outputs: [currentOutput],
+          });
+        } else if (clip.colorCorrection?.ffmpegFilter) {
+          // Use clip-specific color correction if available
           filterCommands.push({
             filter: "eq",
             options: clip.colorCorrection.ffmpegFilter,
-            inputs: [`pts${i}`],
-            outputs: [`color${i}`],
+            inputs: [currentInput],
+            outputs: [currentOutput],
           });
         } else {
+          // Default mild color correction
           filterCommands.push({
-            filter: "null",
-            inputs: [`pts${i}`],
-            outputs: [`color${i}`],
+            filter: "eq",
+            options: "contrast=1.05:brightness=0.02:saturation=1.1",
+            inputs: [currentInput],
+            outputs: [currentOutput],
           });
         }
       });
 
-      // Concatenate video streams
-      const concatInputs = validatedClips.map((_, i) => `color${i}`);
+      const concatInputs = validClips.map((_, i) => `color${i}`);
       filterCommands.push({
         filter: "concat",
-        options: `n=${validatedClips.length}:v=1:a=0`,
+        options: `n=${validClips.length}:v=1:a=0`,
         inputs: concatInputs,
         outputs: ["vconcat"],
       });
 
-      // Process music if present
+      let finalVideoOutput = "vconcat";
       if (musicIndex !== -1) {
-        // Trim audio to match total video duration
         filterCommands.push({
           filter: "atrim",
           options: `duration=${totalDuration}`,
           inputs: [`${musicIndex}:a`],
           outputs: ["atrimmed"],
         });
-
-        // Reset audio timestamps
         filterCommands.push({
           filter: "asetpts",
           options: "PTS-STARTPTS",
           inputs: ["atrimmed"],
           outputs: ["apts"],
         });
-
-        // Format audio
         filterCommands.push({
           filter: "aformat",
           options: "sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
@@ -1941,64 +2175,54 @@ export class VideoProcessingService {
         });
       }
 
-      // Add watermark if present
-      let finalVideoOutput = "vconcat";
       if (watermarkIndex !== -1) {
         const position = watermarkConfig?.position || {
           x: "(main_w-overlay_w)/2",
-          y: "main_h-overlay_h-20",
+          y: "main_h-overlay_h-300",
         };
-
         filterCommands.push({
           filter: "overlay",
           options: `${position.x}:${position.y}`,
           inputs: ["vconcat", `${watermarkIndex}:v`],
           outputs: ["vout"],
         });
-
         finalVideoOutput = "vout";
       }
 
-      // Apply filter graph
       command.complexFilter(filterCommands);
-
-      // Map outputs
       command.outputOptions(["-map", `[${finalVideoOutput}]`]);
       if (musicIndex !== -1) {
         command.outputOptions(["-map", "[aout]"]);
       }
 
-      // Set codec options
       command.outputOptions([
         "-c:v",
         "libx264",
         "-preset",
         "fast",
         "-crf",
-        "22",
+        "23",
+        "-threads",
+        "2", // Limit threads to reduce CPU load
       ]);
       if (musicIndex !== -1) {
-        command.outputOptions(["-c:a", "aac", "-b:a", "128k"]);
+        command.outputOptions(["-c:a", "aac", "-b:a", "96k"]);
       }
 
-      // Add template output options if any
-      if (template.outputOptions) {
-        template.outputOptions.forEach((opt) => {
-          command.outputOptions(opt);
-        });
+      if ("outputOptions" in template && template.outputOptions) {
+        template.outputOptions.forEach((opt: string) =>
+          command.outputOptions(opt)
+        );
       }
 
-      // Set output
       command.output(outputPath);
 
-      // Execute FFmpeg
       await new Promise<void>((resolve, reject) => {
         const stderrBuffer: string[] = [];
-
         command
-          .on("start", (commandLine) => {
-            logger.info(`[${jobId}] FFmpeg started`, { commandLine });
-          })
+          .on("start", (commandLine) =>
+            logger.info(`[${jobId}] FFmpeg started`, { commandLine })
+          )
           .on("progress", (progress) => {
             if (progress.percent !== undefined) {
               logger.debug(
@@ -2012,39 +2236,29 @@ export class VideoProcessingService {
             resolve();
           })
           .on("error", (err: FFmpegError) => {
-            // Ensure we have the full stderr output
             err.stderr = stderrBuffer.join("\n") || err.stderr;
-
             logger.error(`[${jobId}] FFmpeg error in stitchVideoClips`, {
               error: err.message,
               stderr: err.stderr,
-              code: err.code,
-              exitCode: err.exitCode,
             });
             reject(err);
           })
           .on("stderr", (stderrLine) => {
-            // Capture all stderr output in real-time
             stderrBuffer.push(stderrLine);
-
-            // Log critical errors immediately
             if (
               stderrLine.includes("Error") ||
               stderrLine.includes("Invalid") ||
               stderrLine.includes("Cannot") ||
-              stderrLine.includes("failed") ||
-              stderrLine.includes("unable to")
+              stderrLine.includes("failed")
             ) {
               logger.warn(`[${jobId}] FFmpeg stderr critical message`, {
                 line: stderrLine,
-                timestamp: new Date().toISOString(),
               });
             }
           })
           .run();
       });
 
-      // Verify the output file exists and is valid
       await this.validateFile(outputPath, "Output video");
       logger.info(`[${jobId}] Successfully created video`, { outputPath });
     } catch (error) {
@@ -2255,6 +2469,123 @@ export class VideoProcessingService {
           });
         }
       }
+    }
+  }
+
+  /**
+   * Cleans up the segment cache to free memory and disk space
+   * @param forceCleanAll If true, removes all cached segments, otherwise only removes unused ones
+   */
+  private async cleanupSegmentCache(
+    forceCleanAll: boolean = false
+  ): Promise<void> {
+    try {
+      const cacheSize = this.segmentCache.size;
+      if (cacheSize === 0) return;
+
+      logger.info("Starting segment cache cleanup", {
+        cacheSize,
+        forceCleanAll,
+      });
+
+      // If force clean, remove all cached segments
+      if (forceCleanAll) {
+        // Delete all cached files
+        for (const [url, filePath] of this.segmentCache.entries()) {
+          try {
+            if (existsSync(filePath)) {
+              await fs.unlink(filePath);
+            }
+          } catch (error) {
+            logger.warn(`Failed to delete cached file: ${filePath}`, {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+
+        // Clear the cache map
+        this.segmentCache.clear();
+        logger.info("Segment cache completely cleared");
+        return;
+      }
+
+      // Otherwise, implement a simple LRU-like cleanup
+      // For now, just keep the cache size under control (e.g., max 100 items)
+      const MAX_CACHE_SIZE = 100;
+      if (cacheSize > MAX_CACHE_SIZE) {
+        // Get all entries as an array
+        const entries = Array.from(this.segmentCache.entries());
+
+        // Remove oldest entries (first ones in the map)
+        const entriesToRemove = entries.slice(0, cacheSize - MAX_CACHE_SIZE);
+
+        for (const [url, filePath] of entriesToRemove) {
+          try {
+            if (existsSync(filePath)) {
+              await fs.unlink(filePath);
+            }
+            this.segmentCache.delete(url);
+          } catch (error) {
+            logger.warn(
+              `Failed to delete cached file during cleanup: ${filePath}`,
+              {
+                error: error instanceof Error ? error.message : String(error),
+              }
+            );
+          }
+        }
+
+        logger.info("Segment cache partially cleaned up", {
+          removedCount: entriesToRemove.length,
+          newCacheSize: this.segmentCache.size,
+        });
+      }
+    } catch (error) {
+      logger.error("Error during segment cache cleanup", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * Get statistics about the segment cache
+   * @returns Object containing cache statistics
+   */
+  public getSegmentCacheStats(): {
+    size: number;
+    urls: string[];
+    totalSizeBytes: number;
+  } {
+    try {
+      const urls = Array.from(this.segmentCache.keys());
+      let totalSizeBytes = 0;
+
+      // Calculate total size of cached files
+      for (const filePath of this.segmentCache.values()) {
+        try {
+          if (existsSync(filePath)) {
+            const stats = statSync(filePath);
+            totalSizeBytes += stats.size;
+          }
+        } catch (error) {
+          // Ignore errors when getting file stats
+        }
+      }
+
+      return {
+        size: this.segmentCache.size,
+        urls,
+        totalSizeBytes,
+      };
+    } catch (error) {
+      logger.error("Error getting segment cache stats", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        size: 0,
+        urls: [],
+        totalSizeBytes: 0,
+      };
     }
   }
 }
