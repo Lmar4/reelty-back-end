@@ -1220,29 +1220,93 @@ export class ProductionPipeline {
             }
           }
 
-          // Prepare clips
-          const clips = validVideos.map((video, index) => ({
-            path: video.path,
-            duration: durations[index] || video.duration,
-            transition: templateConfig.transitions?.[index > 0 ? index - 1 : 0],
-            colorCorrection: templateConfig.colorCorrection,
-          }));
+          // Prepare clips with explicit pre-processing for Wes Anderson
+          let finalClips: VideoClip[] = [];
+          if (template === "wesanderson") {
+            logger.info(`[${jobId}] Pre-processing Wes Anderson clips`, {
+              clipCount: validVideos.length,
+            });
+            finalClips = await Promise.all(
+              validVideos.map(async (video, index) => {
+                // Use the public method through the service instance
+                const preprocessedClip =
+                  await videoProcessingService.preProcessWesAndersonClip(
+                    {
+                      path: video.path,
+                      duration: durations[index] || video.duration,
+                    },
+                    index,
+                    jobId
+                  );
+                await this.resourceManager.trackResource(preprocessedClip.path);
+                return {
+                  path: preprocessedClip.path,
+                  duration: durations[index] || video.duration,
+                  transition:
+                    templateConfig.transitions?.[index > 0 ? index - 1 : 0],
+                  colorCorrection: templateConfig.colorCorrection,
+                };
+              })
+            );
+            logger.info(
+              `[${jobId}] Completed pre-processing Wes Anderson clips`
+            );
+          } else {
+            finalClips = validVideos.map((video, index) => ({
+              path: video.path,
+              duration: durations[index] || video.duration,
+              transition:
+                templateConfig.transitions?.[index > 0 ? index - 1 : 0],
+              colorCorrection: templateConfig.colorCorrection,
+            }));
+          }
 
           const outputPath = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/properties/${listingId}/videos/templates/${jobId}/${template}.mp4`;
 
-          // Configure watermark
-          const watermarkSettings = watermarkConfig
-            ? ({
+          // Configure and pre-convert watermark
+          let watermarkSettings: WatermarkConfig | undefined;
+          if (watermarkConfig) {
+            const convertedWatermarkPath = path.join(
+              tempDir,
+              `watermark_${jobId}_converted.mp4`
+            );
+            await this.resourceManager.trackResource(convertedWatermarkPath);
+            try {
+              await videoProcessingService.convertImageToVideo(
+                watermarkConfig,
+                convertedWatermarkPath,
+                { format: "yuv420p" }
+              );
+              watermarkSettings = {
+                path: convertedWatermarkPath,
+                position: {
+                  x: "(main_w-overlay_w)/2",
+                  y: "main_h-overlay_h-300",
+                },
+              };
+              logger.info(`[${jobId}] Watermark converted to yuv420p`, {
+                originalPath: watermarkConfig,
+                convertedPath: convertedWatermarkPath,
+              });
+            } catch (error) {
+              logger.warn(
+                `[${jobId}] Failed to convert watermark, using original`,
+                {
+                  error:
+                    error instanceof Error ? error.message : "Unknown error",
+                }
+              );
+              watermarkSettings = {
                 path: watermarkConfig,
                 position: {
                   x: "(main_w-overlay_w)/2",
                   y: "main_h-overlay_h-300",
                 },
-              } as WatermarkConfig)
-            : undefined;
+              };
+            }
+          }
 
           // For googlezoomintro template, explicitly include map video as the first clip
-          let finalClips = [...clips];
           if (template === "googlezoomintro" && processedMapVideo) {
             logger.info(
               `[${jobId}] Adding map video to googlezoomintro template`,
@@ -1266,26 +1330,36 @@ export class ProductionPipeline {
             });
           }
 
-          // Stitch video and verify output
-          await videoProcessingService.createVideo(
-            finalClips,
-            outputPath,
-            {
-              name: templateConfig.name,
-              description: templateConfig.description,
-              colorCorrection: templateConfig.colorCorrection,
-              transitions: templateConfig.transitions,
-              reverseClips: templateConfig.reverseClips,
-              music: processedMusic,
-              outputOptions: ["-q:a 2"],
-            } as VideoTemplate,
-            watermarkSettings
-          );
+          // Stitch video with retry logic
+          const verifiedUrl = await this.retryWithBackoff(
+            async () => {
+              await videoProcessingService.createVideo(
+                finalClips,
+                outputPath,
+                {
+                  name: templateConfig.name,
+                  description: templateConfig.description,
+                  colorCorrection: templateConfig.colorCorrection,
+                  transitions: templateConfig.transitions,
+                  reverseClips: templateConfig.reverseClips,
+                  music: processedMusic,
+                  outputOptions: ["-q:a 2"],
+                } as VideoTemplate,
+                watermarkSettings
+              );
 
-          const verifiedUrl = await this.verifyS3VideoAccess(outputPath, jobId);
-          if (!verifiedUrl) {
-            throw new Error(`Uploaded video not accessible at ${outputPath}`);
-          }
+              const url = await this.verifyS3VideoAccess(outputPath, jobId);
+              if (!url) {
+                throw new Error(
+                  `Uploaded video not accessible at ${outputPath}`
+                );
+              }
+              return url;
+            },
+            this.MAX_RETRIES,
+            `Video creation for ${template}`,
+            jobId
+          );
 
           await this.updateJobProgress(jobId, {
             stage: "template",
