@@ -17,6 +17,7 @@ import { S3Client } from "@aws-sdk/client-s3";
 import { EventEmitter } from "events";
 import { VideoValidationService } from "./video-validation.service.js";
 import { S3VideoService } from "./s3-video.service.js";
+import { resourceManager } from "../video/resource-manager.service.js";
 
 interface FFmpegError extends Error {
   code?: string;
@@ -100,7 +101,7 @@ export class VideoProcessingService {
   private static instance: VideoProcessingService;
   private static activeFFmpegCount = 0; // Global FFmpeg process counter
   private static readonly MAX_GLOBAL_FFMPEG = parseInt(
-    process.env.MAX_GLOBAL_FFMPEG || "4",
+    process.env.MAX_GLOBAL_FFMPEG || "1",
     10
   ); // Global limit
 
@@ -111,7 +112,7 @@ export class VideoProcessingService {
   private readonly FFmpeg_TIMEOUT = 60 * 60 * 1000; // 1 hour timeout
   private activeFFmpegJobs = 0;
   private readonly MAX_CONCURRENT_JOBS = parseInt(
-    process.env.MAX_CONCURRENT_FFMPEG_JOBS || "2",
+    process.env.MAX_CONCURRENT_FFMPEG_JOBS || "1",
     10
   );
   private ffmpegQueue: Array<() => Promise<void>> = [];
@@ -336,7 +337,6 @@ export class VideoProcessingService {
         this.TEMP_DIR,
         `temp_${cacheKey}_${path.basename(assetPath)}`
       );
-      const repairedPath = path.join(this.TEMP_DIR, `repaired_${cacheKey}.mp4`);
       const maxRetries = 3;
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -345,73 +345,43 @@ export class VideoProcessingService {
           await new Promise((r) => setTimeout(r, 500)); // Ensure file is written
           await fs.access(localPath, fs.constants.R_OK);
 
-          // Repair file immediately after download
-          await new Promise<void>((repairResolve, repairReject) => {
-            ffmpeg(localPath)
-              .outputOptions([
-                "-c",
-                "copy",
-                "-map",
-                "0",
-                "-f",
-                "mp4",
-                "-moov_size",
-                "1000000",
-              ])
-              .output(repairedPath)
-              .on("end", () => {
-                logger.info(`Repaired ${type} asset`, {
-                  original: localPath,
-                  repaired: repairedPath,
-                });
-                repairResolve();
-              })
-              .on("error", (repairErr) => {
-                logger.warn(`Failed to repair ${type} asset, using original`, {
-                  path: localPath,
-                  error: repairErr.message,
-                });
-                repairResolve(); // Use original if repair fails
-              })
-              .run();
-          });
-
-          const finalPath = existsSync(repairedPath) ? repairedPath : localPath;
-          const metadata = await this.videoValidationService.validateVideo(
-            finalPath
-          );
-          if (
-            type === "video" &&
-            (!metadata.hasVideo || metadata.duration <= 0)
-          ) {
-            throw new Error(
-              `Invalid ${type} file: no video stream or zero duration`
+          // Use appropriate validation based on asset type
+          if (type === "music") {
+            const isValid = await this.validateMusicFile(localPath);
+            if (!isValid) {
+              throw new Error(
+                `Invalid ${type} file: no audio stream or zero duration`
+              );
+            }
+          } else {
+            const metadata = await this.videoValidationService.validateVideo(
+              localPath
             );
-          }
-          if (
-            type === "music" &&
-            (!metadata.hasAudio || metadata.duration <= 0)
-          ) {
-            throw new Error(
-              `Invalid ${type} file: no audio stream or zero duration`
-            );
+            if (
+              type === "video" &&
+              (!metadata.hasVideo || metadata.duration <= 0)
+            ) {
+              throw new Error(
+                `Invalid ${type} file: no video stream or zero duration`
+              );
+            }
           }
 
           // Add to cache
-          this.segmentCache.set(normalizedPath, finalPath);
+          this.segmentCache.set(normalizedPath, localPath);
 
           logger.info(
             `Downloaded, validated, and cached ${type} asset from S3`,
             {
               assetPath: normalizedPath,
-              finalPath,
+              localPath,
               attempt,
             }
           );
-          return finalPath; // Cleanup deferred to stitchVideos
+          return localPath; // Cleanup deferred to stitchVideos
         } catch (error) {
           logger.warn(
-            `Failed to download/repair ${type} asset, attempt ${attempt}/${maxRetries}`,
+            `Failed to download/validate ${type} asset, attempt ${attempt}/${maxRetries}`,
             {
               assetPath: normalizedPath,
               localPath,
@@ -424,7 +394,6 @@ export class VideoProcessingService {
             );
           }
           await fs.unlink(localPath).catch(() => {});
-          await fs.unlink(repairedPath).catch(() => {});
           await new Promise((r) => setTimeout(r, 1000 * attempt));
         }
       }
@@ -433,14 +402,29 @@ export class VideoProcessingService {
     // Handle local files
     try {
       await fs.access(assetPath, fs.constants.R_OK);
-      const metadata = await this.videoValidationService.validateVideo(
-        assetPath
-      );
-      if (type === "video" && (!metadata.hasVideo || metadata.duration <= 0)) {
-        throw new Error(
-          `Invalid local ${type} file: no video stream or zero duration`
+
+      // Use appropriate validation based on asset type
+      if (type === "music") {
+        const isValid = await this.validateMusicFile(assetPath);
+        if (!isValid) {
+          throw new Error(
+            `Invalid local ${type} file: no audio stream or zero duration`
+          );
+        }
+      } else {
+        const metadata = await this.videoValidationService.validateVideo(
+          assetPath
         );
+        if (
+          type === "video" &&
+          (!metadata.hasVideo || metadata.duration <= 0)
+        ) {
+          throw new Error(
+            `Invalid local ${type} file: no video stream or zero duration`
+          );
+        }
       }
+
       logger.debug(`Local ${type} asset verified`, { assetPath });
       return assetPath;
     } catch (error) {
@@ -566,7 +550,7 @@ export class VideoProcessingService {
           // Apply curves filter (without problematic quotes)
           filterCommands.push({
             filter: "curves",
-            options: "master=0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1",
+            options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
             inputs: [currentInput],
             outputs: [`curves${i}`],
           });
@@ -760,6 +744,7 @@ export class VideoProcessingService {
     const stderrBuffer: string[] = [];
     return (
       ffmpeg()
+        .outputOptions(["-threads", "1"])
         .on("start", async (commandLine) => {
           const codec = await this.getAvailableCodec();
           logger.info("FFmpeg process started", {
@@ -1882,7 +1867,21 @@ export class VideoProcessingService {
     try {
       const isReelTemplate = "sequence" in template && "durations" in template;
 
-      let sequenceClips = [...clips];
+      // Pre-process clips for Wes Anderson template
+      let processedClips = [...clips];
+      if (template.name.toLowerCase() === "wesanderson") {
+        logger.info(`[${jobId}] Pre-processing Wes Anderson clips`, {
+          clipCount: processedClips.length,
+        });
+        processedClips = await Promise.all(
+          processedClips.map((clip, i) =>
+            this.preProcessWesAndersonClip(clip, i, jobId)
+          )
+        );
+        logger.info(`[${jobId}] Completed pre-processing Wes Anderson clips`);
+      }
+
+      let sequenceClips = [...processedClips];
       if (isReelTemplate) {
         const reelTemplate = template as ReelTemplate;
         if (reelTemplate.sequence && Array.isArray(reelTemplate.sequence)) {
@@ -1894,7 +1893,7 @@ export class VideoProcessingService {
                     ? 0
                     : parseInt(seq, 10)
                   : seq;
-              const clip = clips[clipIndex];
+              const clip = processedClips[clipIndex];
               if (!clip) {
                 logger.warn(`[${jobId}] Missing clip at sequence ${index}`, {
                   sequence: seq,
@@ -2071,7 +2070,7 @@ export class VideoProcessingService {
         let currentOutput = `color${i}`;
 
         // Special handling for Wes Anderson template
-        if (template.name.toLowerCase() === "wesanderson") {
+        if (template.name.toLowerCase() === "wesanderson" && !processedClips) {
           // Apply eq filter
           filterCommands.push({
             filter: "eq",
@@ -2102,7 +2101,7 @@ export class VideoProcessingService {
           // Apply curves filter
           filterCommands.push({
             filter: "curves",
-            options: "master=0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1",
+            options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
             inputs: [currentInput],
             outputs: [`curves${i}`],
           });
@@ -2146,6 +2145,18 @@ export class VideoProcessingService {
       });
 
       const concatInputs = validClips.map((_, i) => `color${i}`);
+
+      // Add format filter to ensure pixel format compatibility
+      if (template.name.toLowerCase() === "wesanderson") {
+        filterCommands.push({
+          filter: "format",
+          options: "yuv420p",
+          inputs: [concatInputs[concatInputs.length - 1]],
+          outputs: ["formatted_last"],
+        });
+        concatInputs[concatInputs.length - 1] = "formatted_last";
+      }
+
       filterCommands.push({
         filter: "concat",
         options: `n=${validClips.length}:v=1:a=0`,
@@ -2154,6 +2165,18 @@ export class VideoProcessingService {
       });
 
       let finalVideoOutput = "vconcat";
+
+      // Add format filter after concat for Wes Anderson template
+      if (template.name.toLowerCase() === "wesanderson") {
+        filterCommands.push({
+          filter: "format",
+          options: "yuv420p",
+          inputs: [finalVideoOutput],
+          outputs: ["formatted"],
+        });
+        finalVideoOutput = "formatted";
+      }
+
       if (musicIndex !== -1) {
         filterCommands.push({
           filter: "atrim",
@@ -2183,7 +2206,7 @@ export class VideoProcessingService {
         filterCommands.push({
           filter: "overlay",
           options: `${position.x}:${position.y}`,
-          inputs: ["vconcat", `${watermarkIndex}:v`],
+          inputs: [finalVideoOutput, `${watermarkIndex}:v`],
           outputs: ["vout"],
         });
         finalVideoOutput = "vout";
@@ -2261,6 +2284,17 @@ export class VideoProcessingService {
 
       await this.validateFile(outputPath, "Output video");
       logger.info(`[${jobId}] Successfully created video`, { outputPath });
+
+      // Clean up resources
+      if (template.name.toLowerCase() === "wesanderson") {
+        await resourceManager.cleanup(jobId);
+        logger.info(`[${jobId}] Cleaned up pre-processed Wes Anderson clips`);
+      }
+
+      logger.info(`[${jobId}] Completed stitchVideoClips`, {
+        outputPath,
+        duration: totalDuration,
+      });
     } catch (error) {
       logger.error(`[${jobId}] stitchVideoClips failed`, {
         error: error instanceof Error ? error.message : "Unknown error",
@@ -2586,6 +2620,113 @@ export class VideoProcessingService {
         urls: [],
         totalSizeBytes: 0,
       };
+    }
+  }
+
+  private async preProcessWesAndersonClip(
+    clip: VideoClip,
+    index: number,
+    jobId: string
+  ): Promise<VideoClip> {
+    const tempPath = path.join(
+      this.TEMP_DIR,
+      `preprocessed_${jobId}_${index}.mp4`
+    );
+
+    logger.info(`[${jobId}] Pre-processing Wes Anderson clip ${index}`, {
+      inputPath: clip.path,
+      outputPath: tempPath,
+      duration: clip.duration,
+    });
+
+    try {
+      // Track the temporary file for cleanup
+      resourceManager.trackResource(jobId, tempPath);
+
+      const command = this.createFFmpegCommand()
+        .input(clip.path)
+        .complexFilter([
+          {
+            filter: "trim",
+            options: `duration=${clip.duration}`,
+            outputs: ["trimmed"],
+          },
+          {
+            filter: "setpts",
+            options: "PTS-STARTPTS",
+            inputs: ["trimmed"],
+            outputs: ["pts"],
+          },
+          {
+            filter: "eq",
+            options: "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
+            inputs: ["pts"],
+            outputs: ["eq"],
+          },
+          {
+            filter: "hue",
+            options: "h=5:s=1.2",
+            inputs: ["eq"],
+            outputs: ["hue"],
+          },
+          {
+            filter: "colorbalance",
+            options: "rm=0.1:gm=-0.05:bm=-0.1",
+            inputs: ["hue"],
+            outputs: ["cb"],
+          },
+          {
+            filter: "curves",
+            options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
+            inputs: ["cb"],
+            outputs: ["curves"],
+          },
+          {
+            filter: "unsharp",
+            options: "5:5:1.5:5:5:0.0",
+            inputs: ["curves"],
+            outputs: ["unsharp"],
+          },
+          {
+            filter: "format",
+            options: "yuv420p",
+            inputs: ["unsharp"],
+            outputs: ["final"],
+          },
+        ])
+        .outputOptions(["-map", "[final]"])
+        .outputOptions(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+        .output(tempPath);
+
+      await new Promise<void>((resolve, reject) => {
+        command
+          .on("end", () => {
+            logger.info(`[${jobId}] Pre-processed Wes Anderson clip ${index}`, {
+              tempPath,
+            });
+            resolve();
+          })
+          .on("error", (err) => {
+            logger.error(`[${jobId}] Pre-processing failed for clip ${index}`, {
+              error: err.message,
+              path: clip.path,
+            });
+            reject(err);
+          })
+          .run();
+      });
+
+      return { ...clip, path: tempPath };
+    } catch (error) {
+      logger.error(
+        `[${jobId}] Error in preProcessWesAndersonClip for clip ${index}`,
+        {
+          error: error instanceof Error ? error.message : String(error),
+          path: clip.path,
+        }
+      );
+      // If pre-processing fails, return the original clip
+      return clip;
     }
   }
 }
