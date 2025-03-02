@@ -162,39 +162,79 @@ export class VideoProcessingService {
         this.TEMP_DIR,
         `temp_${crypto.randomUUID()}_${path.basename(assetPath)}`
       );
+      const repairedPath = path.join(
+        this.TEMP_DIR,
+        `repaired_${crypto.randomUUID()}.mp4`
+      );
       const maxRetries = 3;
-      const retryDelay = 1000;
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           await this.s3Service.downloadFile(assetPath, localPath);
-          // Wait briefly to ensure file is fully written
-          await new Promise((r) => setTimeout(r, 500));
-          // Check existence and readability
+          await new Promise((r) => setTimeout(r, 500)); // Ensure file is written
           await fs.access(localPath, fs.constants.R_OK);
-          // Validate file integrity
-          if (type === "video" || type === "music") {
-            const metadata = await this.videoValidationService.validateVideo(
-              localPath
+
+          // Repair file immediately after download
+          await new Promise<void>((repairResolve, repairReject) => {
+            ffmpeg(localPath)
+              .outputOptions([
+                "-c",
+                "copy",
+                "-map",
+                "0",
+                "-f",
+                "mp4",
+                "-moov_size",
+                "1000000",
+              ])
+              .output(repairedPath)
+              .on("end", () => {
+                logger.info(`Repaired ${type} asset`, {
+                  original: localPath,
+                  repaired: repairedPath,
+                });
+                repairResolve();
+              })
+              .on("error", (repairErr) => {
+                logger.warn(`Failed to repair ${type} asset, using original`, {
+                  path: localPath,
+                  error: repairErr.message,
+                });
+                repairResolve(); // Use original if repair fails
+              })
+              .run();
+          });
+
+          const finalPath = existsSync(repairedPath) ? repairedPath : localPath;
+          const metadata = await this.videoValidationService.validateVideo(
+            finalPath
+          );
+          if (
+            type === "video" &&
+            (!metadata.hasVideo || metadata.duration <= 0)
+          ) {
+            throw new Error(
+              `Invalid ${type} file: no video stream or zero duration`
             );
-            if (!metadata.hasVideo && !metadata.hasAudio) {
-              throw new Error(`Downloaded ${type} file has no valid streams`);
-            }
-            if (metadata.duration <= 0) {
-              throw new Error(
-                `Downloaded ${type} file has invalid duration: ${metadata.duration}`
-              );
-            }
           }
+          if (
+            type === "music" &&
+            (!metadata.hasAudio || metadata.duration <= 0)
+          ) {
+            throw new Error(
+              `Invalid ${type} file: no audio stream or zero duration`
+            );
+          }
+
           logger.info(`Downloaded and validated ${type} asset from S3`, {
             assetPath,
-            localPath,
+            finalPath,
             attempt,
           });
-          return localPath;
+          return finalPath; // Cleanup deferred to stitchVideos
         } catch (error) {
           logger.warn(
-            `Failed to download/validate ${type} asset, attempt ${attempt}/${maxRetries}`,
+            `Failed to download/repair ${type} asset, attempt ${attempt}/${maxRetries}`,
             {
               assetPath,
               localPath,
@@ -206,27 +246,21 @@ export class VideoProcessingService {
               `Failed to resolve ${type} asset after ${maxRetries} attempts: ${assetPath}`
             );
           }
-          if (existsSync(localPath)) {
-            await fs.unlink(localPath).catch(() => {}); // Clean up failed download
-          }
-          await new Promise((r) => setTimeout(r, retryDelay * attempt));
+          await fs.unlink(localPath).catch(() => {});
+          await fs.unlink(repairedPath).catch(() => {});
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
         }
       }
     }
     try {
       await fs.access(assetPath, fs.constants.R_OK);
-      if (type === "video" || type === "music") {
-        const metadata = await this.videoValidationService.validateVideo(
-          assetPath
+      const metadata = await this.videoValidationService.validateVideo(
+        assetPath
+      );
+      if (type === "video" && (!metadata.hasVideo || metadata.duration <= 0)) {
+        throw new Error(
+          `Invalid local ${type} file: no video stream or zero duration`
         );
-        if (!metadata.hasVideo && !metadata.hasAudio) {
-          throw new Error(`Local ${type} file has no valid streams`);
-        }
-        if (metadata.duration <= 0) {
-          throw new Error(
-            `Local ${type} file has invalid duration: ${metadata.duration}`
-          );
-        }
       }
       logger.debug(`Local ${type} asset verified`, { assetPath });
       return assetPath;
@@ -741,8 +775,8 @@ export class VideoProcessingService {
   ): Promise<void> {
     const startTime = Date.now();
     const jobId = crypto.randomUUID();
+    const tempFiles: string[] = []; // Track files for cleanup
 
-    // Enhanced validation and logging
     logger.info(
       `[${jobId}] Starting video stitching with enhanced validation`,
       {
@@ -754,25 +788,20 @@ export class VideoProcessingService {
       }
     );
 
-    // Validate all input clips thoroughly before processing
     const validatedClips = await Promise.all(
       clips.map(async (clip, index) => {
         try {
-          // Validate clip path exists and is readable
           if (!clip.path) {
             throw new Error(`Clip ${index} has no path`);
           }
 
-          // Resolve path if it's an S3 URL
           const resolvedPath =
             clip.path.startsWith("http") || clip.path.startsWith("s3://")
               ? await this.resolveAssetPath(clip.path, "video", true)
               : clip.path;
+          tempFiles.push(resolvedPath);
 
-          // Validate file exists and has content
           await this.validateFile(resolvedPath, `Clip ${index}`);
-
-          // Validate duration
           if (!clip.duration || clip.duration <= 0) {
             const duration = await this.getVideoDuration(resolvedPath);
             if (duration <= 0) {
@@ -783,26 +812,20 @@ export class VideoProcessingService {
             clip.duration = duration;
           }
 
-          // Validate transitions if present
           if (clip.transition) {
             if (
               !["crossfade", "fade", "slide"].includes(clip.transition.type)
             ) {
               logger.warn(
                 `Invalid transition type for clip ${index}, defaulting to crossfade`,
-                {
-                  type: clip.transition.type,
-                }
+                { type: clip.transition.type }
               );
               clip.transition.type = "crossfade";
             }
-
             if (!clip.transition.duration || clip.transition.duration <= 0) {
               logger.warn(
                 `Invalid transition duration for clip ${index}, defaulting to 0.5s`,
-                {
-                  duration: clip.transition.duration,
-                }
+                { duration: clip.transition.duration }
               );
               clip.transition.duration = 0.5;
             }
@@ -812,14 +835,8 @@ export class VideoProcessingService {
             path: resolvedPath,
             duration: clip.duration,
             hasTransition: !!clip.transition,
-            transitionType: clip.transition?.type,
-            transitionDuration: clip.transition?.duration,
           });
-
-          return {
-            ...clip,
-            path: resolvedPath,
-          };
+          return { ...clip, path: resolvedPath };
         } catch (error) {
           logger.error(`[${jobId}] Clip ${index} validation failed`, {
             path: clip.path,
@@ -830,7 +847,6 @@ export class VideoProcessingService {
       })
     );
 
-    // Validate music if present
     let validatedMusic = template.music;
     if (template.music?.path) {
       try {
@@ -839,14 +855,10 @@ export class VideoProcessingService {
           "music",
           true
         );
+        tempFiles.push(musicPath);
         await this.validateFile(musicPath, "Music");
-        validatedMusic = {
-          ...template.music,
-          path: musicPath,
-        };
-        logger.info(`[${jobId}] Validated music file`, {
-          path: musicPath,
-        });
+        validatedMusic = { ...template.music, path: musicPath };
+        logger.info(`[${jobId}] Validated music file`, { path: musicPath });
       } catch (error) {
         logger.warn(
           `[${jobId}] Music validation failed, proceeding without music`,
@@ -859,7 +871,6 @@ export class VideoProcessingService {
       }
     }
 
-    // Validate watermark if present
     let validatedWatermark = watermarkConfig;
     if (watermarkConfig?.path) {
       try {
@@ -868,11 +879,9 @@ export class VideoProcessingService {
           "watermark",
           true
         );
+        tempFiles.push(watermarkPath);
         await this.validateFile(watermarkPath, "Watermark");
-        validatedWatermark = {
-          ...watermarkConfig,
-          path: watermarkPath,
-        };
+        validatedWatermark = { ...watermarkConfig, path: watermarkPath };
         logger.info(`[${jobId}] Validated watermark file`, {
           path: watermarkPath,
         });
@@ -888,7 +897,6 @@ export class VideoProcessingService {
       }
     }
 
-    // Calculate total duration for progress tracking
     const totalDuration = validatedClips.reduce(
       (sum, clip) => sum + clip.duration,
       0
@@ -900,61 +908,16 @@ export class VideoProcessingService {
 
       const setupCommand = async () => {
         try {
-          // Repair clips as a fallback if upstream validation misses issues
-          for (let i = 0; i < validatedClips.length; i++) {
-            const clip = validatedClips[i];
-            const repairedPath = path.join(
-              this.TEMP_DIR,
-              `repaired_${crypto.randomUUID()}.mp4`
-            );
-            try {
-              await new Promise<void>((repairResolve, repairReject) => {
-                ffmpeg(clip.path)
-                  .outputOptions([
-                    "-c",
-                    "copy",
-                    "-map",
-                    "0",
-                    "-f",
-                    "mp4",
-                    "-moov_size",
-                    "1000000",
-                  ])
-                  .output(repairedPath)
-                  .on("end", () => {
-                    logger.info(`[${jobId}] Repaired video file`, {
-                      original: clip.path,
-                      repaired: repairedPath,
-                    });
-                    repairResolve();
-                  })
-                  .on("error", (repairErr) => {
-                    logger.warn(
-                      `[${jobId}] Failed to repair video file, using original`,
-                      {
-                        path: clip.path,
-                        error: repairErr.message,
-                      }
-                    );
-                    repairResolve(); // Fallback to original
-                  })
-                  .run();
-              });
-              validatedClips[i].path = repairedPath;
-            } catch (repairError) {
-              logger.error(`[${jobId}] Repair process failed`, {
-                error: repairError,
-              });
-            }
+          // Ensure all inputs exist before proceeding
+          for (const clip of validatedClips) {
+            await fs.access(clip.path, fs.constants.R_OK);
           }
 
-          // Add all validated (and possibly repaired) clips as inputs
           for (const [i, clip] of validatedClips.entries()) {
             command.input(clip.path);
             logger.info(`[${jobId}] Added input ${i}: ${clip.path}`);
           }
 
-          // Add music if validated
           let musicIndex = -1;
           if (validatedMusic?.path) {
             musicIndex = validatedClips.length;
@@ -964,7 +927,6 @@ export class VideoProcessingService {
             );
           }
 
-          // Add watermark if validated
           let watermarkIndex = -1;
           if (validatedWatermark?.path) {
             watermarkIndex =
@@ -977,64 +939,56 @@ export class VideoProcessingService {
             );
           }
 
-          // Build filter graph with enhanced error handling
-          try {
-            const filterGraph = this.buildFilterGraph(
-              validatedClips,
-              validatedWatermark,
-              musicIndex,
-              watermarkIndex
-            );
-
-            if (filterGraph && filterGraph.length > 0) {
-              filterInfo = filterGraph.map((f) => `${f.filter}:${f.options}`);
-              command.complexFilter(filterGraph);
-              logger.info(
-                `[${jobId}] Applied complex filter graph with ${filterGraph.length} filters`
-              );
-            } else {
-              // Fallback to simple concat filter
-              const concatFilter = `concat=n=${validatedClips.length}:v=1:a=0[vout]`;
-              command.outputOptions([`-filter_complex`, concatFilter]);
-              logger.info(
-                `[${jobId}] Applied simple concat filter: ${concatFilter}`
-              );
-            }
-          } catch (filterError) {
-            logger.error(
-              `[${jobId}] Filter graph creation failed, using simple concat`,
-              {
-                error:
-                  filterError instanceof Error
-                    ? filterError.message
-                    : "Unknown error",
-              }
-            );
-            // Use a simpler filter graph as fallback
-            const concatFilter = `concat=n=${validatedClips.length}:v=1:a=0[vout]`;
-            command.outputOptions([`-filter_complex`, concatFilter]);
+          // Simplified filter graph: basic concat with music and watermark
+          const filterGraph: ffmpeg.FilterSpecification[] = [];
+          validatedClips.forEach((clip, i) => {
+            filterGraph.push({
+              filter: "trim",
+              options: `duration=${clip.duration}`,
+              inputs: [`${i}:v`],
+              outputs: [`v${i}`],
+            });
+          });
+          filterGraph.push({
+            filter: "concat",
+            options: `n=${validatedClips.length}:v=1:a=0`,
+            inputs: validatedClips.map((_, i) => `v${i}`),
+            outputs: ["vconcat"],
+          });
+          if (musicIndex !== -1) {
+            filterGraph.push({
+              filter: "atrim",
+              options: `duration=${totalDuration}`,
+              inputs: [`${musicIndex}:a`],
+              outputs: ["aout"],
+            });
+          }
+          if (watermarkIndex !== -1) {
+            filterGraph.push({
+              filter: "overlay",
+              options: "(main_w-overlay_w)/2:main_h-overlay_h-300",
+              inputs: ["vconcat", `${watermarkIndex}:v`],
+              outputs: ["vout"],
+            });
+          } else {
+            filterGraph.push({
+              filter: "null",
+              inputs: ["vconcat"],
+              outputs: ["vout"],
+            });
           }
 
-          // Check if any input has audio
-          const hasAudioInput = await Promise.all(
-            validatedClips.map(async (clip) => {
-              try {
-                const metadata = await this.getVideoMetadata(clip.path);
-                return metadata.hasAudio;
-              } catch (err) {
-                logger.warn(`[${jobId}] Failed to check audio for clip`, {
-                  path: clip.path,
-                  error: err instanceof Error ? err.message : "Unknown error",
-                });
-                return false;
-              }
-            })
-          ).then((results) => results.some(Boolean));
+          filterInfo = filterGraph.map((f) => `${f.filter}:${f.options}`);
+          command.complexFilter(filterGraph);
+          logger.info(
+            `[${jobId}] Applied simplified filter graph with ${filterGraph.length} filters`
+          );
 
-          logger.info(`[${jobId}] Audio detection results`, {
-            hasAudioInput,
-            hasMusicInput: musicIndex !== -1,
-          });
+          const hasAudioInput = await Promise.all(
+            validatedClips.map(
+              async (clip) => (await this.getVideoMetadata(clip.path)).hasAudio
+            )
+          ).then((results) => results.some(Boolean));
 
           command
             .videoCodec("libx264")
@@ -1059,85 +1013,50 @@ export class VideoProcessingService {
           const localOutput = outputPath.startsWith("https://")
             ? path.join(this.TEMP_DIR, `temp_output_${crypto.randomUUID()}.mp4`)
             : outputPath;
+          tempFiles.push(localOutput);
 
-          // Log the full FFmpeg command for debugging
           const fullCommand = command._getArguments().join(" ");
           logger.info(`[${jobId}] Full FFmpeg command:`, {
             command: fullCommand,
           });
 
-          // Ensure all files exist before processing
-          const maxRetries = 5;
-          const retryDelay = 1000;
-          for (const clip of validatedClips) {
-            for (let attempt = 1; attempt <= maxRetries; attempt++) {
-              try {
-                await fs.access(clip.path);
-                break;
-              } catch (err) {
-                if (attempt === maxRetries) {
-                  throw new Error(
-                    `File not accessible after ${maxRetries} attempts: ${clip.path}`
-                  );
-                }
-                logger.warn(`[${jobId}] File not found, retrying`, {
-                  path: clip.path,
-                  attempt,
-                });
-                await new Promise((r) => setTimeout(r, retryDelay));
-              }
-            }
-          }
-
+          let lastProgress = 0;
           command
             .on("progress", (progress) => {
-              if (progressEmitter) {
-                const timeComponents = progress.timemark.split(":");
-                const currentSeconds =
-                  parseInt(timeComponents[0]) * 3600 +
-                  parseInt(timeComponents[1]) * 60 +
-                  parseFloat(timeComponents[2]);
-                const percent = Math.min(
-                  100,
-                  Math.round((currentSeconds / totalDuration) * 100)
-                );
-                progressEmitter.emit("progress", {
+              const currentSeconds = progress.timemark
+                .split(":")
+                .reduce((acc, time) => acc * 60 + parseFloat(time), 0);
+              const percent = Math.min(
+                100,
+                Math.round((currentSeconds / totalDuration) * 100)
+              );
+              if (percent > lastProgress) {
+                lastProgress = percent;
+                logger.info(`[${jobId}] FFmpeg progress`, {
+                  percent,
+                  timemark: progress.timemark,
+                });
+                progressEmitter?.emit("progress", {
                   ...progress,
                   percent,
                   totalDuration,
                   currentSeconds,
-                  estimatedTimeLeft: totalDuration - currentSeconds,
                 });
               }
             })
             .on("error", (err: FFmpegError) => {
-              // Capture stderr for detailed error logging
-              const stderr = err.stderr || "";
-
               err.details = {
                 input: validatedClips.map((clip) => clip.path),
                 output: localOutput,
-                filters: filterInfo.length > 0 ? filterInfo : ["concat"],
-                errorAt:
-                  stderr.split("\n").find((line) => line.includes("Error")) ||
-                  "",
+                filters: filterInfo,
               };
-              err.cmd = command._getArguments().join(" ");
+              err.cmd = fullCommand;
               logger.error(`[${jobId}] FFmpeg error:`, {
                 error: err.message,
                 code: err.code,
-                killed: err.killed,
                 exitCode: err.exitCode,
                 commandLine: err.cmd,
-                details: err.details,
-                stderr: stderr,
               });
-              if (err.message.includes("Error while opening encoder")) {
-                logger.error(`[${jobId}] Encoder initialization failed.`, {
-                  codec: "libx264",
-                  possibleSolution: "Check libx264 installation",
-                });
-              }
               reject(err);
             })
             .on("end", async () => {
@@ -1146,11 +1065,6 @@ export class VideoProcessingService {
                 if (outputPath.startsWith("https://")) {
                   const s3Key = this.getS3KeyFromUrl(outputPath);
                   await this.uploadToS3(localOutput, s3Key);
-                  await fs.unlink(localOutput);
-                  logger.info(
-                    `[${jobId}] Local file cleaned up after S3 upload`,
-                    { localOutput }
-                  );
                 }
                 logger.info(
                   `[${jobId}] Video stitching completed successfully`,
@@ -1158,10 +1072,18 @@ export class VideoProcessingService {
                     outputPath,
                     durationMs: Date.now() - startTime,
                     clipCount: validatedClips.length,
-                    hasMusic: musicIndex !== -1,
-                    hasWatermark: watermarkIndex !== -1,
                   }
                 );
+
+                // Cleanup all temp files
+                for (const file of tempFiles) {
+                  await fs.unlink(file).catch((err) =>
+                    logger.warn(`[${jobId}] Failed to cleanup temp file`, {
+                      file,
+                      error: err.message,
+                    })
+                  );
+                }
                 resolve();
               } catch (error) {
                 reject(error);
@@ -1169,15 +1091,13 @@ export class VideoProcessingService {
             });
 
           await Promise.race([
-            new Promise<void>((resolve) => {
-              command.save(localOutput).on("end", () => {
-                resolve();
-              });
+            new Promise<void>((resolvePromise) => {
+              command.save(localOutput).on("end", () => resolvePromise());
             }),
             new Promise((_, reject) =>
               setTimeout(
-                () => reject(new Error("FFmpeg processing timeout")),
-                this.FFmpeg_TIMEOUT
+                () => reject(new Error("FFmpeg processing timeout after 30s")),
+                30000
               )
             ),
           ]);
@@ -1185,14 +1105,12 @@ export class VideoProcessingService {
           logger.error(`[${jobId}] Video stitching failed`, {
             outputPath,
             error: error instanceof Error ? error.message : "Unknown error",
-            stack: error instanceof Error ? error.stack : undefined,
             durationMs: Date.now() - startTime,
           });
           reject(error);
         }
       };
 
-      // Execute the async setup function
       setupCommand();
     });
   }
