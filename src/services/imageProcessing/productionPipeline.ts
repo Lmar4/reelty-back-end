@@ -420,10 +420,16 @@ export class ProductionPipeline {
     index: number,
     jobId: string
   ): Promise<ValidationResult> {
+    const tempPath = path.join(
+      process.cwd(),
+      "temp",
+      `${jobId}_validate_${index}_${crypto.randomUUID()}.mp4` // Unique temp path
+    );
+    await this.resourceManager.trackResource(tempPath);
+
     try {
       const s3Key = this.getS3KeyFromUrl(s3Url);
       const exists = await this.verifyS3Asset(s3Key);
-
       if (!exists) {
         return {
           success: false,
@@ -431,39 +437,99 @@ export class ProductionPipeline {
         };
       }
 
-      const tempPath = path.join(
-        process.cwd(),
-        "temp",
-        `${jobId}_validate_${index}.mp4`
+      await this.s3Service.downloadFile(s3Url, tempPath);
+      await new Promise((r) => setTimeout(r, 500)); // Ensure file write completes
+
+      // Initial validation
+      let duration = await videoProcessingService.getVideoDuration(tempPath);
+      let isValid = await videoProcessingService.validateVideoIntegrity(
+        tempPath
       );
+      let finalPath = tempPath;
 
-      await this.resourceManager.trackResource(tempPath);
-
-      try {
-        await this.s3Service.downloadFile(s3Url, tempPath);
-        const duration = await videoProcessingService.getVideoDuration(
-          tempPath
+      // Repair if invalid
+      if (duration <= 0 || !isValid) {
+        logger.warn(`[${jobId}] Initial validation failed, attempting repair`, {
+          s3Url,
+          index,
+          duration,
+          isValid,
+        });
+        const repairedPath = path.join(
+          process.cwd(),
+          "temp",
+          `${jobId}_repaired_${index}_${crypto.randomUUID()}.mp4`
         );
+        await this.resourceManager.trackResource(repairedPath);
 
-        if (duration <= 0) {
-          return {
-            success: false,
-            error: `Invalid video duration (${duration}s) from Runway output`,
-          };
+        try {
+          await new Promise<void>((resolve, reject) => {
+            ffmpeg(tempPath)
+              .outputOptions([
+                "-c:v",
+                "copy",
+                "-c:a",
+                "copy",
+                "-map",
+                "0",
+                "-f",
+                "mp4",
+              ])
+              .output(repairedPath)
+              .on("end", () => resolve())
+              .on("error", (err) =>
+                reject(new Error(`Repair failed: ${err.message}`))
+              )
+              .run();
+          });
+          finalPath = repairedPath;
+          duration = await videoProcessingService.getVideoDuration(
+            repairedPath
+          );
+          isValid = await videoProcessingService.validateVideoIntegrity(
+            repairedPath
+          );
+
+          logger.info(`[${jobId}] Video repaired successfully`, {
+            s3Url,
+            index,
+            original: tempPath,
+            repaired: repairedPath,
+          });
+        } catch (repairError) {
+          logger.warn(`[${jobId}] Repair attempt failed`, {
+            s3Url,
+            index,
+            error:
+              repairError instanceof Error
+                ? repairError.message
+                : "Unknown error",
+          });
         }
+      }
 
-        const isValid = await videoProcessingService.validateVideoIntegrity(
-          tempPath
-        );
-        if (!isValid) {
-          return {
-            success: false,
-            error: "Video file integrity check failed",
-          };
-        }
+      if (duration <= 0) {
+        return {
+          success: false,
+          error: `Invalid video duration (${duration}s) from Runway output`,
+        };
+      }
+      if (!isValid) {
+        return {
+          success: false,
+          error: "Video file integrity check failed",
+        };
+      }
 
-        return { success: true, duration };
-      } finally {
+      return { success: true, duration };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+    } finally {
+      // Delayed cleanup to avoid race conditions
+      if (existsSync(tempPath)) {
         await fs.unlink(tempPath).catch((error) => {
           logger.warn(`[${jobId}] Failed to cleanup validation file`, {
             path: tempPath,
@@ -471,11 +537,6 @@ export class ProductionPipeline {
           });
         });
       }
-    } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
     }
   }
 
@@ -1180,9 +1241,34 @@ export class ProductionPipeline {
               } as WatermarkConfig)
             : undefined;
 
+          // For googlezoomintro template, explicitly include map video as the first clip
+          let finalClips = [...clips];
+          if (template === "googlezoomintro" && processedMapVideo) {
+            logger.info(
+              `[${jobId}] Adding map video to googlezoomintro template`,
+              {
+                mapVideoPath: processedMapVideo.path,
+                mapVideoDuration: processedMapVideo.duration,
+              }
+            );
+
+            // Add map video as the first clip with the duration specified in the template
+            finalClips.unshift({
+              path: processedMapVideo.path,
+              duration:
+                typeof templateConfig.durations === "object" &&
+                !Array.isArray(templateConfig.durations)
+                  ? (templateConfig.durations["map"] as number) ||
+                    processedMapVideo.duration
+                  : processedMapVideo.duration,
+              transition: templateConfig.transitions?.[0],
+              colorCorrection: templateConfig.colorCorrection,
+            });
+          }
+
           // Stitch video and verify output
           await videoProcessingService.createVideo(
-            clips,
+            finalClips,
             outputPath,
             {
               name: templateConfig.name,
@@ -1251,10 +1337,9 @@ export class ProductionPipeline {
     coordinates?: { lat: number; lng: number },
     mapVideo?: string | null
   ): Promise<string[]> {
-    const BATCH_SIZE = 2;
+    const BATCH_SIZE = 1; // Reduced to 1 to lower concurrency
     const results: string[] = [];
 
-    // Separate map-dependent templates from others
     const mapDependentTemplates = templates.filter(
       (t) => reelTemplates[t].sequence[0] === "map"
     );
@@ -1262,7 +1347,6 @@ export class ProductionPipeline {
       (t) => reelTemplates[t].sequence[0] !== "map"
     );
 
-    // Validate map requirements early
     if (mapDependentTemplates.length > 0) {
       if (!coordinates) {
         logger.warn(
@@ -1271,10 +1355,8 @@ export class ProductionPipeline {
             templates: mapDependentTemplates,
           }
         );
-        // Filter out map-dependent templates if no coordinates
         templates = regularTemplates;
       } else if (!mapVideo) {
-        // Try to generate map video if not provided
         try {
           logger.info(`[${jobId}] Generating map video for templates`, {
             templates: mapDependentTemplates,
@@ -1285,7 +1367,6 @@ export class ProductionPipeline {
             jobId,
             listingId
           );
-
           if (!mapVideo) {
             throw new Error("Map video generation failed");
           }
@@ -1294,62 +1375,58 @@ export class ProductionPipeline {
             error: error instanceof Error ? error.message : String(error),
             coordinates,
           });
-          // Continue with regular templates only
           templates = regularTemplates;
         }
       }
     }
 
-    // Process regular templates in batches
+    // Process all templates serially with a delay
     for (let i = 0; i < regularTemplates.length; i += BATCH_SIZE) {
       const batch = regularTemplates.slice(i, i + BATCH_SIZE);
 
-      try {
-        logger.info(
-          `[${jobId}] Processing regular template batch ${i / BATCH_SIZE + 1}`,
-          {
-            templates: batch,
-            batchSize: batch.length,
+      logger.info(
+        `[${jobId}] Processing regular template batch ${i / BATCH_SIZE + 1}`,
+        {
+          templates: batch,
+          batchSize: batch.length,
+        }
+      );
+
+      for (const template of batch) {
+        try {
+          const result = await this.processTemplate(
+            template,
+            runwayVideos,
+            jobId,
+            listingId,
+            coordinates,
+            mapVideo
+          );
+
+          if (result.status === "SUCCESS" && result.outputPath) {
+            results.push(result.outputPath);
+            logger.info(`[${jobId}] Processed template ${template}`, {
+              outputPath: result.outputPath,
+              processingTime: result.processingTime,
+            });
+          } else {
+            logger.warn(`[${jobId}] Failed to process template ${template}`, {
+              error: result.error,
+            });
           }
-        );
+        } catch (error) {
+          logger.error(`[${jobId}] Error processing template ${template}`, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
 
-        const batchResults = await Promise.all(
-          batch.map((template) =>
-            this.processTemplate(
-              template,
-              runwayVideos,
-              jobId,
-              listingId,
-              coordinates,
-              mapVideo
-            )
-          )
-        );
-
-        const successfulOutputs = batchResults
-          .filter((result) => result.status === "SUCCESS" && result.outputPath)
-          .map((result) => result.outputPath!);
-
-        results.push(...successfulOutputs);
-
-        // Log batch completion status
-        logger.info(`[${jobId}] Batch ${i / BATCH_SIZE + 1} completed`, {
-          total: batch.length,
-          successful: successfulOutputs.length,
-          failed: batch.length - successfulOutputs.length,
-        });
-      } catch (error) {
-        logger.error(`[${jobId}] Batch processing failed`, {
-          batch,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        // Continue with next batch despite errors
-        continue;
-      }
-
-      // Small delay between batches
-      if (i + BATCH_SIZE < regularTemplates.length) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        // Delay between individual templates
+        if (
+          i + BATCH_SIZE < regularTemplates.length ||
+          mapDependentTemplates.length > 0
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 2000)); // 2s delay
+        }
       }
     }
 
@@ -1391,21 +1468,25 @@ export class ProductionPipeline {
                 processingTime: result.processingTime,
               });
             } else {
-              throw new Error(
-                result.error || "Unknown error in map template processing"
-              );
+              logger.warn(`[${jobId}] Map template processing failed`, {
+                template,
+                error:
+                  result.error || "Unknown error in map template processing",
+              });
             }
           } catch (error) {
-            logger.error(`[${jobId}] Map template processing failed`, {
-              template,
-              error: error instanceof Error ? error.message : String(error),
-            });
+            logger.error(
+              `[${jobId}] Error processing map template ${template}`,
+              {
+                error: error instanceof Error ? error.message : String(error),
+              }
+            );
             // Continue with next template despite errors
             continue;
           }
 
           // Small delay between map templates
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          await new Promise((resolve) => setTimeout(resolve, 3000)); // 3s delay
         }
       } catch (error) {
         logger.error(`[${jobId}] Map video validation failed`, {
@@ -1430,7 +1511,7 @@ export class ProductionPipeline {
       successfulTemplatesCount: results.length,
       templates: results.map((path: string) => {
         const parts = path.split("/");
-        return parts[parts.length - 1].split("_")[0]; // Extract template name from path
+        return parts[parts.length - 1].split(".")[0]; // Extract template name from path
       }),
     });
 
