@@ -32,12 +32,12 @@ RUN apt-get update && \
     mkdir -p /app/logs && \
     chmod -R 777 /app/logs
 
-# Set ffmpeg environment variables
+# Set environment variables
 ENV PATH="/usr/bin:$PATH" \
     FFMPEG_PATH="/usr/bin/ffmpeg" \
     FFPROBE_PATH="/usr/bin/ffprobe" \
+    # Explicitly set NODE_OPTIONS for max heap size
     NODE_OPTIONS="--max-old-space-size=8192" \
-    # Add these environment variables
     TEMP_DIR="/app/temp" \
     TEMP_OUTPUT_DIR="/app/temp/output" \
     TEMP_PROCESSING_DIR="/app/temp/processing" \
@@ -49,7 +49,9 @@ ENV PATH="/usr/bin:$PATH" \
     FILE_VALIDATION_RETRIES="3" \
     FILE_VALIDATION_DELAY="1000" \
     FILE_DOWNLOAD_TIMEOUT="60000" \
-    LOG_DIR="/app/logs"
+    LOG_DIR="/app/logs" \
+    # Ensure Node.js respects ENV during runtime
+    NODE_ENV="production"
 
 # Copy package files
 COPY package.json pnpm-lock.yaml ./
@@ -69,5 +71,5 @@ RUN pnpm run build
 # Expose port
 EXPOSE 8080
 
-# Start the app
-CMD ["pnpm", "start"]
+# Start the app with explicit Node.js command to ensure NODE_OPTIONS is applied
+CMD ["node", "--max-old-space-size=8192", "build/server.js"]
