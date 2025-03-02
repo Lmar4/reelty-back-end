@@ -207,6 +207,18 @@ class ResourceManager {
 }
 
 export class ProductionPipeline {
+  private async getFileDescriptorCount(jobId: string): Promise<number> {
+    try {
+      const files = await fs.readdir("/proc/self/fd");
+      return files.length;
+    } catch (error) {
+      logger.warn(`[${jobId}] Failed to get file descriptor count`, {
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      return 0;
+    }
+  }
+
   private readonly MEMORY_WARNING_THRESHOLD = 0.7; // 70% memory usage triggers warning
   private readonly MEMORY_CRITICAL_THRESHOLD = 0.8; // 80% memory usage triggers reduction
   private readonly MEMORY_STABLE_THRESHOLD = 0.4; // 40% memory usage considered stable
@@ -1091,6 +1103,77 @@ export class ProductionPipeline {
       await fs.mkdir(tempDir, { recursive: true });
       const templateConfig = reelTemplates[template];
 
+      const fdCount = await this.getFileDescriptorCount(jobId);
+      const memoryUsage = process.memoryUsage();
+      logger.info(`[${jobId}] Starting template ${template}`, {
+        fdCount,
+        memoryUsage: {
+          rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+          heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
+          heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+        },
+      });
+
+      if (fdCount > 900 || memoryUsage.rss / 1024 / 1024 > 400) {
+        throw new Error(
+          `Resource limits exceeded (FD: ${fdCount}, RSS: ${Math.round(
+            memoryUsage.rss / 1024 / 1024
+          )} MB)`
+        );
+      }
+
+      let videosToProcess: string[] = runwayVideos;
+      if (template === "googlezoomintro" && mapVideo) {
+        logger.info(`[${jobId}] Batching googlezoomintro clips`, {
+          totalClips: runwayVideos.length + 1,
+        });
+
+        const allClips: VideoClip[] = [
+          {
+            path: mapVideo,
+            duration: (templateConfig.durations as any)?.map || 3,
+          },
+          ...runwayVideos.map((path: string, i: number) => ({
+            path,
+            duration: Array.isArray(templateConfig.durations)
+              ? templateConfig.durations[i + 1] || 5
+              : templateConfig.durations[i] || 5,
+          })),
+        ];
+
+        const batchSize = 5;
+        const batches: VideoClip[][] = [];
+        for (let i = 0; i < allClips.length; i += batchSize) {
+          batches.push(allClips.slice(i, i + batchSize));
+        }
+
+        const batchOutputs: string[] = [];
+        for (let i = 0; i < batches.length; i++) {
+          const batchOutput = path.join(tempDir, `batch_${i}.mp4`);
+          await ffmpegQueueManager.enqueueJob(async () => {
+            const fdCountBatch = await this.getFileDescriptorCount(jobId);
+            logger.debug(`[${jobId}] Processing batch ${i}`, {
+              fdCount: fdCountBatch,
+            });
+            if (fdCountBatch > 900) {
+              throw new Error(
+                `Too many file descriptors (${fdCountBatch}) in batch ${i}`
+              );
+            }
+            await videoProcessingService.stitchVideoClips(
+              batches[i],
+              batchOutput,
+              { name: `batch_${i}` }
+            );
+          });
+          await this.resourceManager.trackResource(batchOutput);
+          batchOutputs.push(batchOutput);
+        }
+
+        videosToProcess = batchOutputs;
+        mapVideo = null; // Processed in batches
+      }
+
       // Validate durations early
       const durations = Array.isArray(templateConfig.durations)
         ? templateConfig.durations
@@ -1122,7 +1205,7 @@ export class ProductionPipeline {
       // Pre-register all resources for tracking
       const watermarkConfig = await this.getSharedWatermarkPath(jobId);
       const resources: ResourceTracker[] = [
-        ...runwayVideos.map((_, index) => ({
+        ...videosToProcess.map((_, index) => ({
           path: path.join(tempDir, `segment_${index}.mp4`),
           type: "video" as const,
         })),
@@ -1147,7 +1230,7 @@ export class ProductionPipeline {
         async () => {
           // Download and validate runway videos
           const processedVideos = await Promise.all(
-            runwayVideos.map(async (video, index) => {
+            videosToProcess.map(async (video, index) => {
               const localPath = path.join(tempDir, `segment_${index}.mp4`);
               const validation = await this.validateWithCache(
                 video,
@@ -3427,6 +3510,25 @@ export class ProductionPipeline {
     try {
       // Track the temporary file for cleanup
       await this.resourceManager.trackResource(tempPath);
+
+      const fdCount = await this.getFileDescriptorCount(jobId);
+      const memoryUsage = process.memoryUsage();
+      logger.debug(`[${jobId}] Pre-processing resources for clip ${index}`, {
+        fdCount,
+        memory: {
+          rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+          heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
+          heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+        },
+      });
+
+      if (fdCount > 900 || memoryUsage.rss / 1024 / 1024 > 400) {
+        throw new Error(
+          `Resource limits exceeded (FD: ${fdCount}, RSS: ${Math.round(
+            memoryUsage.rss / 1024 / 1024
+          )} MB)`
+        );
+      }
 
       await ffmpegQueueManager.enqueueJob(async () => {
         const command = this.createFFmpegCommand()
