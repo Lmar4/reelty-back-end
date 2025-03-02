@@ -46,6 +46,7 @@ import { VideoTemplateService } from "../video/video-template.service.js";
 import { ReelTemplate } from "./templates/types.js";
 import { v4 as uuidv4 } from "uuid";
 import ffmpeg, { FfprobeData, FfprobeStream } from "fluent-ffmpeg";
+import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",
@@ -213,7 +214,10 @@ export class ProductionPipeline {
   private readonly BATCH_SIZE_ADJUSTMENT_INTERVAL = 5000; // 5 seconds between adjustments
   private lastBatchSizeAdjustment: number = 0;
   private readonly MAX_RETRIES = 3;
-  private readonly DEFAULT_BATCH_SIZE = 5;
+  private getDefaultBatchSize(isRegeneration?: boolean): number {
+    return isRegeneration ? 2 : 5;
+  }
+  private readonly DEFAULT_BATCH_SIZE = 5; // Default for non-regeneration
   private readonly MIN_BATCH_SIZE = 1;
   private readonly TEMP_DIRS = { OUTPUT: "temp/output" };
   private readonly bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
@@ -244,7 +248,7 @@ export class ProductionPipeline {
 
   constructor(private readonly prisma: PrismaClient = new PrismaClient()) {
     this.resourceManager = new ResourceManager();
-    this.currentBatchSize = this.DEFAULT_BATCH_SIZE;
+    this.currentBatchSize = this.getDefaultBatchSize();
     this.limit = pLimit(this.currentBatchSize);
     this.assetCacheService = AssetCacheService.getInstance();
     this.initializeTempDirectories();
@@ -463,25 +467,26 @@ export class ProductionPipeline {
         await this.resourceManager.trackResource(repairedPath);
 
         try {
-          await new Promise<void>((resolve, reject) => {
-            ffmpeg(tempPath)
-              .outputOptions([
-                "-c:v",
-                "copy",
-                "-c:a",
-                "copy",
-                "-map",
-                "0",
-                "-f",
-                "mp4",
-              ])
-              .output(repairedPath)
-              .on("end", () => resolve())
-              .on("error", (err) =>
-                reject(new Error(`Repair failed: ${err.message}`))
-              )
-              .run();
+          await ffmpegQueueManager.enqueueJob(() => {
+            return new Promise<void>((resolve, reject) => {
+              ffmpeg(tempPath)
+                .outputOptions([
+                  "-c:v",
+                  "copy",
+                  "-c:a",
+                  "copy",
+                  "-map",
+                  "0",
+                  "-f",
+                  "mp4",
+                ])
+                .output(repairedPath)
+                .on("end", () => resolve())
+                .on("error", (err) => reject(err))
+                .run();
+            });
           });
+
           finalPath = repairedPath;
           duration = await videoProcessingService.getVideoDuration(
             repairedPath
@@ -633,6 +638,13 @@ export class ProductionPipeline {
     });
     if (!job?.listingId) throw new Error("Job or listingId not found");
 
+    logger.info(`[${jobId}] Processing ${inputFiles.length} runway videos`, {
+      indices: inputFiles.map((_, i) => i),
+      isRegeneration: options?.isRegeneration,
+      forceRegeneration: options?.forceRegeneration,
+      activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
+    });
+
     const verifyRunwayVideo = async (order: number): Promise<boolean> => {
       const photo = await this.prisma.photo.findFirst({
         where: { listingId: job.listingId, order },
@@ -653,12 +665,12 @@ export class ProductionPipeline {
         });
         return photo?.runwayVideoPath || null;
       }
-      const result = await this.retryRunwayGeneration(
-        inputUrl,
-        index,
-        job.listingId,
-        jobId
+
+      // Enqueue the FFmpeg job via FFmpegQueueManager
+      const result = await ffmpegQueueManager.enqueueJob(() =>
+        this.retryRunwayGeneration(inputUrl, index, job.listingId, jobId)
       );
+
       return result?.s3Url || null;
     };
 
@@ -1387,7 +1399,8 @@ export class ProductionPipeline {
     coordinates?: { lat: number; lng: number },
     mapVideo?: string | null
   ): Promise<string[]> {
-    const BATCH_SIZE = 1; // Reduced to 1 to lower concurrency
+    const isRegeneration = await this.isRegeneration(jobId); // Helper to check job metadata
+    const BATCH_SIZE = this.getDefaultBatchSize(isRegeneration);
     const results: string[] = [];
 
     const mapDependentTemplates = templates.filter(
@@ -1439,6 +1452,7 @@ export class ProductionPipeline {
         {
           templates: batch,
           batchSize: batch.length,
+          isRegeneration,
         }
       );
 
@@ -1470,12 +1484,13 @@ export class ProductionPipeline {
           });
         }
 
-        // Delay between individual templates
+        // Delay between individual templates, increased for regeneration
         if (
           i + BATCH_SIZE < regularTemplates.length ||
           mapDependentTemplates.length > 0
         ) {
-          await new Promise((resolve) => setTimeout(resolve, 2000)); // 2s delay
+          const delay = isRegeneration ? 3000 : 2000; // 3s for regeneration, 2s otherwise
+          await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
     }
@@ -2228,6 +2243,13 @@ export class ProductionPipeline {
     const heapTotal = used.heapTotal / 1024 / 1024; // Convert to MB
     const heapUsage = used.heapUsed / used.heapTotal;
 
+    logger.info(`[${jobId}] Resource usage before FFmpeg task`, {
+      heapUsed: `${heapUsed.toFixed(2)} MB`,
+      heapTotal: `${heapTotal.toFixed(2)} MB`,
+      heapUsage: `${(heapUsage * 100).toFixed(1)}%`,
+      activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
+    });
+
     const memoryInfo = {
       heapUsed: `${heapUsed.toFixed(2)} MB`,
       heapTotal: `${heapTotal.toFixed(2)} MB`,
@@ -2682,10 +2704,12 @@ export class ProductionPipeline {
 
   // Helper method to run FFprobe (you may need to install ffprobe or use a library like fluent-ffmpeg for this)
   private async runFFprobe(filePath: string): Promise<FfprobeData> {
-    return new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(filePath, (err: Error | null, metadata: FfprobeData) => {
-        if (err) reject(err);
-        else resolve(metadata);
+    return ffmpegQueueManager.enqueueJob(() => {
+      return new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(filePath, (err: Error | null, metadata: FfprobeData) => {
+          if (err) reject(err);
+          else resolve(metadata);
+        });
       });
     });
   }
@@ -3361,5 +3385,13 @@ export class ProductionPipeline {
     } catch {
       return false;
     }
+  }
+
+  private async isRegeneration(jobId: string): Promise<boolean> {
+    const job = await this.prisma.videoJob.findUnique({
+      where: { id: jobId },
+      select: { metadata: true },
+    });
+    return (job?.metadata as any)?.isRegeneration === true;
   }
 }
