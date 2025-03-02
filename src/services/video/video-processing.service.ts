@@ -100,10 +100,7 @@ interface GifOptions {
 export class VideoProcessingService {
   private static instance: VideoProcessingService;
   private static activeFFmpegCount = 0; // Global FFmpeg process counter
-  private static readonly MAX_GLOBAL_FFMPEG = parseInt(
-    process.env.MAX_GLOBAL_FFMPEG || "1",
-    10
-  ); // Global limit
+  private static readonly MAX_GLOBAL_FFMPEG = 2; // Global limit
 
   private readonly TEMP_DIR = process.env.TEMP_OUTPUT_DIR || "./temp";
   private s3Service: S3Service;
@@ -225,7 +222,10 @@ export class VideoProcessingService {
         tempValidationPath
       );
       let finalPath = tempValidationPath;
-      if (!metadata.hasVideo || metadata.duration <= 0) {
+      if (
+        (!metadata.hasVideo && context !== "music") ||
+        metadata.duration <= 0
+      ) {
         const repairedPath = await this.repairVideo(
           tempValidationPath,
           context
@@ -236,9 +236,18 @@ export class VideoProcessingService {
         }
       }
 
-      if (!metadata.hasVideo) {
-        throw new Error(`${context} has no video stream`);
+      // For music files, we only need to check if it has audio and valid duration
+      if (context === "music") {
+        if (!metadata.hasAudio) {
+          throw new Error(`${context} has no audio stream`);
+        }
+      } else {
+        // For video files, we need to check if it has video
+        if (!metadata.hasVideo) {
+          throw new Error(`${context} has no video stream`);
+        }
       }
+
       if (metadata.duration <= 0) {
         throw new Error(
           `${context} has invalid duration: ${metadata.duration}`
@@ -268,11 +277,24 @@ export class VideoProcessingService {
     filePath: string,
     context: string
   ): Promise<string | null> {
-    const repairedPath = `${this.TEMP_DIR}/repaired_${crypto.randomUUID()}.mp4`;
+    const extension = context === "music" ? ".mp3" : ".mp4";
+    const repairedPath = `${
+      this.TEMP_DIR
+    }/repaired_${crypto.randomUUID()}${extension}`;
     try {
       await new Promise<void>((resolve, reject) => {
-        ffmpeg(filePath)
-          .outputOptions([
+        const command = ffmpeg(filePath);
+
+        if (context === "music") {
+          // For music files, focus on audio
+          command.outputOptions([
+            "-c:a",
+            "copy",
+            "-vn", // No video
+          ]);
+        } else {
+          // For video files, copy both streams
+          command.outputOptions([
             "-c:v",
             "copy",
             "-c:a",
@@ -281,7 +303,10 @@ export class VideoProcessingService {
             "0",
             "-f",
             "mp4",
-          ])
+          ]);
+        }
+
+        command
           .output(repairedPath)
           .on("end", () => resolve())
           .on("error", (err) =>
@@ -289,7 +314,7 @@ export class VideoProcessingService {
           )
           .run();
       });
-      logger.info(`Repaired potentially corrupted video`, {
+      logger.info(`Repaired potentially corrupted ${context}`, {
         original: filePath,
         repaired: repairedPath,
       });
@@ -1688,9 +1713,10 @@ export class VideoProcessingService {
       const metadata = await this.videoValidationService.validateVideo(
         filePath
       );
+      // This works for both video and audio files
       return metadata.duration;
     } catch (error) {
-      logger.error("Failed to get video duration", {
+      logger.error("Failed to get media duration", {
         path: filePath,
         error: error instanceof Error ? error.message : "Unknown error",
       });
@@ -1703,9 +1729,19 @@ export class VideoProcessingService {
       const metadata = await this.videoValidationService.validateVideo(
         filePath
       );
+
+      // Check if this is likely an audio file
+      const isAudioFile = !metadata.hasVideo && metadata.hasAudio;
+
+      if (isAudioFile) {
+        // For audio files, we only need valid audio and duration
+        return metadata.hasAudio && metadata.duration > 0;
+      }
+
+      // For video files, we need valid video and duration
       return metadata.hasVideo && metadata.duration > 0;
     } catch (error) {
-      logger.error("Video integrity check failed", {
+      logger.error("Media integrity check failed", {
         error: error instanceof Error ? error.message : "Unknown error",
         filePath,
       });
@@ -1753,12 +1789,21 @@ export class VideoProcessingService {
       await this.validateFile(filePath, "music");
 
       // Try to get duration as additional validation
-      const duration = await this.getVideoDuration(filePath);
+      const metadata = await this.videoValidationService.validateVideo(
+        filePath
+      );
 
-      if (duration <= 0) {
+      if (!metadata.hasAudio) {
+        logger.warn("Music file has no audio stream", {
+          path: filePath,
+        });
+        return false;
+      }
+
+      if (metadata.duration <= 0) {
         logger.warn("Invalid music file duration", {
           path: filePath,
-          duration,
+          duration: metadata.duration,
         });
         return false;
       }
