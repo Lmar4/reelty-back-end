@@ -217,7 +217,7 @@ export class ProductionPipeline {
   private getDefaultBatchSize(isRegeneration?: boolean): number {
     return isRegeneration ? 2 : 5;
   }
-  private readonly DEFAULT_BATCH_SIZE = 5; // Default for non-regeneration
+  private readonly DEFAULT_BATCH_SIZE = this.getDefaultBatchSize(); // Default for non-regeneration
   private readonly MIN_BATCH_SIZE = 1;
   private readonly TEMP_DIRS = { OUTPUT: "temp/output" };
   private readonly bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
@@ -3393,5 +3393,139 @@ export class ProductionPipeline {
       select: { metadata: true },
     });
     return (job?.metadata as any)?.isRegeneration === true;
+  }
+
+  private getMemoryUsageInfo(): {
+    rss: string;
+    heapTotal: string;
+    heapUsed: string;
+  } {
+    const memoryUsage = process.memoryUsage();
+    return {
+      rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+      heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
+      heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+    };
+  }
+
+  public async preProcessWesAndersonClip(
+    clip: VideoClip,
+    index: number,
+    jobId: string
+  ): Promise<VideoClip> {
+    const tempPath = path.join(
+      this.TEMP_DIRS.OUTPUT,
+      `preprocessed_${jobId}_${index}.mp4`
+    );
+
+    logger.info(`[${jobId}] Pre-processing Wes Anderson clip ${index}`, {
+      inputPath: clip.path,
+      outputPath: tempPath,
+      duration: clip.duration,
+    });
+
+    try {
+      // Track the temporary file for cleanup
+      await this.resourceManager.trackResource(tempPath);
+
+      await ffmpegQueueManager.enqueueJob(async () => {
+        const command = this.createFFmpegCommand()
+          .input(clip.path)
+          .complexFilter([
+            {
+              filter: "trim",
+              options: `duration=${clip.duration}`,
+              outputs: ["trimmed"],
+            },
+            {
+              filter: "setpts",
+              options: "PTS-STARTPTS",
+              inputs: ["trimmed"],
+              outputs: ["pts"],
+            },
+            {
+              filter: "eq",
+              options:
+                "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
+              inputs: ["pts"],
+              outputs: ["eq"],
+            },
+            {
+              filter: "hue",
+              options: "h=5:s=1.2",
+              inputs: ["eq"],
+              outputs: ["hue"],
+            },
+            {
+              filter: "colorbalance",
+              options: "rm=0.1:gm=-0.05:bm=-0.1",
+              inputs: ["hue"],
+              outputs: ["cb"],
+            },
+            {
+              filter: "curves",
+              options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
+              inputs: ["cb"],
+              outputs: ["curves"],
+            },
+            {
+              filter: "unsharp",
+              options: "5:5:1.5:5:5:0.0",
+              inputs: ["curves"],
+              outputs: ["unsharp"],
+            },
+            {
+              filter: "format",
+              options: "yuv420p",
+              inputs: ["unsharp"],
+              outputs: ["final"],
+            },
+          ])
+          .outputOptions(["-map", "[final]"])
+          .outputOptions(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+          .output(tempPath);
+
+        await new Promise<void>((resolve, reject) => {
+          command
+            .on("end", () => {
+              logger.info(
+                `[${jobId}] Pre-processed Wes Anderson clip ${index}`,
+                { tempPath }
+              );
+              resolve();
+            })
+            .on("error", (err: Error) => {
+              logger.error(
+                `[${jobId}] Pre-processing failed for clip ${index}`,
+                { error: err.message, path: clip.path }
+              );
+              reject(err);
+            })
+            .run();
+        });
+      });
+
+      return { ...clip, path: tempPath };
+    } catch (error) {
+      logger.error(
+        `[${jobId}] Error in preProcessWesAndersonClip for clip ${index}`,
+        {
+          error: error instanceof Error ? error.message : String(error),
+          path: clip.path,
+        }
+      );
+      return clip; // Fallback to original clip
+    } finally {
+      logger.debug(`[${jobId}] Pre-processing cleanup check`, {
+        tempFiles: Array.from(this.resourceManager.tempFiles).filter((f) =>
+          f.includes(`preprocessed_${jobId}`)
+        ),
+      });
+    }
+  }
+
+  private createFFmpegCommand(): any {
+    const ffmpeg = require("fluent-ffmpeg");
+    return ffmpeg();
   }
 }
