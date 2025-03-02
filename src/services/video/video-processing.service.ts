@@ -18,6 +18,7 @@ import { EventEmitter } from "events";
 import { VideoValidationService } from "./video-validation.service.js";
 import { S3VideoService } from "./s3-video.service.js";
 import { resourceManager } from "../video/resource-manager.service.js";
+import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
 
 interface FFmpegError extends Error {
   code?: string;
@@ -99,21 +100,12 @@ interface GifOptions {
 
 export class VideoProcessingService {
   private static instance: VideoProcessingService;
-  private static activeFFmpegCount = 0; // Global FFmpeg process counter
-  private static readonly MAX_GLOBAL_FFMPEG = 2; // Global limit
 
   private readonly TEMP_DIR = process.env.TEMP_OUTPUT_DIR || "./temp";
   private s3Service: S3Service;
   private s3VideoService: S3VideoService;
   private videoValidationService: VideoValidationService;
   private readonly FFmpeg_TIMEOUT = 60 * 60 * 1000; // 1 hour timeout
-  private activeFFmpegJobs = 0;
-  private readonly MAX_CONCURRENT_JOBS = parseInt(
-    process.env.MAX_CONCURRENT_FFMPEG_JOBS || "1",
-    10
-  );
-  private ffmpegQueue: Array<() => Promise<void>> = [];
-  private processingLock = false;
   private segmentCache: Map<string, string> = new Map(); // Cache for downloaded segments
 
   // Add a private property to cache the codec
@@ -128,9 +120,6 @@ export class VideoProcessingService {
       logger.info("Created TEMP_DIR", { path: this.TEMP_DIR });
     }
 
-    // Start the queue processor
-    this.processFFmpegQueue();
-
     // Set up periodic cache cleanup (every 30 minutes)
     setInterval(() => this.cleanupSegmentCache(), 30 * 60 * 1000);
 
@@ -140,8 +129,7 @@ export class VideoProcessingService {
         "Uncaught exception in VideoProcessingService, cleaning up resources",
         {
           error: error instanceof Error ? error.message : String(error),
-          activeJobs: this.activeFFmpegJobs,
-          globalFFmpegCount: VideoProcessingService.activeFFmpegCount,
+          activeJobs: ffmpegQueueManager.getActiveCount(),
         }
       );
 
@@ -775,34 +763,19 @@ export class VideoProcessingService {
           logger.info("FFmpeg process started", {
             commandLine,
             codec,
-            activeJobs: this.activeFFmpegJobs,
-            globalFFmpegCount: VideoProcessingService.activeFFmpegCount,
+            activeJobs: ffmpegQueueManager.getActiveCount(),
           });
-
-          // Increment global FFmpeg counter
-          VideoProcessingService.activeFFmpegCount++;
         })
         .on("progress", (progress) =>
           this.handleFFmpegProgress(progress, "video-processing")
         )
         .on("end", () => {
           logger.info("FFmpeg process completed");
-          // Decrement global FFmpeg counter
-          VideoProcessingService.activeFFmpegCount = Math.max(
-            0,
-            VideoProcessingService.activeFFmpegCount - 1
-          );
         })
         .on("error", (error: FFmpegError) => {
           // Ensure we have the full stderr output
           const fullStderr = stderrBuffer.join("\n");
           error.stderr = fullStderr || error.stderr;
-
-          // Decrement global FFmpeg counter on error
-          VideoProcessingService.activeFFmpegCount = Math.max(
-            0,
-            VideoProcessingService.activeFFmpegCount - 1
-          );
 
           this.handleFFmpegError(error, "video-processing");
         })
@@ -953,8 +926,8 @@ export class VideoProcessingService {
           heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
           heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
         },
-        activeFFmpegJobs: this.activeFFmpegJobs,
-        queuedJobs: this.ffmpegQueue.length,
+        activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
+        queuedJobs: ffmpegQueueManager.getQueueLength(),
       };
     } catch (e) {
       details.systemInfoError =
@@ -1204,18 +1177,6 @@ export class VideoProcessingService {
       options,
     });
 
-    // Wait for global FFmpeg slot
-    while (
-      VideoProcessingService.activeFFmpegCount >=
-      VideoProcessingService.MAX_GLOBAL_FFMPEG
-    ) {
-      logger.debug(`[${jobId}] Waiting for global FFmpeg slot`, {
-        activeCount: VideoProcessingService.activeFFmpegCount,
-        maxGlobal: VideoProcessingService.MAX_GLOBAL_FFMPEG,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-
     // Ensure all input files exist and are accessible
     for (const path of inputPaths) {
       try {
@@ -1241,8 +1202,16 @@ export class VideoProcessingService {
       );
     }
 
-    // Enqueue the FFmpeg job
-    return this.enqueueFFmpegJob(async () => {
+    // Enqueue the FFmpeg job via FFmpegQueueManager
+    logger.info(`[${jobId}] Enqueuing stitchVideos job`, {
+      inputCount: inputPaths.length,
+      outputPath,
+      options,
+      memoryUsage: this.getMemoryUsageInfo(),
+      activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
+      queuedJobs: ffmpegQueueManager.getQueueLength(),
+    });
+    return ffmpegQueueManager.enqueueJob(async () => {
       // Create a temporary directory for intermediate files
       const tempDir = await this.createTempDirectory();
       resourceManager.trackResource(jobId, tempDir); // Track temp directory
@@ -1253,6 +1222,9 @@ export class VideoProcessingService {
           inputCount: inputPaths.length,
           outputPath,
           options,
+          memoryUsage: this.getMemoryUsageInfo(),
+          activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
+          queuedJobs: ffmpegQueueManager.getQueueLength(),
         });
 
         // Prepare filter complex for concatenation
@@ -1303,8 +1275,6 @@ export class VideoProcessingService {
               logger.info(`[${jobId}] FFmpeg started with command:`, {
                 commandLine,
               });
-              // Increment global FFmpeg counter
-              VideoProcessingService.activeFFmpegCount++;
             })
             .on("progress", (progress) => {
               logger.debug(`[${jobId}] FFmpeg progress:`, { progress });
@@ -1313,22 +1283,11 @@ export class VideoProcessingService {
               logger.info(`[${jobId}] Video stitching completed successfully`, {
                 outputPath,
               });
-              // Decrement global FFmpeg counter
-              VideoProcessingService.activeFFmpegCount = Math.max(
-                0,
-                VideoProcessingService.activeFFmpegCount - 1
-              );
               resolve();
             })
             .on("error", (err: FFmpegError) => {
               // Ensure we have the full stderr output
               err.stderr = stderrBuffer.join("\n") || err.stderr;
-
-              // Decrement global FFmpeg counter on error
-              VideoProcessingService.activeFFmpegCount = Math.max(
-                0,
-                VideoProcessingService.activeFFmpegCount - 1
-              );
 
               this.handleFFmpegError(err, `stitchVideos-${jobId}`);
               reject(err);
@@ -1819,82 +1778,6 @@ export class VideoProcessingService {
   }
 
   // Process the FFmpeg job queue
-  private async processFFmpegQueue() {
-    if (this.processingLock) return;
-
-    this.processingLock = true;
-    try {
-      while (
-        this.ffmpegQueue.length > 0 &&
-        this.activeFFmpegJobs < this.MAX_CONCURRENT_JOBS
-      ) {
-        const job = this.ffmpegQueue.shift();
-        if (job) {
-          this.activeFFmpegJobs++;
-          try {
-            await job();
-          } catch (error) {
-            logger.error("FFmpeg job failed in queue processor", {
-              error: error instanceof Error ? error.message : "Unknown error",
-              activeJobs: this.activeFFmpegJobs,
-              queueLength: this.ffmpegQueue.length,
-            });
-          } finally {
-            this.activeFFmpegJobs--;
-          }
-        }
-      }
-    } finally {
-      this.processingLock = false;
-
-      // If there are still jobs and we're not at capacity, continue processing
-      if (
-        this.ffmpegQueue.length > 0 &&
-        this.activeFFmpegJobs < this.MAX_CONCURRENT_JOBS
-      ) {
-        setTimeout(() => this.processFFmpegQueue(), 100);
-      }
-    }
-  }
-
-  // Add a job to the queue and start processing if possible
-  private enqueueFFmpegJob(job: () => Promise<void>): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const MAX_QUEUE_SIZE = 50; // Configurable limit
-      if (this.ffmpegQueue.length >= MAX_QUEUE_SIZE) {
-        logger.error("FFmpeg queue full, rejecting job", {
-          queueLength: this.ffmpegQueue.length,
-          maxQueueSize: MAX_QUEUE_SIZE,
-        });
-        reject(new Error("FFmpeg queue is full"));
-        return;
-      }
-
-      const wrappedJob = async () => {
-        try {
-          await job();
-          resolve();
-        } catch (error) {
-          reject(error);
-        }
-      };
-
-      this.ffmpegQueue.push(wrappedJob);
-      logger.info("Added FFmpeg job to queue", {
-        queueLength: this.ffmpegQueue.length,
-        activeJobs: this.activeFFmpegJobs,
-      });
-
-      // Trigger queue processing
-      if (
-        !this.processingLock &&
-        this.activeFFmpegJobs < this.MAX_CONCURRENT_JOBS
-      ) {
-        setTimeout(() => this.processFFmpegQueue(), 0);
-      }
-    });
-  }
-
   private async createTempDirectory(): Promise<string> {
     const tempDir = path.join(this.TEMP_DIR, `temp_${crypto.randomUUID()}`);
     await fs.mkdir(tempDir, { recursive: true });
@@ -1917,6 +1800,9 @@ export class VideoProcessingService {
       outputPath,
       hasMusic: !!template.music,
       hasWatermark: !!watermarkConfig,
+      memoryUsage: this.getMemoryUsageInfo(),
+      activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
+      queuedJobs: ffmpegQueueManager.getQueueLength(),
     });
 
     try {
@@ -2801,6 +2687,19 @@ export class VideoProcessingService {
       );
       // If pre-processing fails, return the original clip
       return clip;
+    }
+  }
+
+  private getMemoryUsageInfo() {
+    try {
+      const memoryUsage = process.memoryUsage();
+      return {
+        rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+        heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
+        heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+      };
+    } catch (e) {
+      return { error: String(e) };
     }
   }
 }
