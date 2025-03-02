@@ -1239,6 +1239,14 @@ export class ProductionPipeline {
                     jobId
                   );
                 await this.resourceManager.trackResource(preprocessedClip.path);
+                const metadata = await videoProcessingService.getVideoMetadata(
+                  preprocessedClip.path
+                );
+                if (!metadata.hasVideo || !metadata.width || !metadata.height) {
+                  throw new Error(
+                    `Pre-processed clip ${index} invalid: ${preprocessedClip.path}`
+                  );
+                }
                 return {
                   path: preprocessedClip.path,
                   duration: durations[index] || video.duration,
@@ -1264,47 +1272,15 @@ export class ProductionPipeline {
           const outputPath = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/properties/${listingId}/videos/templates/${jobId}/${template}.mp4`;
 
           // Configure and pre-convert watermark
-          let watermarkSettings: WatermarkConfig | undefined;
-          if (watermarkConfig) {
-            const convertedWatermarkPath = path.join(
-              tempDir,
-              `watermark_${jobId}_converted.mp4`
-            );
-            await this.resourceManager.trackResource(convertedWatermarkPath);
-            try {
-              await videoProcessingService.convertImageToVideo(
-                watermarkConfig,
-                convertedWatermarkPath,
-                { format: "yuv420p" }
-              );
-              watermarkSettings = {
-                path: convertedWatermarkPath,
-                position: {
-                  x: "(main_w-overlay_w)/2",
-                  y: "main_h-overlay_h-300",
-                },
-              };
-              logger.info(`[${jobId}] Watermark converted to yuv420p`, {
-                originalPath: watermarkConfig,
-                convertedPath: convertedWatermarkPath,
-              });
-            } catch (error) {
-              logger.warn(
-                `[${jobId}] Failed to convert watermark, using original`,
-                {
-                  error:
-                    error instanceof Error ? error.message : "Unknown error",
-                }
-              );
-              watermarkSettings = {
+          const watermarkSettings: WatermarkConfig | undefined = watermarkConfig
+            ? {
                 path: watermarkConfig,
                 position: {
                   x: "(main_w-overlay_w)/2",
                   y: "main_h-overlay_h-300",
                 },
-              };
-            }
-          }
+              }
+            : undefined;
 
           // For googlezoomintro template, explicitly include map video as the first clip
           if (template === "googlezoomintro" && processedMapVideo) {
