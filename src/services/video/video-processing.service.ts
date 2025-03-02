@@ -2517,6 +2517,79 @@ export class VideoProcessingService {
   }
 
   /**
+   * Converts an image to a short video with specified format
+   * @param imagePath Path to the input image
+   * @param outputPath Path for the output video
+   * @param options Conversion options including format
+   */
+  public async convertImageToVideo(
+    imagePath: string,
+    outputPath: string,
+    options: { format?: string } = { format: "yuv420p" }
+  ): Promise<void> {
+    const jobId = crypto.randomUUID();
+    logger.info(`[${jobId}] Converting image to video`, {
+      imagePath,
+      outputPath,
+      format: options.format,
+    });
+
+    try {
+      const command = this.createFFmpegCommand()
+        .input(imagePath)
+        .loop(1) // Single frame
+        .outputOptions([
+          "-t",
+          "1", // 1 second duration
+          "-r",
+          "30", // 30 fps
+          "-c:v",
+          "libx264",
+          "-preset",
+          "fast",
+          "-crf",
+          "23",
+          "-pix_fmt",
+          options.format || "yuv420p",
+        ])
+        .output(outputPath);
+
+      await new Promise<void>((resolve, reject) => {
+        const stderrBuffer: string[] = [];
+        command
+          .on("start", (commandLine) =>
+            logger.info(`[${jobId}] FFmpeg started`, { commandLine })
+          )
+          .on("end", () => {
+            logger.info(`[${jobId}] Image conversion completed`, {
+              outputPath,
+            });
+            resolve();
+          })
+          .on("error", (err: FFmpegError) => {
+            err.stderr = stderrBuffer.join("\n") || err.stderr;
+            logger.error(`[${jobId}] FFmpeg error in image conversion`, {
+              error: err.message,
+              stderr: err.stderr,
+            });
+            reject(err);
+          })
+          .on("stderr", (stderrLine) => stderrBuffer.push(stderrLine))
+          .run();
+      });
+
+      await this.validateFile(outputPath, "Converted watermark video");
+    } catch (error) {
+      logger.error(`[${jobId}] Image to video conversion failed`, {
+        error: error instanceof Error ? error.message : "Unknown error",
+        imagePath,
+        outputPath,
+      });
+      throw error;
+    }
+  }
+
+  /**
    * Cleans up the segment cache to free memory and disk space
    * @param forceCleanAll If true, removes all cached segments, otherwise only removes unused ones
    */
@@ -2652,7 +2725,7 @@ export class VideoProcessingService {
     }
   }
 
-  private async preProcessWesAndersonClip(
+  public async preProcessWesAndersonClip(
     clip: VideoClip,
     index: number,
     jobId: string
