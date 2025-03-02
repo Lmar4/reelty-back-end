@@ -948,9 +948,21 @@ export class VideoProcessingService {
     }
     if (details.lastErrorLine) {
       enhancedMessage += ` (Error: ${details.lastErrorLine})`;
+      const lastErrorLine = String(details.lastErrorLine);
+      const filterMatch = lastErrorLine.match(
+        /(Parsed_[a-z]+_\d+)|auto_scale_\d+/
+      );
+      if (filterMatch) {
+        enhancedMessage += ` (Failed Filter: ${filterMatch[0]})`;
+        details.failedFilter = filterMatch[0];
+      }
     }
 
-    throw new Error(enhancedMessage);
+    const enrichedError = new Error(enhancedMessage) as Error & {
+      details?: Record<string, any>;
+    };
+    enrichedError.details = details;
+    throw enrichedError;
   }
 
   private async uploadToS3(filePath: string, s3Key: string): Promise<string> {
@@ -1208,6 +1220,7 @@ export class VideoProcessingService {
     return this.enqueueFFmpegJob(async () => {
       // Create a temporary directory for intermediate files
       const tempDir = await this.createTempDirectory();
+      resourceManager.trackResource(jobId, tempDir); // Track temp directory
       const tempFiles: string[] = [];
 
       try {
@@ -1336,24 +1349,11 @@ export class VideoProcessingService {
         // Re-throw the error after cleanup
         throw error;
       } finally {
-        // Clean up temporary files
         try {
-          for (const file of tempFiles) {
-            await fs.unlink(file).catch((err) => {
-              logger.warn(`Failed to delete temporary file ${file}:`, {
-                error: err instanceof Error ? err.message : String(err),
-              });
-            });
-          }
-
-          // Remove temporary directory
-          await fs.rmdir(tempDir).catch((err) => {
-            logger.warn(`Failed to delete temporary directory ${tempDir}:`, {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-
-          logger.debug(`[${jobId}] Temporary files cleanup completed`);
+          await resourceManager.cleanup(jobId);
+          logger.debug(
+            `[${jobId}] Temporary files cleanup completed via resourceManager`
+          );
         } catch (cleanupError) {
           logger.warn(
             `[${jobId}] Error during cleanup after video stitching:`,
@@ -1815,6 +1815,16 @@ export class VideoProcessingService {
   // Add a job to the queue and start processing if possible
   private enqueueFFmpegJob(job: () => Promise<void>): Promise<void> {
     return new Promise((resolve, reject) => {
+      const MAX_QUEUE_SIZE = 50; // Configurable limit
+      if (this.ffmpegQueue.length >= MAX_QUEUE_SIZE) {
+        logger.error("FFmpeg queue full, rejecting job", {
+          queueLength: this.ffmpegQueue.length,
+          maxQueueSize: MAX_QUEUE_SIZE,
+        });
+        reject(new Error("FFmpeg queue is full"));
+        return;
+      }
+
       const wrappedJob = async () => {
         try {
           await job();
@@ -2521,6 +2531,25 @@ export class VideoProcessingService {
         cacheSize,
         forceCleanAll,
       });
+
+      // Validate cache entries
+      for (const [url, filePath] of this.segmentCache.entries()) {
+        try {
+          const stats = await fs.stat(filePath);
+          if (stats.size === 0) {
+            logger.warn("Cached file is empty, removing", { url, filePath });
+            await fs.unlink(filePath);
+            this.segmentCache.delete(url);
+          }
+        } catch (error) {
+          logger.warn("Cached file invalid, removing", {
+            url,
+            filePath,
+            error,
+          });
+          this.segmentCache.delete(url);
+        }
+      }
 
       // If force clean, remove all cached segments
       if (forceCleanAll) {
