@@ -14,7 +14,9 @@ import templatesRouter from "./routes/templates.js";
 import usersRouter from "./routes/users.js";
 import clerkWebhookRouter from "./routes/webhooks/clerk.js";
 import { logger } from "./utils/logger.js";
+import v8 from "v8";
 
+logger.info("V8 Heap Space Statistics", v8.getHeapSpaceStatistics());
 const app = express();
 const port = Number(process.env.PORT) || 3001;
 
