@@ -362,8 +362,22 @@ export class AssetManager {
               error: "Empty watermark file",
             };
           }
-          // Could add more image validation here
-          return { isValid: true };
+          const metadata = await videoProcessingService.getVideoMetadata(
+            filePath
+          );
+          if (!metadata.hasVideo || !metadata.width || !metadata.height) {
+            return {
+              isValid: false,
+              error: "Invalid watermark format or dimensions",
+            };
+          }
+          if (metadata.width > 1920 || metadata.height > 1080) {
+            return {
+              isValid: false,
+              error: "Watermark dimensions exceed 1920x1080",
+            };
+          }
+          return { isValid: true, format: metadata.codec };
 
         default:
           return {
