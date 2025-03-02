@@ -1181,7 +1181,7 @@ export class ProductionPipeline {
             : undefined;
 
           // Stitch video and verify output
-          await videoProcessingService.stitchVideos(
+          await videoProcessingService.createVideo(
             clips,
             outputPath,
             {
