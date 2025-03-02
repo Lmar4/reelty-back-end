@@ -574,6 +574,15 @@ export class MapCaptureService {
     // Round coordinates to 6 decimal places for consistent cache keys
     const lat = Math.round(coordinates.lat * 1000000) / 1000000;
     const lng = Math.round(coordinates.lng * 1000000) / 1000000;
+
+    // Log the exact coordinates used for cache key generation
+    logger.debug("Generating map cache key", {
+      originalLat: coordinates.lat,
+      originalLng: coordinates.lng,
+      normalizedLat: lat,
+      normalizedLng: lng,
+    });
+
     return crypto.createHash("md5").update(`${lat},${lng}`).digest("hex");
   }
 
@@ -635,6 +644,10 @@ export class MapCaptureService {
             cacheKey,
             coordinates,
             cachedPath,
+            attempt,
+            maxRetries,
+            lat: coordinates.lat.toFixed(6),
+            lng: coordinates.lng.toFixed(6),
           });
           return cachedPath;
         }
@@ -644,6 +657,9 @@ export class MapCaptureService {
           {
             cacheKey,
             coordinates,
+            cachedPath,
+            lat: coordinates.lat.toFixed(6),
+            lng: coordinates.lng.toFixed(6),
           }
         );
 
@@ -651,41 +667,70 @@ export class MapCaptureService {
           headless: true,
           args: MAP_CAPTURE_CONFIG.BROWSER_ARGS,
         });
-        const page = await browser.newPage();
 
         try {
+          const page = await browser.newPage();
+
+          // Create frames directory
+          await fsPromises.mkdir(framesDir, { recursive: true });
+
+          // Capture frames
           await this.captureMapFrames(coordinates, page);
+
+          // Create video from frames
           const videoPath = await this.createVideo(framesDir, browser, page);
 
-          // Validate the video immediately
-          const metadata = await videoValidationService.validateVideo(
-            videoPath
+          // Crop to portrait
+          const portraitPath = path.join(
+            this.CACHE_DIR,
+            `portrait-${cacheKey}.mp4`
           );
-          if (!metadata.hasVideo || !metadata.width || !metadata.height) {
-            throw new Error("Generated video has no valid content");
+          await this.cropToPortrait(videoPath, portraitPath);
+
+          // Move to final location
+          await fsPromises.rename(portraitPath, cachedPath);
+
+          // Validate the final video
+          const isValid = await this.validateWithRetry(cachedPath);
+          if (!isValid) {
+            throw new Error("Generated video failed validation");
           }
 
-          await fsPromises.copyFile(videoPath, cachedPath);
+          logger.info(`[${jobId}] Successfully generated map video`, {
+            cacheKey,
+            coordinates,
+            cachedPath,
+            attempt,
+            lat: coordinates.lat.toFixed(6),
+            lng: coordinates.lng.toFixed(6),
+          });
+
           return cachedPath;
         } finally {
-          await this.clearPageResources(page).catch((err) => {
-            logger.warn("Error clearing page resources:", {
-              error: err instanceof Error ? err.message : "Unknown error",
+          // Always close browser
+          if (browser) {
+            await browser.close().catch((err) => {
+              logger.warn("Error closing browser", { error: err.message });
             });
-          });
-          await browser.close().catch((err) => {
-            logger.warn("Error closing browser:", {
-              error: err instanceof Error ? err.message : "Unknown error",
-            });
+          }
+
+          // Clean up frames
+          await this.cleanupFrames(framesDir).catch((err) => {
+            logger.warn("Error cleaning up frames", { error: err.message });
           });
         }
       } catch (error) {
-        logger.warn(
-          `[${jobId}] Map video generation attempt ${attempt} failed`,
+        const errorMessage =
+          error instanceof Error ? error.message : "Unknown error";
+        logger.error(
+          `[${jobId}] Map video generation failed (attempt ${attempt}/${maxRetries})`,
           {
-            error: error instanceof Error ? error.message : "Unknown error",
-            coordinates,
+            error: errorMessage,
             cacheKey,
+            coordinates,
+            lat: coordinates.lat.toFixed(6),
+            lng: coordinates.lng.toFixed(6),
+            attempt,
           }
         );
 
@@ -693,31 +738,15 @@ export class MapCaptureService {
           throw error;
         }
 
-        // Cleanup any temporary files from this attempt
-        await this.cleanupFrames(framesDir).catch((err) => {
-          logger.warn("Failed to cleanup frames after retry:", {
-            error: err instanceof Error ? err.message : "Unknown error",
-            framesDir,
-          });
-        });
-        await fsPromises.unlink(cachedPath).catch((err) => {
-          logger.warn("Failed to cleanup cached file after retry:", {
-            error: err instanceof Error ? err.message : "Unknown error",
-            cachedPath,
-          });
-        });
-
-        // Wait with exponential backoff before retry
-        const delay = Math.min(
-          1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random()),
-          5000
-        );
+        // Exponential backoff
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+        logger.info(`[${jobId}] Retrying map generation in ${delay}ms`);
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
 
     throw new Error(
-      `Failed to generate valid map video after ${maxRetries} attempts`
+      `Failed to generate map video after ${maxRetries} attempts`
     );
   }
 
