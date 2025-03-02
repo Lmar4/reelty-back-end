@@ -1779,6 +1779,8 @@ export class ProductionPipeline {
       isRegeneration,
       forceRegeneration,
       regenerationContext,
+      coordinates,
+      listingId: inputListingId,
     } = input;
     logger.info(`[${jobId}] Pipeline execution started`, { input });
 
@@ -1804,7 +1806,7 @@ export class ProductionPipeline {
     const tempDir = path.join(process.cwd(), "temp", jobId);
 
     try {
-      let listingId = input.listingId;
+      let listingId = inputListingId;
       if (!listingId) {
         const job = await this.prisma.videoJob.findUnique({
           where: { id: jobId },
@@ -1841,14 +1843,16 @@ export class ProductionPipeline {
         logger.warn(`[${jobId}] Job not found before execution`);
       }
 
+      // Vision processing - can be forced to regenerate
       await this.processWithMemoryCheck(
         jobId,
         async () => await this.processVisionImages(jobId),
         "Vision image processing"
       );
 
+      // Runway video generation - can be forced to regenerate
       let runwayVideos: string[] = [];
-      const options = {
+      const runwayOptions = {
         isRegeneration,
         forceRegeneration,
         regenerationContext,
@@ -1859,7 +1863,7 @@ export class ProductionPipeline {
           jobId,
           async () =>
             await this.retryWithBackoff(
-              () => this.processRunwayVideos(jobId, inputFiles, options),
+              () => this.processRunwayVideos(jobId, inputFiles, runwayOptions),
               this.MAX_RUNWAY_RETRIES,
               "Runway video processing",
               jobId
@@ -1880,7 +1884,8 @@ export class ProductionPipeline {
             jobId,
             async () =>
               await this.retryWithBackoff(
-                () => this.processRunwayVideos(jobId, inputFiles, options),
+                () =>
+                  this.processRunwayVideos(jobId, inputFiles, runwayOptions),
                 this.MAX_RUNWAY_RETRIES,
                 "Runway video processing",
                 jobId
@@ -1900,23 +1905,73 @@ export class ProductionPipeline {
 
       await this.verifyResources(runwayVideos, null);
 
-      const mapVideo = input.coordinates
-        ? await this.processWithMemoryCheck(
+      // Map video generation - always check cache first regardless of forceRegeneration
+      let mapVideo = null;
+      if (coordinates && listingId) {
+        // Generate a standardized cache key for map videos
+        const mapCacheKey = this.generateStandardMapCacheKey(
+          listingId,
+          coordinates
+        );
+
+        // Always check cache first, regardless of forceRegeneration
+        const cachedMapVideo = await this.getCachedAsset(mapCacheKey, "map");
+        if (cachedMapVideo) {
+          const isValid = await this.validateMapVideo(cachedMapVideo, jobId);
+          if (isValid) {
+            logger.info(
+              `[${jobId}] Using cached map video regardless of forceRegeneration`,
+              {
+                mapCacheKey,
+                cachedPath: cachedMapVideo,
+                listingId,
+                coordinates,
+                forceRegeneration,
+              }
+            );
+            mapVideo = this.validateS3Url(cachedMapVideo);
+          } else {
+            logger.warn(
+              `[${jobId}] Cached map video failed validation, will regenerate`,
+              {
+                mapCacheKey,
+                cachedPath: cachedMapVideo,
+                listingId,
+                coordinates,
+              }
+            );
+          }
+        }
+
+        // Only generate if not found in cache or validation failed
+        if (!mapVideo) {
+          mapVideo = await this.processWithMemoryCheck(
             jobId,
             async () =>
               await this.generateMapVideoForTemplate(
-                input.coordinates!,
+                coordinates,
                 jobId,
                 listingId
               ),
             "Map video generation"
-          )
-        : null;
+          );
+
+          if (mapVideo) {
+            logger.info(`[${jobId}] Generated new map video`, {
+              mapCacheKey,
+              path: mapVideo,
+              listingId,
+              coordinates,
+            });
+          }
+        }
+      }
 
       if (mapVideo) {
         await this.verifyResources([mapVideo], null);
       }
 
+      // Template processing - can be forced to regenerate
       const templateResults = await this.processWithMemoryCheck(
         jobId,
         async () =>
@@ -1925,7 +1980,7 @@ export class ProductionPipeline {
             jobId,
             listingId,
             Object.keys(reelTemplates) as TemplateKey[],
-            input.coordinates,
+            coordinates,
             mapVideo
           ),
         "Template processing"
@@ -2215,10 +2270,9 @@ export class ProductionPipeline {
     const MAP_GENERATION_TIMEOUT = 300000; // 5 minutes
     const MAX_RETRIES = 3;
 
-    const cacheKey = `map_${jobId}_${crypto
-      .createHash("md5")
-      .update(`${coordinates.lat},${coordinates.lng}`)
-      .digest("hex")}`;
+    // Standardize cache key to use only listing ID and coordinates
+    // This ensures consistency across regenerations
+    const cacheKey = this.generateStandardMapCacheKey(listingId, coordinates);
     const tempS3Key = `temp/maps/${jobId}/${Date.now()}.mp4`;
 
     try {
@@ -2228,14 +2282,20 @@ export class ProductionPipeline {
         const isValid = await this.validateMapVideo(cachedPath, jobId);
         if (isValid) {
           logger.info(`[${jobId}] Using validated cached map video from S3`, {
+            cacheKey,
             cachedPath,
+            listingId,
+            coordinates,
           });
           return this.validateS3Url(cachedPath);
         } else {
           logger.warn(
             `[${jobId}] Cached map video failed validation, regenerating`,
             {
+              cacheKey,
               cachedPath,
+              listingId,
+              coordinates,
             }
           );
         }
@@ -2244,6 +2304,7 @@ export class ProductionPipeline {
       logger.info(`[${jobId}] Starting map video generation`, {
         coordinates,
         cacheKey,
+        listingId,
       });
 
       // Generate map video with retries and validation
@@ -2272,6 +2333,8 @@ export class ProductionPipeline {
                 {
                   attempt,
                   path: localVideoPath,
+                  listingId,
+                  coordinates,
                 }
               );
               localVideoPath = null;
@@ -2284,6 +2347,7 @@ export class ProductionPipeline {
           logger.warn(`[${jobId}] Map generation attempt ${attempt} failed`, {
             error: errorMessage,
             coordinates,
+            listingId,
           });
 
           if (attempt < MAX_RETRIES) {
@@ -2347,11 +2411,14 @@ export class ProductionPipeline {
         throw new Error("Uploaded map video not accessible after retries");
       }
 
-      // Cache the validated video
+      // Cache the validated video with the standardized cache key
       await this.cacheAsset(jobId, cacheKey, finalS3Url, "map");
 
       logger.info(`[${jobId}] Map video generation completed and validated`, {
         finalS3Url,
+        cacheKey,
+        listingId,
+        coordinates,
       });
 
       return finalS3Url;
@@ -2359,10 +2426,23 @@ export class ProductionPipeline {
       logger.error(`[${jobId}] Map video generation failed`, {
         error: error instanceof Error ? error.message : "Unknown error",
         coordinates,
+        listingId,
+        cacheKey,
         stack: error instanceof Error ? error.stack : undefined,
       });
       return null;
     }
+  }
+
+  // Helper method to generate a standardized cache key for map videos
+  private generateStandardMapCacheKey(
+    listingId: string,
+    coordinates: { lat: number; lng: number }
+  ): string {
+    // Round coordinates to 6 decimal places for consistent cache keys
+    const lat = Math.round(coordinates.lat * 1000000) / 1000000;
+    const lng = Math.round(coordinates.lng * 1000000) / 1000000;
+    return `map_${listingId}_${lat}_${lng}`;
   }
 
   private async validateMapVideo(
