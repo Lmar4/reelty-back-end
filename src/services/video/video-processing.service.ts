@@ -19,6 +19,7 @@ import { VideoValidationService } from "./video-validation.service.js";
 import { S3VideoService } from "./s3-video.service.js";
 import { resourceManager } from "../video/resource-manager.service.js";
 import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
+import { reelTemplates } from "../imageProcessing/templates/types.js";
 
 interface FFmpegError extends Error {
   code?: string;
@@ -484,132 +485,83 @@ export class VideoProcessingService {
     musicIndex?: number,
     watermarkIndex?: number
   ): ffmpeg.FilterSpecification[] | null {
-    if (!clips.length) {
-      logger.warn("No clips provided for filter graph");
-      return null;
-    }
+    if (!clips.length) return null;
 
     const filterCommands: ffmpeg.FilterSpecification[] = [];
     let lastOutput = "";
 
-    // Calculate total duration for audio trimming
-    const totalDuration = clips.reduce(
-      (sum, clip) => sum + (clip.duration || 0),
-      0
-    );
-
-    logger.info("Building filter graph", {
-      clipCount: clips.length,
-      totalDuration,
-      hasWatermark: !!watermarkConfig,
-      hasMusic: musicIndex !== undefined && musicIndex !== -1,
-    });
-
     clips.forEach((clip, i) => {
       const baseInput = `${i}:v`;
-      const trimmedOutput = `trim${i}`;
+      let currentInput = baseInput;
+      let currentOutput = `clip${i}`;
 
-      // First trim the clip to exact duration
+      // Trim and reset PTS
       filterCommands.push({
         filter: "trim",
-        options: `duration=${clip.duration}`,
-        inputs: [baseInput],
-        outputs: [trimmedOutput],
+        options: { duration: clip.duration.toString() },
+        inputs: [currentInput],
+        outputs: [`trim${i}`],
       });
-
-      // Reset timestamps after trim
       filterCommands.push({
         filter: "setpts",
         options: "PTS-STARTPTS",
-        inputs: [trimmedOutput],
-        outputs: [`pts${i}`],
+        inputs: [`trim${i}`],
+        outputs: [currentOutput],
       });
+      currentInput = currentOutput;
 
-      // Apply color correction - MODIFIED to handle complex filters
-      let currentInput = `pts${i}`;
-      let currentOutput = `color${i}`;
-
-      if (clip.colorCorrection?.ffmpegFilter) {
-        // Check if it's the wesanderson template (has curves filter)
-        if (clip.colorCorrection.ffmpegFilter.includes("curves=master")) {
-          // Split into individual filters for wesanderson template
-          // Apply eq filter
-          filterCommands.push({
+      // Apply color correction for Wes Anderson
+      if (clip.colorCorrection?.ffmpegFilter?.includes("curves=master")) {
+        const filters = [
+          {
             filter: "eq",
             options: "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
-            inputs: [currentInput],
-            outputs: [`eq${i}`],
-          });
-          currentInput = `eq${i}`;
-
-          // Apply hue filter
-          filterCommands.push({
-            filter: "hue",
-            options: "h=5:s=1.2",
-            inputs: [currentInput],
-            outputs: [`hue${i}`],
-          });
-          currentInput = `hue${i}`;
-
-          // Apply colorbalance filter
-          filterCommands.push({
+            output: `eq${i}`,
+          },
+          { filter: "hue", options: "h=5:s=1.2", output: `hue${i}` },
+          {
             filter: "colorbalance",
             options: "rm=0.1:gm=-0.05:bm=-0.1",
-            inputs: [currentInput],
-            outputs: [`cb${i}`],
-          });
-          currentInput = `cb${i}`;
-
-          // Apply curves filter (without problematic quotes)
-          filterCommands.push({
+            output: `cb${i}`,
+          },
+          {
             filter: "curves",
-            options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
-            inputs: [currentInput],
-            outputs: [`curves${i}`],
-          });
-          currentInput = `curves${i}`;
-
-          // Apply unsharp filter
-          filterCommands.push({
+            options: { master: "0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1" },
+            output: `curves${i}`,
+          },
+          {
             filter: "unsharp",
             options: "5:5:1.5:5:5:0.0",
-            inputs: [currentInput],
-            outputs: [currentOutput],
-          });
-        } else {
-          // For other templates, use the standard approach with eq filter
-          const filterOptions = clip.colorCorrection.ffmpegFilter.startsWith(
-            "eq="
-          )
-            ? clip.colorCorrection.ffmpegFilter.substring(3)
-            : clip.colorCorrection.ffmpegFilter;
+            output: currentOutput,
+          },
+        ];
 
+        filters.forEach((f, idx) => {
+          const input = idx === 0 ? currentInput : filters[idx - 1].output;
           filterCommands.push({
-            filter: filterOptions.startsWith("eq=") ? "eq" : "eq",
-            options: filterOptions.startsWith("eq=")
-              ? filterOptions.substring(3)
-              : filterOptions,
-            inputs: [currentInput],
-            outputs: [currentOutput],
+            filter: f.filter,
+            options: f.options,
+            inputs: [input],
+            outputs: [f.output],
           });
-        }
-      } else {
-        // Default color correction for clips without specific settings
+        });
+      } else if (clip.colorCorrection?.ffmpegFilter) {
         filterCommands.push({
           filter: "eq",
-          options: "contrast=0.9:brightness=0.05:saturation=0.95",
+          options: clip.colorCorrection.ffmpegFilter.replace("eq=", ""),
           inputs: [currentInput],
           outputs: [currentOutput],
         });
       }
 
-      // Handle transitions between clips
+      // Transitions (simplified for now)
       if (i > 0 && clip.transition) {
-        const { type, duration } = clip.transition;
-        const transitionType = type === "slide" ? "crossfade" : type;
         filterCommands.push({
           filter: "xfade",
-          options: `transition=${transitionType}:duration=${duration}`,
+          options: {
+            transition: clip.transition.type,
+            duration: clip.transition.duration.toString(),
+          },
           inputs: [lastOutput, currentOutput],
           outputs: [`trans${i}`],
         });
@@ -619,119 +571,15 @@ export class VideoProcessingService {
       }
     });
 
-    // Concatenate all clips in smaller batches
+    // Concatenation
     if (clips.length > 1) {
       const inputs = clips.map((_, i) =>
-        i > 0 && clips[i].transition ? `trans${i}` : `color${i}`
+        lastOutput.includes("trans") ? `trans${i}` : `clip${i}`
       );
-
-      // Use a smaller batch size for concatenation
-      const MAX_CONCAT_INPUTS = 4; // Limit number of inputs per concat operation
-
-      if (inputs.length <= MAX_CONCAT_INPUTS) {
-        // If we have few enough clips, we can do a single concat
-        filterCommands.push({
-          filter: "concat",
-          options: `n=${inputs.length}:v=1:a=0`,
-          inputs,
-          outputs: ["vconcat"],
-        });
-      } else {
-        // Otherwise, do multiple concat operations in a cascade
-        let remainingInputs = [...inputs];
-        let concatStepCount = 0;
-        let previousOutput = "";
-
-        while (remainingInputs.length > 0) {
-          const batchInputs = remainingInputs.splice(0, MAX_CONCAT_INPUTS);
-          const isFirstBatch = concatStepCount === 0;
-          const isLastBatch = remainingInputs.length === 0;
-          const outputLabel = isLastBatch
-            ? "vconcat"
-            : `concat_step${concatStepCount}`;
-
-          if (isFirstBatch) {
-            // First batch just concatenates the first set of inputs
-            filterCommands.push({
-              filter: "concat",
-              options: `n=${batchInputs.length}:v=1:a=0`,
-              inputs: batchInputs,
-              outputs: [outputLabel],
-            });
-          } else {
-            // Subsequent batches concatenate previous result with next batch
-            if (batchInputs.length > 1) {
-              // If we have multiple inputs in this batch, concat them first
-              const currentBatchOutput = `batch${concatStepCount}`;
-              filterCommands.push({
-                filter: "concat",
-                options: `n=${batchInputs.length}:v=1:a=0`,
-                inputs: batchInputs,
-                outputs: [currentBatchOutput],
-              });
-
-              // Then concat with previous result
-              filterCommands.push({
-                filter: "concat",
-                options: "n=2:v=1:a=0",
-                inputs: [previousOutput, currentBatchOutput],
-                outputs: [outputLabel],
-              });
-            } else {
-              // If only one input in this batch, concat directly with previous result
-              filterCommands.push({
-                filter: "concat",
-                options: "n=2:v=1:a=0",
-                inputs: [previousOutput, batchInputs[0]],
-                outputs: [outputLabel],
-              });
-            }
-          }
-
-          previousOutput = outputLabel;
-          concatStepCount++;
-        }
-      }
-
-      lastOutput = "vconcat";
-    }
-
-    // Handle audio processing
-    if (musicIndex !== undefined && musicIndex !== -1) {
-      // Trim audio to match total video duration
       filterCommands.push({
-        filter: "atrim",
-        options: `duration=${totalDuration}`,
-        inputs: [`${musicIndex}:a`],
-        outputs: ["atrimmed"],
-      });
-
-      // Reset audio timestamps
-      filterCommands.push({
-        filter: "asetpts",
-        options: "PTS-STARTPTS",
-        inputs: ["atrimmed"],
-        outputs: ["apts"],
-      });
-
-      filterCommands.push({
-        filter: "aformat",
-        options: "sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
-        inputs: ["apts"],
-        outputs: ["aout"],
-      });
-    }
-
-    // Add watermark if configured
-    if (watermarkConfig) {
-      const position = watermarkConfig.position || {
-        x: "(main_w-overlay_w)/2",
-        y: "main_h-overlay_h-20",
-      };
-      filterCommands.push({
-        filter: "overlay",
-        options: `${position.x}:${position.y}`,
-        inputs: [lastOutput, `${watermarkIndex}:v`],
+        filter: "concat",
+        options: { n: inputs.length.toString(), v: "1", a: "0" },
+        inputs,
         outputs: ["vout"],
       });
     } else {
@@ -742,69 +590,40 @@ export class VideoProcessingService {
       });
     }
 
-    logger.debug("Filter graph constructed", {
-      filters: filterCommands.map((f) => ({
-        filter: f.filter,
-        options: f.options,
-      })),
-      totalDuration,
-    });
-
     return filterCommands;
   }
 
   private createFFmpegCommand(): ffmpeg.FfmpegCommand {
-    const stderrBuffer: string[] = [];
-    return (
-      ffmpeg()
-        .outputOptions(["-threads", "1"])
-        .on("start", async (commandLine) => {
-          const codec = await this.getAvailableCodec();
-          logger.info("FFmpeg process started", {
-            commandLine,
-            codec,
-            activeJobs: ffmpegQueueManager.getActiveCount(),
-          });
-        })
-        .on("progress", (progress) =>
-          this.handleFFmpegProgress(progress, "video-processing")
-        )
-        .on("end", () => {
-          logger.info("FFmpeg process completed");
-        })
-        .on("error", (error: FFmpegError) => {
-          // Ensure we have the full stderr output
-          const fullStderr = stderrBuffer.join("\n");
-          error.stderr = fullStderr || error.stderr;
-
-          this.handleFFmpegError(error, "video-processing");
-        })
-        .on("stderr", (stderrLine) => {
-          // Capture all stderr output in real-time
-          stderrBuffer.push(stderrLine);
-
-          // Log critical errors immediately
-          if (
-            stderrLine.includes("Error") ||
-            stderrLine.includes("Invalid") ||
-            stderrLine.includes("Cannot") ||
-            stderrLine.includes("failed") ||
-            stderrLine.includes("unable to")
-          ) {
-            logger.warn("FFmpeg stderr critical message", {
-              line: stderrLine,
-              timestamp: new Date().toISOString(),
-            });
-          } else {
-            logger.debug("FFmpeg stderr output", {
-              line: stderrLine,
-              timestamp: new Date().toISOString(),
-            });
-          }
-        })
-        // Add verbose debugging output
-        .outputOptions(["-v", "debug"])
-    );
+    const command = ffmpeg();
+    return command
+      .outputOptions(["-threads", "1"])
+      .on("start", async (commandLine) => {
+        const codec = await this.getAvailableCodec();
+        logger.info("FFmpeg process started", {
+          commandLine,
+          codec,
+          activeJobs: ffmpegQueueManager.getActiveCount(),
+        });
+      })
+      .on("progress", (progress) =>
+        this.handleFFmpegProgress(progress, "video-processing")
+      )
+      .on("end", () => logger.info("FFmpeg process completed"))
+      .on("error", (error: FFmpegError) =>
+        this.handleFFmpegError(error, "video-processing")
+      )
+      .on("stderr", (stderrLine) => {
+        if (
+          stderrLine.includes("Error") ||
+          stderrLine.includes("Invalid") ||
+          stderrLine.includes("Cannot") ||
+          stderrLine.includes("failed") ||
+          stderrLine.includes("unable to")
+        ) {
+          logger.warn("FFmpeg stderr critical message", { line: stderrLine });
+        }
+      })
+      .outputOptions(["-v", "debug"]);
   }
 
   private handleFFmpegProgress(
@@ -1156,370 +975,100 @@ export class VideoProcessingService {
   }
 
   public async stitchVideos(
-    inputPaths: string[],
+    inputPaths: string[], // Keep this for compatibility, but adapt to clips internally
     outputPath: string,
     options: StitchOptions = {}
   ): Promise<void> {
-    // Validate input parameters
-    if (!inputPaths || inputPaths.length === 0) {
-      throw new Error("No input paths provided for video stitching");
-    }
-
-    if (!outputPath) {
-      throw new Error("No output path provided for video stitching");
-    }
-
-    // Generate a unique job ID for tracking
     const jobId = crypto.randomUUID();
+    if (!inputPaths.length || !outputPath) {
+      throw new Error("Invalid input: No paths or output specified");
+    }
+
     logger.info(`[${jobId}] Starting video stitching process`, {
       inputCount: inputPaths.length,
       outputPath,
       options,
     });
 
-    // Ensure all input files exist and are accessible
-    for (const path of inputPaths) {
-      try {
-        await fs.access(path);
-      } catch (error) {
-        throw new Error(`Input file not accessible: ${path}`);
-      }
-    }
-
-    // Validate each input file with lightweight probe before proceeding
-    const validationResults = await Promise.all(
-      inputPaths.map(async (path) => {
-        const isValid = await this.validateVideoFile(path);
-        return { path, isValid };
+    // Convert inputPaths to VideoClip array (assuming default durations for now)
+    const clips: VideoClip[] = await Promise.all(
+      inputPaths.map(async (path, i) => {
+        const duration = await this.getVideoDuration(path);
+        return { path, duration: Math.min(duration, 5) }; // Cap at 5s for simplicity
       })
     );
 
-    const invalidFiles = validationResults.filter((result) => !result.isValid);
-    if (invalidFiles.length > 0) {
-      const invalidPaths = invalidFiles.map((file) => file.path).join(", ");
+    // Validate inputs
+    const validationResults = await Promise.all(
+      clips.map(async (clip) => ({
+        path: clip.path,
+        exists: await this.fileExists(clip.path),
+        isValid: await this.validateVideoFile(clip.path),
+      }))
+    );
+    const invalidFiles = validationResults.filter(
+      (r) => !r.exists || !r.isValid
+    );
+    if (invalidFiles.length) {
       throw new Error(
-        `Cannot stitch videos: Invalid input files detected: ${invalidPaths}`
+        `Invalid inputs: ${invalidFiles.map((f) => f.path).join(", ")}`
       );
     }
 
-    // Enqueue the FFmpeg job via FFmpegQueueManager
-    logger.info(`[${jobId}] Enqueuing stitchVideos job`, {
-      inputCount: inputPaths.length,
-      outputPath,
-      options,
-      memoryUsage: this.getMemoryUsageInfo(),
-      activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
-      queuedJobs: ffmpegQueueManager.getQueueLength(),
-    });
-    return ffmpegQueueManager.enqueueJob(async () => {
-      // Create a temporary directory for intermediate files
-      const tempDir = await this.createTempDirectory();
-      resourceManager.trackResource(jobId, tempDir); // Track temp directory
-      const tempFiles: string[] = [];
+    // Use reasonable defaults for timeout and retries
+    const timeout = 120000; // 2 minutes
+    const maxRetries = 2;
 
-      try {
-        logger.info(`[${jobId}] Starting video stitching process`, {
-          inputCount: inputPaths.length,
-          outputPath,
-          options,
-          memoryUsage: this.getMemoryUsageInfo(),
-          activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
-          queuedJobs: ffmpegQueueManager.getQueueLength(),
-        });
+    await ffmpegQueueManager.enqueueJob(
+      async () => {
+        const command = this.createFFmpegCommand();
 
-        // Prepare filter complex for concatenation
-        // Simplified filter graph as requested
-        const inputs = inputPaths
-          .map((_, i) => `[${i}:v:0][${i}:a:0]`)
-          .join("");
-        const filterComplex = `${inputs}concat=n=${inputPaths.length}:v=1:a=1[outv][outa]`;
+        // Add inputs
+        clips.forEach((clip, i) => command.input(clip.path));
 
-        // Build the FFmpeg command
-        const command = ffmpeg();
-
-        // Add input files
-        inputPaths.forEach((path) => {
-          command.input(path);
-        });
-
-        // Get the best available codec
-        const codec = await this.getAvailableCodec();
-
-        // Apply filter complex
-        command
-          .outputOptions([
-            `-filter_complex ${filterComplex}`,
-            "-map [outv]",
-            "-map [outa]",
-          ])
-          .outputOptions(`-c:v ${codec}`)
-          .outputOptions("-preset fast")
-          .outputOptions("-crf 22")
-          .outputOptions("-c:a aac")
-          .outputOptions("-b:a 128k")
-          .output(outputPath);
-
-        // Add custom output options if provided
-        if (options.outputOptions) {
-          options.outputOptions.forEach((opt) => {
-            command.outputOptions(opt);
-          });
+        // Build filter graph (no watermark or music for now; add later if needed)
+        const filterGraph = this.buildFilterGraph(clips);
+        if (!filterGraph) {
+          throw new Error("Failed to build filter graph");
         }
 
-        // Execute the command with timeout
+        const codec = await this.getAvailableCodec();
+        command
+          .complexFilter(filterGraph)
+          .outputOptions(["-map", "[vout]"]) // Map video output from filter graph
+          .outputOptions([`-c:v ${codec}`, "-preset fast", "-crf 22"])
+          .outputOptions(options.outputOptions || [])
+          .output(outputPath);
+
         await new Promise<void>((resolve, reject) => {
-          const stderrBuffer: string[] = [];
+          const timeoutId = setTimeout(() => {
+            command.kill("SIGKILL");
+            reject(new Error(`FFmpeg timed out after ${timeout}ms`));
+          }, timeout);
 
           command
-            .on("start", (commandLine) => {
-              logger.info(`[${jobId}] FFmpeg started with command:`, {
-                commandLine,
-              });
-            })
-            .on("progress", (progress) => {
-              logger.debug(`[${jobId}] FFmpeg progress:`, { progress });
-            })
             .on("end", () => {
-              logger.info(`[${jobId}] Video stitching completed successfully`, {
+              clearTimeout(timeoutId);
+              logger.info(`[${jobId}] Video stitching completed`, {
                 outputPath,
               });
               resolve();
             })
-            .on("error", (err: FFmpegError) => {
-              // Ensure we have the full stderr output
-              err.stderr = stderrBuffer.join("\n") || err.stderr;
-
-              this.handleFFmpegError(err, `stitchVideos-${jobId}`);
+            .on("error", (err) => {
+              clearTimeout(timeoutId);
               reject(err);
             })
-            .on("stderr", (stderrLine) => {
-              // Capture all stderr output in real-time
-              stderrBuffer.push(stderrLine);
-
-              // Log critical errors immediately
-              if (
-                stderrLine.includes("Error") ||
-                stderrLine.includes("Invalid") ||
-                stderrLine.includes("Cannot") ||
-                stderrLine.includes("failed") ||
-                stderrLine.includes("unable to")
-              ) {
-                logger.warn(`[${jobId}] FFmpeg stderr critical message`, {
-                  line: stderrLine,
-                  timestamp: new Date().toISOString(),
-                });
-              }
-            })
             .run();
-
-          // Set a timeout to kill the process if it runs too long
-          const timeoutId = setTimeout(() => {
-            logger.error(
-              `[${jobId}] FFmpeg process timed out after ${this.FFmpeg_TIMEOUT}ms`
-            );
-            command.kill("SIGKILL");
-            reject(
-              new Error(
-                `FFmpeg process timed out after ${this.FFmpeg_TIMEOUT}ms`
-              )
-            );
-          }, this.FFmpeg_TIMEOUT);
-
-          // Clear the timeout when the process ends
-          command.on("end", () => clearTimeout(timeoutId));
-          command.on("error", () => clearTimeout(timeoutId));
-        });
-      } catch (error) {
-        // Re-throw the error after cleanup
-        throw error;
-      } finally {
-        try {
-          await resourceManager.cleanup(jobId);
-          logger.debug(
-            `[${jobId}] Temporary files cleanup completed via resourceManager`
-          );
-        } catch (cleanupError) {
-          logger.warn(
-            `[${jobId}] Error during cleanup after video stitching:`,
-            {
-              error:
-                cleanupError instanceof Error
-                  ? cleanupError.message
-                  : String(cleanupError),
-            }
-          );
-        }
-      }
-    });
-  }
-
-  private async getAvailableCodec(): Promise<string> {
-    // Cache the result to avoid repeated checks
-    if (this._cachedCodec) {
-      return this._cachedCodec;
-    }
-
-    return new Promise<string>((resolve) => {
-      logger.debug("Checking available video codecs");
-
-      exec("ffmpeg -encoders", (error, stdout) => {
-        if (error) {
-          logger.warn(
-            "Failed to check FFmpeg encoders, defaulting to libx264",
-            {
-              error: error instanceof Error ? error.message : String(error),
-            }
-          );
-          this._cachedCodec = "libx264";
-          resolve("libx264");
-          return;
-        }
-
-        // Check for hardware acceleration options
-        const hasNvenc = stdout.includes("h264_nvenc");
-        const hasQsv = stdout.includes("h264_qsv");
-        const hasVideotoolbox = stdout.includes("h264_videotoolbox");
-        const hasVaapi = stdout.includes("h264_vaapi");
-        const hasLibx264 = stdout.includes("libx264");
-
-        logger.info("Available FFmpeg encoders detected", {
-          hasLibx264,
-          hasNvenc,
-          hasQsv,
-          hasVideotoolbox,
-          hasVaapi,
         });
 
-        // Store reference to this for use in callbacks
-        const self = this;
-
-        // Try hardware encoders first
-        if (hasNvenc) {
-          // Test NVENC with a simple command
-          exec(
-            "ffmpeg -f lavfi -i color=c=black:s=32x32:r=1 -t 1 -c:v h264_nvenc -f null -",
-            (nvencError) => {
-              if (!nvencError) {
-                logger.info("Using NVIDIA hardware acceleration (h264_nvenc)");
-                self._cachedCodec = "h264_nvenc";
-                resolve("h264_nvenc");
-              } else {
-                logger.warn(
-                  "NVENC detected but not working, trying next option",
-                  {
-                    error:
-                      nvencError instanceof Error
-                        ? nvencError.message
-                        : String(nvencError),
-                  }
-                );
-                tryNextCodec();
-              }
-            }
-          );
-        } else {
-          tryNextCodec();
+        // Validate output
+        if (!(await this.validateVideoFile(outputPath))) {
+          throw new Error(`Output validation failed: ${outputPath}`);
         }
-
-        function tryNextCodec() {
-          if (hasQsv) {
-            // Test Intel QuickSync
-            exec(
-              "ffmpeg -f lavfi -i color=c=black:s=32x32:r=1 -t 1 -c:v h264_qsv -f null -",
-              (qsvError) => {
-                if (!qsvError) {
-                  logger.info(
-                    "Using Intel QuickSync hardware acceleration (h264_qsv)"
-                  );
-                  self._cachedCodec = "h264_qsv";
-                  resolve("h264_qsv");
-                } else {
-                  logger.warn(
-                    "QSV detected but not working, trying next option",
-                    {
-                      error:
-                        qsvError instanceof Error
-                          ? qsvError.message
-                          : String(qsvError),
-                    }
-                  );
-                  tryVideotoolbox();
-                }
-              }
-            );
-          } else {
-            tryVideotoolbox();
-          }
-        }
-
-        function tryVideotoolbox() {
-          if (hasVideotoolbox) {
-            // Test Apple VideoToolbox
-            exec(
-              "ffmpeg -f lavfi -i color=c=black:s=32x32:r=1 -t 1 -c:v h264_videotoolbox -f null -",
-              (vtError) => {
-                if (!vtError) {
-                  logger.info(
-                    "Using Apple VideoToolbox hardware acceleration (h264_videotoolbox)"
-                  );
-                  self._cachedCodec = "h264_videotoolbox";
-                  resolve("h264_videotoolbox");
-                } else {
-                  logger.warn(
-                    "VideoToolbox detected but not working, trying next option",
-                    {
-                      error:
-                        vtError instanceof Error
-                          ? vtError.message
-                          : String(vtError),
-                    }
-                  );
-                  tryVaapi();
-                }
-              }
-            );
-          } else {
-            tryVaapi();
-          }
-        }
-
-        function tryVaapi() {
-          if (hasVaapi) {
-            // Test VAAPI
-            exec(
-              "ffmpeg -f lavfi -i color=c=black:s=32x32:r=1 -t 1 -c:v h264_vaapi -f null -",
-              (vaapiError) => {
-                if (!vaapiError) {
-                  logger.info("Using VAAPI hardware acceleration (h264_vaapi)");
-                  self._cachedCodec = "h264_vaapi";
-                  resolve("h264_vaapi");
-                } else {
-                  logger.warn(
-                    "VAAPI detected but not working, falling back to libx264",
-                    {
-                      error:
-                        vaapiError instanceof Error
-                          ? vaapiError.message
-                          : String(vaapiError),
-                    }
-                  );
-                  fallbackToLibx264();
-                }
-              }
-            );
-          } else {
-            fallbackToLibx264();
-          }
-        }
-
-        function fallbackToLibx264() {
-          // Fallback to software encoding
-          logger.info("Using software encoding (libx264)");
-          self._cachedCodec = "libx264";
-          resolve("libx264");
-        }
-      });
-    });
+      },
+      timeout,
+      maxRetries
+    );
   }
 
   public async batchProcessVideos(
@@ -2701,6 +2250,72 @@ export class VideoProcessingService {
     } catch (e) {
       return { error: String(e) };
     }
+  }
+
+  private async fileExists(path: string): Promise<boolean> {
+    try {
+      await fs.access(path);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  private async getAvailableCodec(): Promise<string> {
+    if (this._cachedCodec) {
+      return this._cachedCodec;
+    }
+
+    // Try hardware acceleration first, then fallback to software
+    try {
+      // Try h264_videotoolbox (Mac)
+      const isVideotoolboxAvailable = await this.checkCodecAvailability(
+        "h264_videotoolbox"
+      );
+      if (isVideotoolboxAvailable) {
+        this._cachedCodec = "h264_videotoolbox";
+        return this._cachedCodec;
+      }
+
+      // Try VAAPI (Linux)
+      const isVaapiAvailable = await this.checkCodecAvailability("h264_vaapi");
+      if (isVaapiAvailable) {
+        this._cachedCodec = "h264_vaapi";
+        return this._cachedCodec;
+      }
+
+      // Fallback to software encoding
+      this._cachedCodec = "libx264";
+      return this._cachedCodec;
+    } catch (error) {
+      logger.warn(
+        "Error checking codec availability, falling back to libx264",
+        {
+          error: error instanceof Error ? error.message : String(error),
+        }
+      );
+      this._cachedCodec = "libx264";
+      return this._cachedCodec;
+    }
+  }
+
+  private async checkCodecAvailability(codec: string): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const command = ffmpeg();
+      command
+        .outputOptions([`-c:v ${codec}`])
+        .output("/dev/null") // Output to nowhere
+        .noAudio()
+        .inputOptions(["-f", "lavfi", "-i", "color=c=black:s=1280x720:d=0.1"])
+        .on("start", () => {
+          command.kill("SIGKILL");
+          resolve(true);
+        })
+        .on("error", () => {
+          resolve(false);
+        })
+        .run();
+    });
   }
 }
 
