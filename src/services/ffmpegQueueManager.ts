@@ -8,9 +8,11 @@ import * as crypto from "crypto";
 class FFmpegQueueManager {
   private static instance: FFmpegQueueManager;
   private activeFFmpegCount = 0;
-  private readonly MAX_FFMPEG_JOBS = 1; // Conservative limit for testing
-  private queue: Array<() => Promise<any>> = []; // Use any to accommodate different return types
+  private readonly MAX_FFMPEG_JOBS = 1;
+  private queue: Array<() => Promise<any>> = [];
   private processingLock = false;
+  private readonly DEFAULT_TIMEOUT = 120 * 1000; // Default 120s
+  private readonly DEFAULT_MAX_RETRIES = 2; // Default 2 retries
 
   private constructor() {
     logger.info("FFmpegQueueManager initialized", {
@@ -25,85 +27,105 @@ class FFmpegQueueManager {
     return FFmpegQueueManager.instance;
   }
 
-  public async enqueueJob<T>(job: () => Promise<T>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const MAX_QUEUE_SIZE = 50;
-      const JOB_TIMEOUT = 120 * 1000;
+  public async enqueueJob<T>(
+    job: () => Promise<T>,
+    timeout: number = this.DEFAULT_TIMEOUT,
+    maxRetries: number = this.DEFAULT_MAX_RETRIES
+  ): Promise<T> {
+    const MAX_QUEUE_SIZE = 50;
+    const jobId = crypto.randomUUID();
 
-      if (this.queue.length >= MAX_QUEUE_SIZE) {
-        logger.error("FFmpeg queue full, rejecting job", {
-          queueLength: this.queue.length,
-          maxQueueSize: MAX_QUEUE_SIZE,
-        });
-        reject(new Error("FFmpeg queue is full"));
-        return;
-      }
-
-      const jobId = crypto.randomUUID();
-      logger.info(`[${jobId}] Enqueuing FFmpeg job`, {
-        activeJobs: this.activeFFmpegCount,
-        queuedJobs: this.queue.length + 1,
-        maxConcurrentJobs: this.MAX_FFMPEG_JOBS,
+    if (this.queue.length >= MAX_QUEUE_SIZE) {
+      logger.error("FFmpeg queue full, rejecting job", {
+        queueLength: this.queue.length,
+        maxQueueSize: MAX_QUEUE_SIZE,
       });
+      throw new Error("FFmpeg queue is full");
+    }
 
-      this.queue.push(async () => {
-        let timeoutId: NodeJS.Timeout | null = null;
-        try {
-          // Wait for an available slot
-          while (this.activeFFmpegCount >= this.MAX_FFMPEG_JOBS) {
-            await new Promise((r) => setTimeout(r, 100));
-          }
+    logger.info(`[${jobId}] Enqueuing FFmpeg job`, {
+      activeJobs: this.activeFFmpegCount,
+      queuedJobs: this.queue.length + 1,
+      maxConcurrentJobs: this.MAX_FFMPEG_JOBS,
+      timeout,
+      maxRetries,
+    });
 
-          this.activeFFmpegCount++;
-          const memoryUsage = process.memoryUsage();
-          logger.info(`[${jobId}] Starting FFmpeg job`, {
-            activeJobs: this.activeFFmpegCount,
-            queuedJobs: this.queue.length,
-            memoryUsage: {
-              rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
-              heapTotal: `${Math.round(
-                memoryUsage.heapTotal / 1024 / 1024
-              )} MB`,
-              heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
-            },
-          });
+    return new Promise<T>((resolve, reject) => {
+      const wrappedJob = async () => {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          let timeoutId: NodeJS.Timeout | null = null;
+          try {
+            this.activeFFmpegCount++;
+            const memoryUsage = process.memoryUsage();
+            logger.info(`[${jobId}] Starting FFmpeg job`, {
+              activeJobs: this.activeFFmpegCount,
+              queuedJobs: this.queue.length,
+              memoryUsage: {
+                rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+                heapTotal: `${Math.round(
+                  memoryUsage.heapTotal / 1024 / 1024
+                )} MB`,
+                heapUsed: `${Math.round(
+                  memoryUsage.heapUsed / 1024 / 1024
+                )} MB`,
+              },
+              attempt,
+              maxRetries,
+            });
 
-          timeoutId = setTimeout(() => {
-            logger.error(
-              `[${jobId}] FFmpeg job timed out after ${JOB_TIMEOUT}ms`
-            );
-            reject(new Error(`FFmpeg job timed out after ${JOB_TIMEOUT}ms`));
-          }, JOB_TIMEOUT);
+            timeoutId = setTimeout(() => {
+              logger.error(
+                `[${jobId}] FFmpeg job timed out after ${timeout}ms`,
+                {
+                  attempt,
+                }
+              );
+              reject(new Error(`FFmpeg job timed out after ${timeout}ms`));
+            }, timeout);
 
-          const result = await job();
-          if (timeoutId) clearTimeout(timeoutId);
-          logger.info(`[${jobId}] FFmpeg job completed`, {
-            activeJobs: this.activeFFmpegCount,
-          });
-          resolve(result);
-          return result;
-        } catch (error) {
-          if (timeoutId) clearTimeout(timeoutId);
-          logger.error(`[${jobId}] FFmpeg job failed`, {
-            error: error instanceof Error ? error.message : "Unknown error",
-            activeJobs: this.activeFFmpegCount,
-            queuedJobs: this.queue.length,
-          });
-          reject(error);
-          throw error;
-        } finally {
-          this.activeFFmpegCount--;
-          logger.debug(`[${jobId}] FFmpeg job finished`, {
-            activeJobs: this.activeFFmpegCount,
-            queuedJobs: this.queue.length,
-          });
-          if (this.queue.length > 0) {
-            setTimeout(() => this.processQueue(), 100);
+            const result = await job();
+            if (timeoutId) clearTimeout(timeoutId);
+            logger.info(`[${jobId}] FFmpeg job completed`, {
+              activeJobs: this.activeFFmpegCount,
+              attempt,
+            });
+            resolve(result);
+            return result;
+          } catch (error) {
+            if (timeoutId) clearTimeout(timeoutId);
+            logger.error(`[${jobId}] FFmpeg job failed`, {
+              error: error instanceof Error ? error.message : "Unknown error",
+              activeJobs: this.activeFFmpegCount,
+              queuedJobs: this.queue.length,
+              attempt,
+              maxRetries,
+            });
+
+            if (attempt === maxRetries) {
+              reject(error);
+              throw error;
+            }
+
+            const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+            logger.info(`[${jobId}] Retrying in ${delay}ms`, { attempt });
+            await new Promise((r) => setTimeout(r, delay));
+          } finally {
+            this.activeFFmpegCount--;
+            logger.debug(`[${jobId}] FFmpeg job finished`, {
+              activeJobs: this.activeFFmpegCount,
+              queuedJobs: this.queue.length,
+            });
           }
         }
-      });
+      };
 
-      if (!this.processingLock) {
+      this.queue.push(wrappedJob);
+
+      if (
+        !this.processingLock &&
+        this.activeFFmpegCount < this.MAX_FFMPEG_JOBS
+      ) {
         logger.debug(`[${jobId}] Triggering queue processing`, {
           activeJobs: this.activeFFmpegCount,
           queuedJobs: this.queue.length,
