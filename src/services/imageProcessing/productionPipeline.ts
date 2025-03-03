@@ -15,6 +15,7 @@ import {
 import crypto from "crypto";
 import { createReadStream } from "fs";
 import fs from "fs/promises";
+import ffmpeg, { FfprobeData, FfprobeStream } from "fluent-ffmpeg"; // Include the types
 import pLimit from "p-limit";
 import path from "path";
 import sharp from "sharp";
@@ -44,8 +45,6 @@ import {
 import { existsSync } from "fs";
 import { VideoTemplateService } from "../video/video-template.service.js";
 import { ReelTemplate } from "./templates/types.js";
-import { v4 as uuidv4 } from "uuid";
-import ffmpeg, { FfprobeData, FfprobeStream } from "fluent-ffmpeg";
 import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
 
 const ALL_TEMPLATES: TemplateKey[] = [
@@ -1111,479 +1110,80 @@ export class ProductionPipeline {
   ): Promise<TemplateProcessingResult> {
     const startTime = Date.now();
     const tempDir = path.join(process.cwd(), "temp", `${jobId}_${template}`);
-    const videoTemplateService = VideoTemplateService.getInstance();
+    const templateConfig = reelTemplates[template];
+    const outputPath = path.join(tempDir, `${template}.mp4`);
 
     try {
       await fs.mkdir(tempDir, { recursive: true });
-      const templateConfig = reelTemplates[template];
 
-      // Get template-specific timeout and maxRetries
-      const timeout = templateConfig.timeout || 120000; // Default 120s
-      const maxRetries = templateConfig.maxRetries || 2; // Default 2 retries
+      let clips: VideoClip[] = runwayVideos.map((path, i) => ({
+        path,
+        duration: Array.isArray(templateConfig.durations)
+          ? templateConfig.durations[i] || 5
+          : (templateConfig.durations as Record<string | number, number>)[i] ||
+            5,
+        colorCorrection: templateConfig.colorCorrection,
+      }));
 
-      const fdCount = await this.getFileDescriptorCount(jobId);
-      const memoryUsage = process.memoryUsage();
-      logger.info(`[${jobId}] Starting template ${template}`, {
-        fdCount,
-        memoryUsage: {
-          rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
-          heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
-          heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
-        },
-      });
-
-      if (fdCount > 900 || memoryUsage.rss / 1024 / 1024 > 400) {
-        throw new Error(
-          `Resource limits exceeded (FD: ${fdCount}, RSS: ${Math.round(
-            memoryUsage.rss / 1024 / 1024
-          )} MB)`
-        );
-      }
-
-      let videosToProcess: string[] = runwayVideos;
       if (template === "googlezoomintro" && mapVideo) {
-        logger.info(`[${jobId}] Batching googlezoomintro clips`, {
-          totalClips: runwayVideos.length + 1,
-        });
-
-        const allClips: VideoClip[] = [
+        clips = [
           {
             path: mapVideo,
             duration: (templateConfig.durations as any)?.map || 3,
+            isMapVideo: true,
           },
-          ...runwayVideos.map((path: string, i: number) => ({
-            path,
-            duration: Array.isArray(templateConfig.durations)
-              ? templateConfig.durations[i + 1] || 5
-              : templateConfig.durations[i] || 5,
-          })),
+          ...clips,
         ];
-
-        const batchSize = 5;
-        const batches: VideoClip[][] = [];
-        for (let i = 0; i < allClips.length; i += batchSize) {
-          batches.push(allClips.slice(i, i + batchSize));
-        }
-
-        const batchOutputs: string[] = [];
-        for (let i = 0; i < batches.length; i++) {
-          const batchOutput = path.join(tempDir, `batch_${i}.mp4`);
-          await ffmpegQueueManager.enqueueJob(
-            async () => {
-              const fdCountBatch = await this.getFileDescriptorCount(jobId);
-              logger.debug(`[${jobId}] Processing batch ${i}`, {
-                fdCount: fdCountBatch,
-              });
-              if (fdCountBatch > 900) {
-                throw new Error(
-                  `Too many file descriptors (${fdCountBatch}) in batch ${i}`
-                );
-              }
-
-              const command = this.createFFmpegCommand();
-              batches[i].forEach((clip) => command.input(clip.path));
-
-              const filterCommands = batches[i]
-                .map((clip, idx) => ({
-                  filter: "trim",
-                  options: `duration=${clip.duration}`,
-                  inputs: [`${idx}:v`],
-                  outputs: [`v${idx}`],
-                }))
-                .concat([
-                  {
-                    filter: "concat",
-                    options: `n=${batches[i].length}:v=1:a=0`,
-                    inputs: batches[i].map((_, idx) => `v${idx}`),
-                    outputs: ["vout"],
-                  },
-                ]);
-
-              command
-                .complexFilter(filterCommands)
-                .outputOptions(["-map", "[vout]"])
-                .outputOptions([
-                  "-c:v",
-                  "libx264",
-                  "-preset",
-                  "fast",
-                  "-crf",
-                  "23",
-                ])
-                .output(batchOutput);
-
-              await new Promise<void>((resolve, reject) => {
-                let lastProgress = 0;
-                let lastProgressTime = Date.now();
-                const progressTimeout = setTimeout(() => {
-                  logger.warn(
-                    `[${jobId}] Batch ${i} stalled at ${lastProgress}%`
-                  );
-                  command.kill("SIGKILL");
-                  reject(new Error(`Batch ${i} stalled at ${lastProgress}%`));
-                }, 30000); // 30s stall check
-
-                command
-                  .on("progress", (progress: { percent?: number }) => {
-                    const currentProgress = progress.percent || 0;
-                    // Only log progress at meaningful intervals
-                    if (
-                      currentProgress - lastProgress >= 10 ||
-                      Date.now() - lastProgressTime > 10000
-                    ) {
-                      logger.info(
-                        `[${jobId}] Batch ${i} progress: ${Math.round(
-                          currentProgress
-                        )}%`
-                      );
-                      lastProgress = currentProgress;
-                      lastProgressTime = Date.now();
-                    }
-
-                    // Reset stall detection timeout
-                    clearTimeout(progressTimeout);
-                    if (currentProgress < 100) {
-                      setTimeout(() => {
-                        logger.warn(
-                          `[${jobId}] Batch ${i} stalled at ${lastProgress}%`
-                        );
-                        command.kill("SIGKILL");
-                        reject(
-                          new Error(`Batch ${i} stalled at ${lastProgress}%`)
-                        );
-                      }, 30000); // 30s stall check
-                    }
-                  })
-                  .on("end", () => {
-                    clearTimeout(progressTimeout);
-                    logger.info(`[${jobId}] Batch ${i} completed successfully`);
-                    resolve();
-                  })
-                  .on("error", (err: Error) => {
-                    clearTimeout(progressTimeout);
-                    logger.error(`[${jobId}] Batch ${i} failed`, {
-                      error: err.message,
-                      clipCount: batches[i].length,
-                    });
-                    reject(err);
-                  })
-                  .run();
-              });
-            },
-            timeout,
-            maxRetries
-          );
-          await this.resourceManager.trackResource(batchOutput);
-          batchOutputs.push(batchOutput);
-        }
-
-        videosToProcess = batchOutputs;
-        mapVideo = null; // Processed in batches
       }
 
-      // Validate durations early
-      const durations = Array.isArray(templateConfig.durations)
-        ? templateConfig.durations
-        : Object.values(templateConfig.durations);
-
-      if (!durations.length) {
-        throw new Error(`Template ${template} has no valid durations defined`);
+      // Pre-process Wes Anderson clips
+      if (template === "wesanderson") {
+        clips = await Promise.all(
+          clips.map((clip, i) => this.preProcessWesAndersonClip(clip, i, jobId))
+        );
       }
 
-      if (durations.some((d) => typeof d !== "number" || d <= 0)) {
-        throw new Error(`Template ${template} has invalid duration values`);
-      }
+      const timeout = templateConfig.timeout || 120000;
+      const maxRetries = templateConfig.maxRetries || 2;
 
-      // Check map requirement
-      const needsMap = templateConfig.sequence.includes("map");
-      if (needsMap && !mapVideo) {
-        const error = `Map video required but not available for template ${template}`;
-        logger.error(`[${jobId}] ${error}`);
-        return { template, status: "FAILED", outputPath: null, error };
-      }
-
-      await this.updateJobProgress(jobId, {
-        stage: "template",
-        subStage: template,
-        progress: 0,
-        message: `Generating ${template} template`,
-      });
-
-      // Pre-register all resources for tracking
-      const watermarkConfig = await this.getSharedWatermarkPath(jobId);
-      const resources: ResourceTracker[] = [
-        ...videosToProcess.map((_, index) => ({
-          path: path.join(tempDir, `segment_${index}.mp4`),
-          type: "video" as const,
-        })),
-        ...(needsMap && mapVideo
-          ? [{ path: path.join(tempDir, "map.mp4"), type: "video" as const }]
-          : []),
-        ...(templateConfig.music?.path
-          ? [
-              {
-                path: path.join(tempDir, `music_${template}.mp3`),
-                type: "music" as const,
-              },
-            ]
-          : []),
-        ...(watermarkConfig
-          ? [{ path: watermarkConfig, type: "watermark" as const }]
-          : []),
-      ];
-
-      return await this.withResourceTracking(
-        jobId,
-        async () => {
-          // Download and validate runway videos
-          const processedVideos = await Promise.all(
-            videosToProcess.map(async (video, index) => {
-              const localPath = path.join(tempDir, `segment_${index}.mp4`);
-              const validation = await this.validateWithCache(
-                video,
-                index,
-                jobId
-              );
-
-              if (!validation) {
-                logger.warn(`[${jobId}] Skipping invalid video`, {
-                  index,
-                  path: video,
-                });
-                return null;
-              }
-
-              await this.s3Service.downloadFile(video, localPath);
-              return {
-                path: localPath,
-                duration: validation.duration,
-              } as ValidatedVideo;
-            })
-          );
-
-          const validVideos = processedVideos.filter(
-            (v): v is ValidatedVideo => v !== null
-          );
-          if (validVideos.length === 0) {
-            throw new Error(
-              "No valid videos available for template processing"
-            );
-          }
-
-          // Process map video if needed
-          let processedMapVideo: ValidatedVideo | undefined;
-          if (needsMap && mapVideo) {
-            const mapPath = path.join(tempDir, "map.mp4");
-            const mapValidation = await this.validateWithCache(
-              mapVideo,
-              -1,
-              jobId
-            );
-
-            if (mapValidation) {
-              await this.s3Service.downloadFile(mapVideo, mapPath);
-              processedMapVideo = {
-                path: mapPath,
-                duration: mapValidation.duration,
-              };
-            }
-          }
-
-          // Process music
-          let processedMusic: ReelTemplate["music"] | undefined;
-          if (templateConfig.music?.path) {
-            const musicPath = path.join(tempDir, `music_${template}.mp3`);
-            try {
-              const resolvedMusicPath =
-                await videoTemplateService.resolveAssetPath(
-                  templateConfig.music.path,
-                  "music",
-                  true
-                );
-
-              if (resolvedMusicPath) {
-                await this.s3Service.downloadFile(resolvedMusicPath, musicPath);
-                const isValid = await videoProcessingService.validateMusicFile(
-                  musicPath
-                );
-                if (isValid) {
-                  processedMusic = {
-                    ...templateConfig.music,
-                    path: musicPath,
-                    isValid: true,
-                  };
-                }
-              }
-            } catch (error) {
-              logger.warn(`[${jobId}] Music file issue, proceeding without`, {
-                path: templateConfig.music.path,
-                error: error instanceof Error ? error.message : "Unknown error",
-              });
-            }
-          }
-
-          // Prepare clips with explicit pre-processing for Wes Anderson
-          let finalClips: VideoClip[] = [];
-          if (template === "wesanderson") {
-            logger.info(`[${jobId}] Pre-processing Wes Anderson clips`, {
-              clipCount: validVideos.length,
-            });
-            finalClips = await Promise.all(
-              validVideos.map(async (video, index) => {
-                // Use the public method through the service instance
-                const preprocessedClip =
-                  await videoProcessingService.preProcessWesAndersonClip(
-                    {
-                      path: video.path,
-                      duration: durations[index] || video.duration,
-                    },
-                    index,
-                    jobId
-                  );
-                await this.resourceManager.trackResource(preprocessedClip.path);
-                const metadata = await videoProcessingService.getVideoMetadata(
-                  preprocessedClip.path
-                );
-                if (!metadata.hasVideo || !metadata.width || !metadata.height) {
-                  throw new Error(
-                    `Pre-processed clip ${index} invalid: ${preprocessedClip.path}`
-                  );
-                }
-                return {
-                  path: preprocessedClip.path,
-                  duration: durations[index] || video.duration,
-                  transition:
-                    templateConfig.transitions?.[index > 0 ? index - 1 : 0],
-                  colorCorrection: templateConfig.colorCorrection,
-                };
-              })
-            );
-            logger.info(
-              `[${jobId}] Completed pre-processing Wes Anderson clips`
-            );
-          } else {
-            finalClips = validVideos.map((video, index) => ({
-              path: video.path,
-              duration: durations[index] || video.duration,
-              transition:
-                templateConfig.transitions?.[index > 0 ? index - 1 : 0],
-              colorCorrection: templateConfig.colorCorrection,
-            }));
-          }
-
-          const outputPath = `https://${process.env.AWS_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/properties/${listingId}/videos/templates/${jobId}/${template}.mp4`;
-
-          // Configure and pre-convert watermark
-          const watermarkSettings: WatermarkConfig | undefined = watermarkConfig
-            ? {
-                path: watermarkConfig,
-                position: {
-                  x: "(main_w-overlay_w)/2",
-                  y: "main_h-overlay_h-300",
-                },
-              }
-            : undefined;
-
-          // For googlezoomintro template, explicitly include map video as the first clip
-          if (template === "googlezoomintro" && processedMapVideo) {
-            logger.info(
-              `[${jobId}] Adding map video to googlezoomintro template`,
-              {
-                mapVideoPath: processedMapVideo.path,
-                mapVideoDuration: processedMapVideo.duration,
-              }
-            );
-
-            // Add map video as the first clip with the duration specified in the template
-            finalClips.unshift({
-              path: processedMapVideo.path,
-              duration:
-                typeof templateConfig.durations === "object" &&
-                !Array.isArray(templateConfig.durations)
-                  ? (templateConfig.durations["map"] as number) ||
-                    processedMapVideo.duration
-                  : processedMapVideo.duration,
-              transition: templateConfig.transitions?.[0],
-              colorCorrection: templateConfig.colorCorrection,
-            });
-          }
-
-          // Stitch video with retry logic
-          const verifiedUrl = await this.retryWithBackoff(
-            async () => {
-              await ffmpegQueueManager.enqueueJob(
-                async () => {
-                  await videoProcessingService.createVideo(
-                    finalClips,
-                    outputPath,
-                    {
-                      name: templateConfig.name,
-                      description: templateConfig.description,
-                      colorCorrection: templateConfig.colorCorrection,
-                      transitions: templateConfig.transitions,
-                      reverseClips: templateConfig.reverseClips,
-                      music: processedMusic,
-                      outputOptions: ["-q:a 2"],
-                    } as VideoTemplate,
-                    watermarkSettings
-                  );
-                },
-                timeout,
-                maxRetries
-              );
-
-              const url = await this.verifyS3VideoAccess(outputPath, jobId);
-              if (!url) {
-                throw new Error(
-                  `Uploaded video not accessible at ${outputPath}`
-                );
-              }
-              return url;
-            },
-            this.MAX_RETRIES,
-            `Video creation for ${template}`,
-            jobId
-          );
-
-          await this.updateJobProgress(jobId, {
-            stage: "template",
-            subStage: template,
-            progress: 100,
-            message: `${template} template completed`,
-          });
-
-          return {
-            template,
-            status: "SUCCESS",
-            outputPath: verifiedUrl,
-            processingTime: Date.now() - startTime,
-          };
-        },
-        resources
+      await videoProcessingService.stitchVideos(
+        clips.map((c) => c.path),
+        outputPath,
+        {}
       );
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      logger.error(`[${jobId}] Template processing error`, {
+
+      const verifiedUrl = await this.retryWithBackoff(
+        async () => {
+          const url = await this.verifyS3VideoAccess(outputPath, jobId);
+          if (!url)
+            throw new Error(`Uploaded video not accessible at ${outputPath}`);
+          return url;
+        },
+        this.MAX_RETRIES,
+        `Video creation for ${template}`,
+        jobId
+      );
+
+      return {
         template,
-        error: errorMessage,
+        status: "SUCCESS",
+        outputPath: verifiedUrl,
+        processingTime: Date.now() - startTime,
+      };
+    } catch (error) {
+      logger.error(`[${jobId}] Error processing template ${template}`, {
+        error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined,
       });
-
-      await this.updateJobProgress(jobId, {
-        stage: "template",
-        subStage: template,
-        progress: 0,
-        error: errorMessage,
-      });
-
       return {
         template,
         status: "FAILED",
         outputPath: null,
-        error: errorMessage,
+        error: error instanceof Error ? error.message : String(error),
         processingTime: Date.now() - startTime,
       };
+    } finally {
+      // Cleanup moved to caller
     }
   }
 
@@ -1595,124 +1195,66 @@ export class ProductionPipeline {
     coordinates?: { lat: number; lng: number },
     mapVideo?: string | null
   ): Promise<string[]> {
-    const isRegeneration = await this.isRegeneration(jobId); // Helper to check job metadata
-    const BATCH_SIZE = this.getDefaultBatchSize(isRegeneration);
     const results: string[] = [];
+    try {
+      const isRegeneration = await this.isRegeneration(jobId); // Helper to check job metadata
+      const BATCH_SIZE = this.getDefaultBatchSize(isRegeneration);
 
-    const mapDependentTemplates = templates.filter(
-      (t) => reelTemplates[t].sequence[0] === "map"
-    );
-    const regularTemplates = templates.filter(
-      (t) => reelTemplates[t].sequence[0] !== "map"
-    );
-
-    if (mapDependentTemplates.length > 0) {
-      if (!coordinates) {
-        logger.warn(
-          `[${jobId}] Map-dependent templates requested but no coordinates provided`,
-          {
-            templates: mapDependentTemplates,
-          }
-        );
-        templates = regularTemplates;
-      } else if (!mapVideo) {
-        try {
-          logger.info(`[${jobId}] Generating map video for templates`, {
-            templates: mapDependentTemplates,
-            coordinates,
-          });
-          mapVideo = await this.generateMapVideoForTemplate(
-            coordinates,
-            jobId,
-            listingId
-          );
-          if (!mapVideo) {
-            throw new Error("Map video generation failed");
-          }
-        } catch (error) {
-          logger.error(`[${jobId}] Failed to generate map video`, {
-            error: error instanceof Error ? error.message : String(error),
-            coordinates,
-          });
-          templates = regularTemplates;
-        }
-      }
-    }
-
-    // Process all templates serially with a delay
-    for (let i = 0; i < regularTemplates.length; i += BATCH_SIZE) {
-      const batch = regularTemplates.slice(i, i + BATCH_SIZE);
-
-      logger.info(
-        `[${jobId}] Processing regular template batch ${i / BATCH_SIZE + 1}`,
-        {
-          templates: batch,
-          batchSize: batch.length,
-          isRegeneration,
-        }
+      const mapDependentTemplates = templates.filter(
+        (t) => reelTemplates[t].sequence[0] === "map"
+      );
+      const regularTemplates = templates.filter(
+        (t) => reelTemplates[t].sequence[0] !== "map"
       );
 
-      for (const template of batch) {
-        try {
-          const result = await this.processTemplate(
-            template,
-            runwayVideos,
-            jobId,
-            listingId,
-            coordinates,
-            mapVideo
+      if (mapDependentTemplates.length > 0) {
+        if (!coordinates) {
+          logger.warn(
+            `[${jobId}] Map-dependent templates requested but no coordinates provided`,
+            {
+              templates: mapDependentTemplates,
+            }
           );
-
-          if (result.status === "SUCCESS" && result.outputPath) {
-            results.push(result.outputPath);
-            logger.info(`[${jobId}] Processed template ${template}`, {
-              outputPath: result.outputPath,
-              processingTime: result.processingTime,
+          templates = regularTemplates;
+        } else if (!mapVideo) {
+          try {
+            logger.info(`[${jobId}] Generating map video for templates`, {
+              templates: mapDependentTemplates,
+              coordinates,
             });
-          } else {
-            logger.warn(`[${jobId}] Failed to process template ${template}`, {
-              error: result.error,
+            mapVideo = await this.generateMapVideoForTemplate(
+              coordinates,
+              jobId,
+              listingId
+            );
+            if (!mapVideo) {
+              throw new Error("Map video generation failed");
+            }
+          } catch (error) {
+            logger.error(`[${jobId}] Failed to generate map video`, {
+              error: error instanceof Error ? error.message : String(error),
+              coordinates,
             });
+            templates = regularTemplates;
           }
-        } catch (error) {
-          logger.error(`[${jobId}] Error processing template ${template}`, {
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-
-        // Delay between individual templates, increased for regeneration
-        if (
-          i + BATCH_SIZE < regularTemplates.length ||
-          mapDependentTemplates.length > 0
-        ) {
-          const delay = isRegeneration ? 3000 : 2000; // 3s for regeneration, 2s otherwise
-          await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
-    }
 
-    // Process map-dependent templates if map video is available
-    if (mapDependentTemplates.length > 0 && mapVideo) {
-      logger.info(`[${jobId}] Processing map-dependent templates`, {
-        templates: mapDependentTemplates,
-        mapVideoPath: mapVideo,
-      });
+      // Process all templates serially with a delay
+      for (let i = 0; i < regularTemplates.length; i += BATCH_SIZE) {
+        const batch = regularTemplates.slice(i, i + BATCH_SIZE);
 
-      // Validate map video before processing
-      try {
-        const isMapValid = await this.validateMapVideo(mapVideo, jobId);
-        if (!isMapValid) {
-          throw new Error("Map video validation failed");
-        }
+        logger.info(
+          `[${jobId}] Processing regular template batch ${i / BATCH_SIZE + 1}`,
+          {
+            templates: batch,
+            batchSize: batch.length,
+            isRegeneration,
+          }
+        );
 
-        // Process map-dependent templates one at a time
-        for (const template of mapDependentTemplates) {
+        for (const template of batch) {
           try {
-            logger.info(`[${jobId}] Processing map template: ${template}`, {
-              mapVideo,
-              runwayVideosCount: runwayVideos.length,
-            });
-
             const result = await this.processTemplate(
               template,
               runwayVideos,
@@ -1724,59 +1266,122 @@ export class ProductionPipeline {
 
             if (result.status === "SUCCESS" && result.outputPath) {
               results.push(result.outputPath);
-              logger.info(`[${jobId}] Map template processed successfully`, {
-                template,
+              logger.info(`[${jobId}] Processed template ${template}`, {
+                outputPath: result.outputPath,
                 processingTime: result.processingTime,
               });
             } else {
-              logger.warn(`[${jobId}] Map template processing failed`, {
-                template,
-                error:
-                  result.error || "Unknown error in map template processing",
+              logger.warn(`[${jobId}] Failed to process template ${template}`, {
+                error: result.error,
               });
             }
           } catch (error) {
-            logger.error(
-              `[${jobId}] Error processing map template ${template}`,
-              {
-                error: error instanceof Error ? error.message : String(error),
-              }
-            );
-            // Continue with next template despite errors
-            continue;
+            logger.error(`[${jobId}] Error processing template ${template}`, {
+              error: error instanceof Error ? error.message : String(error),
+            });
           }
 
-          // Small delay between map templates
-          await new Promise((resolve) => setTimeout(resolve, 3000)); // 3s delay
+          // Delay between individual templates, increased for regeneration
+          if (
+            i + BATCH_SIZE < regularTemplates.length ||
+            mapDependentTemplates.length > 0
+          ) {
+            const delay = isRegeneration ? 3000 : 2000; // 3s for regeneration, 2s otherwise
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
         }
-      } catch (error) {
-        logger.error(`[${jobId}] Map video validation failed`, {
-          mapVideo,
-          error: error instanceof Error ? error.message : String(error),
-        });
       }
-    }
 
-    // Validate results before returning
-    if (results.length === 0) {
-      logger.error(`[${jobId}] No templates processed successfully`, {
-        regularTemplatesCount: regularTemplates.length,
-        mapDependentTemplatesCount: mapDependentTemplates.length,
-        hasMapVideo: !!mapVideo,
-        hasCoordinates: !!coordinates,
+      // Process map-dependent templates if map video is available
+      if (mapDependentTemplates.length > 0 && mapVideo) {
+        logger.info(`[${jobId}] Processing map-dependent templates`, {
+          templates: mapDependentTemplates,
+          mapVideoPath: mapVideo,
+        });
+
+        // Validate map video before processing
+        try {
+          const isMapValid = await this.validateMapVideo(mapVideo, jobId);
+          if (!isMapValid) {
+            throw new Error("Map video validation failed");
+          }
+
+          // Process map-dependent templates one at a time
+          for (const template of mapDependentTemplates) {
+            try {
+              logger.info(`[${jobId}] Processing map template: ${template}`, {
+                mapVideo,
+                runwayVideosCount: runwayVideos.length,
+              });
+
+              const result = await this.processTemplate(
+                template,
+                runwayVideos,
+                jobId,
+                listingId,
+                coordinates,
+                mapVideo
+              );
+
+              if (result.status === "SUCCESS" && result.outputPath) {
+                results.push(result.outputPath);
+                logger.info(`[${jobId}] Map template processed successfully`, {
+                  template,
+                  processingTime: result.processingTime,
+                });
+              } else {
+                logger.warn(`[${jobId}] Map template processing failed`, {
+                  template,
+                  error:
+                    result.error || "Unknown error in map template processing",
+                });
+              }
+            } catch (error) {
+              logger.error(
+                `[${jobId}] Error processing map template ${template}`,
+                {
+                  error: error instanceof Error ? error.message : String(error),
+                }
+              );
+              // Continue with next template despite errors
+              continue;
+            }
+
+            // Small delay between map templates
+            await new Promise((resolve) => setTimeout(resolve, 3000)); // 3s delay
+          }
+        } catch (error) {
+          logger.error(`[${jobId}] Map video validation failed`, {
+            mapVideo,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      // Validate results before returning
+      if (results.length === 0) {
+        logger.error(`[${jobId}] No templates processed successfully`, {
+          regularTemplatesCount: regularTemplates.length,
+          mapDependentTemplatesCount: mapDependentTemplates.length,
+          hasMapVideo: !!mapVideo,
+          hasCoordinates: !!coordinates,
+        });
+        throw new Error("No templates processed successfully");
+      }
+
+      logger.info(`[${jobId}] Template processing completed`, {
+        successfulTemplatesCount: results.length,
+        templates: results.map((path: string) => {
+          const parts = path.split("/");
+          return parts[parts.length - 1].split(".")[0]; // Extract template name from path
+        }),
       });
-      throw new Error("No templates processed successfully");
+
+      return results;
+    } finally {
+      await this.resourceManager.cleanup();
+      logger.info(`[${jobId}] Cleanup completed after all templates`);
     }
-
-    logger.info(`[${jobId}] Template processing completed`, {
-      successfulTemplatesCount: results.length,
-      templates: results.map((path: string) => {
-        const parts = path.split("/");
-        return parts[parts.length - 1].split(".")[0]; // Extract template name from path
-      }),
-    });
-
-    return results;
   }
 
   private async processVisionImages(jobId: string): Promise<ProcessingImage[]> {
@@ -3779,8 +3384,7 @@ export class ProductionPipeline {
     }
   }
 
-  private createFFmpegCommand(): any {
-    const ffmpeg = require("fluent-ffmpeg");
-    return ffmpeg();
+  private createFFmpegCommand(): ffmpeg.FfmpegCommand {
+    return ffmpeg(); // Use imported ffmpeg directly
   }
 }
