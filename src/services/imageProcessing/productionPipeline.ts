@@ -1146,10 +1146,13 @@ export class ProductionPipeline {
       const timeout = templateConfig.timeout || 120000;
       const maxRetries = templateConfig.maxRetries || 2;
 
-      await videoProcessingService.stitchVideos(
-        clips.map((c) => c.path),
+      // Replace stitchVideos with stitchVideoClips and pass the template configuration
+      await videoProcessingService.stitchVideoClips(
+        clips,
         outputPath,
-        {}
+        templateConfig,
+        undefined, // No watermark config
+        undefined // No progress emitter
       );
 
       const verifiedUrl = await this.retryWithBackoff(
