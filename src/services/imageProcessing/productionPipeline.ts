@@ -68,7 +68,15 @@ interface ProductionPipelineInput {
   skipRunwayIfCached?: boolean;
   allTemplates?: boolean;
   skipLock?: boolean;
-  forceRegeneration?: boolean; // Added this field
+  forceRegeneration?: boolean;
+  metadata?: {
+    processedTemplates?: {
+      key: string;
+      path: string;
+      usedFallback?: boolean;
+    }[];
+    [key: string]: any;
+  };
 }
 
 interface RegenerationContext {
@@ -102,6 +110,7 @@ interface TemplateProcessingResult {
   outputPath: string | null;
   error?: string;
   processingTime?: number;
+  usedFallback?: boolean;
 }
 
 interface ProcessingVideo {
@@ -1155,24 +1164,57 @@ export class ProductionPipeline {
         undefined // No progress emitter
       );
 
-      const verifiedUrl = await this.retryWithBackoff(
-        async () => {
-          const url = await this.verifyS3VideoAccess(outputPath, jobId);
-          if (!url)
-            throw new Error(`Uploaded video not accessible at ${outputPath}`);
-          return url;
-        },
-        this.MAX_RETRIES,
-        `Video creation for ${template}`,
-        jobId
-      );
+      try {
+        // Try to verify the file accessibility
+        const verifiedUrl = await this.retryWithBackoff(
+          async () => {
+            const url = await this.verifyS3VideoAccess(outputPath, jobId);
+            if (!url)
+              throw new Error(`Uploaded video not accessible at ${outputPath}`);
+            return url;
+          },
+          this.MAX_RETRIES,
+          `Video creation for ${template}`,
+          jobId
+        );
 
-      return {
-        template,
-        status: "SUCCESS",
-        outputPath: verifiedUrl,
-        processingTime: Date.now() - startTime,
-      };
+        return {
+          template,
+          status: "SUCCESS",
+          outputPath: verifiedUrl,
+          processingTime: Date.now() - startTime,
+        };
+      } catch (verificationError) {
+        // If verification fails, but we have successfully processed the clips,
+        // use a fallback strategy - return a photo URL instead of video
+        logger.warn(
+          `[${jobId}] Video creation for ${template} failed verification, using fallback`,
+          {
+            error:
+              verificationError instanceof Error
+                ? verificationError.message
+                : String(verificationError),
+          }
+        );
+
+        // Get a sample photo from the first available video path
+        const fallbackPhotoUrl = runwayVideos[0]
+          ?.replace("/videos/runway/", "/images/processed/")
+          .replace(".mp4", ".webp");
+
+        if (fallbackPhotoUrl) {
+          return {
+            template,
+            status: "SUCCESS",
+            outputPath: fallbackPhotoUrl,
+            processingTime: Date.now() - startTime,
+            usedFallback: true,
+          };
+        }
+
+        // If we can't even create a fallback, then throw the error
+        throw verificationError;
+      }
     } catch (error) {
       logger.error(`[${jobId}] Error processing template ${template}`, {
         error: error instanceof Error ? error.message : String(error),
@@ -1185,8 +1227,6 @@ export class ProductionPipeline {
         error: error instanceof Error ? error.message : String(error),
         processingTime: Date.now() - startTime,
       };
-    } finally {
-      // Cleanup moved to caller
     }
   }
 
@@ -1199,6 +1239,12 @@ export class ProductionPipeline {
     mapVideo?: string | null
   ): Promise<string[]> {
     const results: string[] = [];
+    const processedTemplates: {
+      key: string;
+      path: string;
+      usedFallback?: boolean;
+    }[] = [];
+
     try {
       const isRegeneration = await this.isRegeneration(jobId); // Helper to check job metadata
       const BATCH_SIZE = this.getDefaultBatchSize(isRegeneration);
@@ -1269,19 +1315,46 @@ export class ProductionPipeline {
 
             if (result.status === "SUCCESS" && result.outputPath) {
               results.push(result.outputPath);
+              processedTemplates.push({
+                key: template,
+                path: result.outputPath,
+                usedFallback: result.usedFallback,
+              });
+
               logger.info(`[${jobId}] Processed template ${template}`, {
                 outputPath: result.outputPath,
                 processingTime: result.processingTime,
+                usedFallback: result.usedFallback,
               });
             } else {
               logger.warn(`[${jobId}] Failed to process template ${template}`, {
                 error: result.error,
               });
+
+              // Even if a template fails, we'll continue with the rest
+              if (result.error?.includes("not accessible") && runwayVideos[0]) {
+                // Use first image as fallback for template thumbnail
+                const fallbackPhotoUrl = runwayVideos[0]
+                  .replace("/videos/runway/", "/images/processed/")
+                  .replace(".mp4", ".webp");
+                processedTemplates.push({
+                  key: template,
+                  path: fallbackPhotoUrl,
+                  usedFallback: true,
+                });
+                logger.info(
+                  `[${jobId}] Using fallback image for template ${template}`,
+                  {
+                    fallbackPhotoUrl,
+                  }
+                );
+              }
             }
           } catch (error) {
             logger.error(`[${jobId}] Error processing template ${template}`, {
               error: error instanceof Error ? error.message : String(error),
             });
+            // Continue processing other templates even if this one failed
           }
 
           // Delay between individual templates, increased for regeneration
@@ -1328,9 +1401,16 @@ export class ProductionPipeline {
 
               if (result.status === "SUCCESS" && result.outputPath) {
                 results.push(result.outputPath);
+                processedTemplates.push({
+                  key: template,
+                  path: result.outputPath,
+                  usedFallback: result.usedFallback,
+                });
+
                 logger.info(`[${jobId}] Map template processed successfully`, {
                   template,
                   processingTime: result.processingTime,
+                  usedFallback: result.usedFallback,
                 });
               } else {
                 logger.warn(`[${jobId}] Map template processing failed`, {
@@ -1338,6 +1418,28 @@ export class ProductionPipeline {
                   error:
                     result.error || "Unknown error in map template processing",
                 });
+
+                // Even if a template fails, we'll continue with the rest
+                if (
+                  result.error?.includes("not accessible") &&
+                  runwayVideos[0]
+                ) {
+                  // Use first image as fallback for template thumbnail
+                  const fallbackPhotoUrl = runwayVideos[0]
+                    .replace("/videos/runway/", "/images/processed/")
+                    .replace(".mp4", ".webp");
+                  processedTemplates.push({
+                    key: template,
+                    path: fallbackPhotoUrl,
+                    usedFallback: true,
+                  });
+                  logger.info(
+                    `[${jobId}] Using fallback image for map template ${template}`,
+                    {
+                      fallbackPhotoUrl,
+                    }
+                  );
+                }
               }
             } catch (error) {
               logger.error(
@@ -1349,41 +1451,64 @@ export class ProductionPipeline {
               // Continue with next template despite errors
               continue;
             }
-
-            // Small delay between map templates
-            await new Promise((resolve) => setTimeout(resolve, 3000)); // 3s delay
           }
-        } catch (error) {
+        } catch (mapValidationError) {
           logger.error(`[${jobId}] Map video validation failed`, {
-            mapVideo,
-            error: error instanceof Error ? error.message : String(error),
+            error:
+              mapValidationError instanceof Error
+                ? mapValidationError.message
+                : String(mapValidationError),
           });
         }
       }
 
-      // Validate results before returning
-      if (results.length === 0) {
-        logger.error(`[${jobId}] No templates processed successfully`, {
-          regularTemplatesCount: regularTemplates.length,
-          mapDependentTemplatesCount: mapDependentTemplates.length,
-          hasMapVideo: !!mapVideo,
-          hasCoordinates: !!coordinates,
+      // Update the job with processed templates information
+      try {
+        const currentJob = await this.prisma.videoJob.findUnique({
+          where: { id: jobId },
         });
-        throw new Error("No templates processed successfully");
+
+        if (currentJob && currentJob.metadata) {
+          const updatedMetadata = {
+            ...(currentJob.metadata as Record<string, any>),
+            processedTemplates,
+          };
+
+          await this.prisma.videoJob.update({
+            where: { id: jobId },
+            data: {
+              metadata: updatedMetadata,
+            },
+          });
+
+          logger.info(
+            `[${jobId}] Updated job metadata with processed templates info`,
+            {
+              templatesCount: processedTemplates.length,
+            }
+          );
+        }
+      } catch (metadataError) {
+        logger.warn(
+          `[${jobId}] Failed to update job metadata with templates info`,
+          {
+            error:
+              metadataError instanceof Error
+                ? metadataError.message
+                : String(metadataError),
+          }
+        );
       }
 
-      logger.info(`[${jobId}] Template processing completed`, {
-        successfulTemplatesCount: results.length,
-        templates: results.map((path: string) => {
-          const parts = path.split("/");
-          return parts[parts.length - 1].split(".")[0]; // Extract template name from path
-        }),
+      return results;
+    } catch (error) {
+      logger.error(`[${jobId}] Error in template processing`, {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
       });
 
+      // Even if we have an error, return any results we've collected so far
       return results;
-    } finally {
-      await this.resourceManager.cleanup();
-      logger.info(`[${jobId}] Cleanup completed after all templates`);
     }
   }
 
@@ -1939,6 +2064,7 @@ export class ProductionPipeline {
       if (templateResults.length === 0)
         throw new Error("No templates processed successfully");
 
+      // In the execute method, update the job with processedTemplates information
       await this.prisma.videoJob.update({
         where: { id: jobId },
         data: {
@@ -1948,10 +2074,20 @@ export class ProductionPipeline {
           completedAt: new Date(),
           metadata: {
             defaultTemplate: input.template,
-            processedTemplates: templateResults.map((path) => ({
-              key: input.template,
-              path,
-            })),
+            processedTemplates: templateResults.map((path) => {
+              // Check if this is a fallback (image) path
+              const isFallback =
+                path.includes("/images/processed/") &&
+                (path.endsWith(".webp") ||
+                  path.endsWith(".jpg") ||
+                  path.endsWith(".png"));
+
+              return {
+                key: input.template,
+                path,
+                usedFallback: isFallback,
+              };
+            }),
             isRegeneration,
             regenerationContext: regenerationContext
               ? JSON.parse(JSON.stringify(regenerationContext))
