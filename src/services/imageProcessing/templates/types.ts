@@ -76,6 +76,9 @@ export interface ReelTemplate {
   };
   /** Access level required for this template */
   accessLevel: TemplateAccessLevel;
+
+  timeout?: number; // Added: FFmpeg timeout in milliseconds
+  maxRetries?: number; // Added: Maximum retry attempts
 }
 
 // Add new type for template access level
@@ -97,6 +100,8 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       volume: 0.85,
     },
     accessLevel: "free",
+    timeout: 120000, // 2 minutes
+    maxRetries: 2,
   },
   wave: {
     name: "Wave",
@@ -114,6 +119,8 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       volume: 0.8,
     },
     accessLevel: "free",
+    timeout: 120000, // 2 minutes
+    maxRetries: 2,
   },
   storyteller: {
     name: "Storyteller",
@@ -130,6 +137,8 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       volume: 0.75,
     },
     accessLevel: "free",
+    timeout: 120000, // 2 minutes
+    maxRetries: 2,
   },
   googlezoomintro: {
     name: "Google Zoom Intro",
@@ -176,6 +185,8 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       volume: 0.8,
     },
     accessLevel: "premium",
+    timeout: 300000, // 5 minutes - accounts for map + multiple clips
+    maxRetries: 3,
   },
   wesanderson: {
     name: "Wes Anderson",
@@ -194,6 +205,8 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
         "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95,hue=h=5:s=1.2,colorbalance=rm=0.1:gm=-0.05:bm=-0.1,curves=master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1',unsharp=5:5:1.5:5:5:0.0",
     },
     accessLevel: "premium",
+    timeout: 300000, // 5 minutes - longer due to pre-processing complexity
+    maxRetries: 2,
   },
   hyperpop: {
     name: "Hyperpop",
@@ -211,5 +224,7 @@ export const reelTemplates: Record<TemplateKey, ReelTemplate> = {
       volume: 0.9,
     },
     accessLevel: "premium",
+    timeout: 120000, // 2 minutes
+    maxRetries: 2,
   },
 } as const;
