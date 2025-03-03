@@ -479,25 +479,33 @@ export class ProductionPipeline {
         await this.resourceManager.trackResource(repairedPath);
 
         try {
-          await ffmpegQueueManager.enqueueJob(() => {
-            return new Promise<void>((resolve, reject) => {
-              ffmpeg(tempPath)
-                .outputOptions([
-                  "-c:v",
-                  "copy",
-                  "-c:a",
-                  "copy",
-                  "-map",
-                  "0",
-                  "-f",
-                  "mp4",
-                ])
-                .output(repairedPath)
-                .on("end", () => resolve())
-                .on("error", (err) => reject(err))
-                .run();
-            });
-          });
+          // Use default timeout and maxRetries for repair operations
+          const timeout = 60000; // 60 seconds for repair
+          const maxRetries = 2; // 2 retries for repair
+
+          await ffmpegQueueManager.enqueueJob(
+            () => {
+              return new Promise<void>((resolve, reject) => {
+                ffmpeg(tempPath)
+                  .outputOptions([
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "copy",
+                    "-map",
+                    "0",
+                    "-f",
+                    "mp4",
+                  ])
+                  .output(repairedPath)
+                  .on("end", () => resolve())
+                  .on("error", (err) => reject(err))
+                  .run();
+              });
+            },
+            timeout,
+            maxRetries
+          );
 
           finalPath = repairedPath;
           duration = await videoProcessingService.getVideoDuration(
@@ -679,8 +687,14 @@ export class ProductionPipeline {
       }
 
       // Enqueue the FFmpeg job via FFmpegQueueManager
-      const result = await ffmpegQueueManager.enqueueJob(() =>
-        this.retryRunwayGeneration(inputUrl, index, job.listingId, jobId)
+      // Use longer timeout for Runway generation which can be resource-intensive
+      const timeout = 180000; // 3 minutes for Runway generation
+      const maxRetries = 3; // 3 retries for Runway generation
+
+      const result = await ffmpegQueueManager.enqueueJob(
+        () => this.retryRunwayGeneration(inputUrl, index, job.listingId, jobId),
+        timeout,
+        maxRetries
       );
 
       return result?.s3Url || null;
@@ -1103,6 +1117,10 @@ export class ProductionPipeline {
       await fs.mkdir(tempDir, { recursive: true });
       const templateConfig = reelTemplates[template];
 
+      // Get template-specific timeout and maxRetries
+      const timeout = templateConfig.timeout || 120000; // Default 120s
+      const maxRetries = templateConfig.maxRetries || 2; // Default 2 retries
+
       const fdCount = await this.getFileDescriptorCount(jobId);
       const memoryUsage = process.memoryUsage();
       logger.info(`[${jobId}] Starting template ${template}`, {
@@ -1150,22 +1168,111 @@ export class ProductionPipeline {
         const batchOutputs: string[] = [];
         for (let i = 0; i < batches.length; i++) {
           const batchOutput = path.join(tempDir, `batch_${i}.mp4`);
-          await ffmpegQueueManager.enqueueJob(async () => {
-            const fdCountBatch = await this.getFileDescriptorCount(jobId);
-            logger.debug(`[${jobId}] Processing batch ${i}`, {
-              fdCount: fdCountBatch,
-            });
-            if (fdCountBatch > 900) {
-              throw new Error(
-                `Too many file descriptors (${fdCountBatch}) in batch ${i}`
-              );
-            }
-            await videoProcessingService.stitchVideoClips(
-              batches[i],
-              batchOutput,
-              { name: `batch_${i}` }
-            );
-          });
+          await ffmpegQueueManager.enqueueJob(
+            async () => {
+              const fdCountBatch = await this.getFileDescriptorCount(jobId);
+              logger.debug(`[${jobId}] Processing batch ${i}`, {
+                fdCount: fdCountBatch,
+              });
+              if (fdCountBatch > 900) {
+                throw new Error(
+                  `Too many file descriptors (${fdCountBatch}) in batch ${i}`
+                );
+              }
+
+              const command = this.createFFmpegCommand();
+              batches[i].forEach((clip) => command.input(clip.path));
+
+              const filterCommands = batches[i]
+                .map((clip, idx) => ({
+                  filter: "trim",
+                  options: `duration=${clip.duration}`,
+                  inputs: [`${idx}:v`],
+                  outputs: [`v${idx}`],
+                }))
+                .concat([
+                  {
+                    filter: "concat",
+                    options: `n=${batches[i].length}:v=1:a=0`,
+                    inputs: batches[i].map((_, idx) => `v${idx}`),
+                    outputs: ["vout"],
+                  },
+                ]);
+
+              command
+                .complexFilter(filterCommands)
+                .outputOptions(["-map", "[vout]"])
+                .outputOptions([
+                  "-c:v",
+                  "libx264",
+                  "-preset",
+                  "fast",
+                  "-crf",
+                  "23",
+                ])
+                .output(batchOutput);
+
+              await new Promise<void>((resolve, reject) => {
+                let lastProgress = 0;
+                let lastProgressTime = Date.now();
+                const progressTimeout = setTimeout(() => {
+                  logger.warn(
+                    `[${jobId}] Batch ${i} stalled at ${lastProgress}%`
+                  );
+                  command.kill("SIGKILL");
+                  reject(new Error(`Batch ${i} stalled at ${lastProgress}%`));
+                }, 30000); // 30s stall check
+
+                command
+                  .on("progress", (progress: { percent?: number }) => {
+                    const currentProgress = progress.percent || 0;
+                    // Only log progress at meaningful intervals
+                    if (
+                      currentProgress - lastProgress >= 10 ||
+                      Date.now() - lastProgressTime > 10000
+                    ) {
+                      logger.info(
+                        `[${jobId}] Batch ${i} progress: ${Math.round(
+                          currentProgress
+                        )}%`
+                      );
+                      lastProgress = currentProgress;
+                      lastProgressTime = Date.now();
+                    }
+
+                    // Reset stall detection timeout
+                    clearTimeout(progressTimeout);
+                    if (currentProgress < 100) {
+                      setTimeout(() => {
+                        logger.warn(
+                          `[${jobId}] Batch ${i} stalled at ${lastProgress}%`
+                        );
+                        command.kill("SIGKILL");
+                        reject(
+                          new Error(`Batch ${i} stalled at ${lastProgress}%`)
+                        );
+                      }, 30000); // 30s stall check
+                    }
+                  })
+                  .on("end", () => {
+                    clearTimeout(progressTimeout);
+                    logger.info(`[${jobId}] Batch ${i} completed successfully`);
+                    resolve();
+                  })
+                  .on("error", (err: Error) => {
+                    clearTimeout(progressTimeout);
+                    logger.error(`[${jobId}] Batch ${i} failed`, {
+                      error: err.message,
+                      clipCount: batches[i].length,
+                    });
+                    reject(err);
+                  })
+                  .run();
+              });
+            },
+            timeout,
+            maxRetries
+          );
           await this.resourceManager.trackResource(batchOutput);
           batchOutputs.push(batchOutput);
         }
@@ -1404,19 +1511,25 @@ export class ProductionPipeline {
           // Stitch video with retry logic
           const verifiedUrl = await this.retryWithBackoff(
             async () => {
-              await videoProcessingService.createVideo(
-                finalClips,
-                outputPath,
-                {
-                  name: templateConfig.name,
-                  description: templateConfig.description,
-                  colorCorrection: templateConfig.colorCorrection,
-                  transitions: templateConfig.transitions,
-                  reverseClips: templateConfig.reverseClips,
-                  music: processedMusic,
-                  outputOptions: ["-q:a 2"],
-                } as VideoTemplate,
-                watermarkSettings
+              await ffmpegQueueManager.enqueueJob(
+                async () => {
+                  await videoProcessingService.createVideo(
+                    finalClips,
+                    outputPath,
+                    {
+                      name: templateConfig.name,
+                      description: templateConfig.description,
+                      colorCorrection: templateConfig.colorCorrection,
+                      transitions: templateConfig.transitions,
+                      reverseClips: templateConfig.reverseClips,
+                      music: processedMusic,
+                      outputOptions: ["-q:a 2"],
+                    } as VideoTemplate,
+                    watermarkSettings
+                  );
+                },
+                timeout,
+                maxRetries
               );
 
               const url = await this.verifyS3VideoAccess(outputPath, jobId);
@@ -2787,14 +2900,25 @@ export class ProductionPipeline {
 
   // Helper method to run FFprobe (you may need to install ffprobe or use a library like fluent-ffmpeg for this)
   private async runFFprobe(filePath: string): Promise<FfprobeData> {
-    return ffmpegQueueManager.enqueueJob(() => {
-      return new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(filePath, (err: Error | null, metadata: FfprobeData) => {
-          if (err) reject(err);
-          else resolve(metadata);
+    // Use shorter timeout for FFprobe which is typically quick
+    const timeout = 30000; // 30 seconds for FFprobe
+    const maxRetries = 2; // 2 retries for FFprobe
+
+    return ffmpegQueueManager.enqueueJob(
+      () => {
+        return new Promise((resolve, reject) => {
+          ffmpeg.ffprobe(
+            filePath,
+            (err: Error | null, metadata: FfprobeData) => {
+              if (err) reject(err);
+              else resolve(metadata);
+            }
+          );
         });
-      });
-    });
+      },
+      timeout,
+      maxRetries
+    );
   }
 
   private async uploadToS3(filePath: string, s3Key: string): Promise<string> {
@@ -3511,6 +3635,11 @@ export class ProductionPipeline {
       // Track the temporary file for cleanup
       await this.resourceManager.trackResource(tempPath);
 
+      // Get template-specific timeout and maxRetries
+      const templateConfig = reelTemplates["wesanderson"];
+      const timeout = templateConfig.timeout || 120000; // Default 120s
+      const maxRetries = templateConfig.maxRetries || 2; // Default 2 retries
+
       const fdCount = await this.getFileDescriptorCount(jobId);
       const memoryUsage = process.memoryUsage();
       logger.debug(`[${jobId}] Pre-processing resources for clip ${index}`, {
@@ -3530,84 +3659,101 @@ export class ProductionPipeline {
         );
       }
 
-      await ffmpegQueueManager.enqueueJob(async () => {
-        const command = this.createFFmpegCommand()
-          .input(clip.path)
-          .complexFilter([
-            {
-              filter: "trim",
-              options: `duration=${clip.duration}`,
-              outputs: ["trimmed"],
-            },
-            {
-              filter: "setpts",
-              options: "PTS-STARTPTS",
-              inputs: ["trimmed"],
-              outputs: ["pts"],
-            },
-            {
-              filter: "eq",
-              options:
-                "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
-              inputs: ["pts"],
-              outputs: ["eq"],
-            },
-            {
-              filter: "hue",
-              options: "h=5:s=1.2",
-              inputs: ["eq"],
-              outputs: ["hue"],
-            },
-            {
-              filter: "colorbalance",
-              options: "rm=0.1:gm=-0.05:bm=-0.1",
-              inputs: ["hue"],
-              outputs: ["cb"],
-            },
-            {
-              filter: "curves",
-              options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
-              inputs: ["cb"],
-              outputs: ["curves"],
-            },
-            {
-              filter: "unsharp",
-              options: "5:5:1.5:5:5:0.0",
-              inputs: ["curves"],
-              outputs: ["unsharp"],
-            },
-            {
-              filter: "format",
-              options: "yuv420p",
-              inputs: ["unsharp"],
-              outputs: ["final"],
-            },
-          ])
-          .outputOptions(["-map", "[final]"])
-          .outputOptions(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
-          .output(tempPath);
+      await ffmpegQueueManager.enqueueJob(
+        async () => {
+          const command = this.createFFmpegCommand()
+            .input(clip.path)
+            .complexFilter([
+              {
+                filter: "trim",
+                options: `duration=${clip.duration}`,
+                outputs: ["trimmed"],
+              },
+              {
+                filter: "setpts",
+                options: "PTS-STARTPTS",
+                inputs: ["trimmed"],
+                outputs: ["pts"],
+              },
+              {
+                filter: "eq",
+                options:
+                  "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
+                inputs: ["pts"],
+                outputs: ["eq"],
+              },
+              {
+                filter: "hue",
+                options: "h=5:s=1.2",
+                inputs: ["eq"],
+                outputs: ["hue"],
+              },
+              {
+                filter: "colorbalance",
+                options: "rm=0.1:gm=-0.05:bm=-0.1",
+                inputs: ["hue"],
+                outputs: ["cb"],
+              },
+              {
+                filter: "curves",
+                options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
+                inputs: ["cb"],
+                outputs: ["curves"],
+              },
+              {
+                filter: "unsharp",
+                options: "5:5:1.5:5:5:0.0",
+                inputs: ["curves"],
+                outputs: ["unsharp"],
+              },
+              {
+                filter: "format",
+                options: "yuv420p",
+                inputs: ["unsharp"],
+                outputs: ["final"],
+              },
+            ])
+            .outputOptions(["-map", "[final]"])
+            .outputOptions(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+            .output(tempPath);
 
-        await new Promise<void>((resolve, reject) => {
-          command
-            .on("end", () => {
-              logger.info(
-                `[${jobId}] Pre-processed Wes Anderson clip ${index}`,
-                { tempPath }
-              );
-              resolve();
-            })
-            .on("error", (err: Error) => {
-              logger.error(
-                `[${jobId}] Pre-processing failed for clip ${index}`,
-                { error: err.message, path: clip.path }
-              );
-              reject(err);
-            })
-            .run();
-        });
-      });
+          await new Promise<void>((resolve, reject) => {
+            command
+              .on("end", () => {
+                logger.info(
+                  `[${jobId}] Pre-processed Wes Anderson clip ${index}`,
+                  { tempPath }
+                );
+                resolve();
+              })
+              .on("error", (err: Error) => {
+                logger.error(
+                  `[${jobId}] Pre-processing failed for clip ${index}`,
+                  { error: err.message, path: clip.path }
+                );
+                reject(err);
+              })
+              .run();
+          });
+        },
+        timeout,
+        maxRetries
+      );
 
-      return { ...clip, path: tempPath };
+      // Validate the processed clip
+      const processedClip = { ...clip, path: tempPath };
+      const isValid = await this.validateClipDuration(
+        processedClip,
+        index,
+        jobId,
+        reelTemplates["wesanderson"]
+      );
+
+      if (!isValid) {
+        throw new Error(`Processed clip ${index} failed validation`);
+      }
+
+      return processedClip;
     } catch (error) {
       logger.error(
         `[${jobId}] Error in preProcessWesAndersonClip for clip ${index}`,
@@ -3616,7 +3762,14 @@ export class ProductionPipeline {
           path: clip.path,
         }
       );
-      return clip; // Fallback to original clip
+
+      // Validate the original clip as fallback
+      const isOriginalValid = await this.validateClipDuration(
+        clip,
+        index,
+        jobId
+      );
+      return isOriginalValid ? clip : { ...clip, path: "" }; // Empty path signals skip
     } finally {
       logger.debug(`[${jobId}] Pre-processing cleanup check`, {
         tempFiles: Array.from(this.resourceManager.tempFiles).filter((f) =>
