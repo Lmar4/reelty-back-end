@@ -13,7 +13,8 @@
     "forceConsistentCasingInFileNames": true, // Ensure consistent casing in file names
     "skipLibCheck": true, // Skip type checking of declaration files
     "resolveJsonModule": true, // Allow importing JSON files
-    "types": ["node", "puppeteer"] // Include type definitions for Node.js, Puppeteer, and Jest
+    "types": ["node"], // Include type definitions for Node.js
+    "typeRoots": ["./node_modules/@types", "./src/types"]
   },
   "include": ["src/**/*", "scripts/**/*", "prisma/**/*"],
   "exclude": ["node_modules", "build"]
