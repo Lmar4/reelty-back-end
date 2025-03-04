@@ -854,37 +854,64 @@ export class ProductionPipeline {
   }
 
   private getS3UrlFromKey(key: string): string {
-    return `https://${this.bucket}.s3.${this.region}.amazonaws.com/${key}`;
+    // Ensure the key doesn't start with a slash
+    const sanitizedKey = key.startsWith("/") ? key.substring(1) : key;
+
+    // Construct a proper URL with protocol and hostname
+    return `https://${this.bucket}.s3.${this.region}.amazonaws.com/${sanitizedKey}`;
   }
 
   private getS3KeyFromUrl(url: string): string {
-    // Check if this is a local file path
-    if (url.startsWith("/") && !url.startsWith("//")) {
-      // For local paths, return the path as is
-      return url;
-    }
-
-    if (url.startsWith("s3://")) {
-      const parts = url.slice(5).split("/");
-      return parts.slice(1).join("/"); // Remove bucket name
-    }
     try {
-      const urlObj = new URL(url);
-      const pathParts = urlObj.pathname.split("/");
-      // Skip the first empty part due to leading slash
-      return pathParts.slice(1).join("/");
+      // Parse the URL properly
+      const parsedUrl = new URL(url);
+
+      // Extract the path and remove leading slash if present
+      let path = parsedUrl.pathname;
+      if (path.startsWith("/")) {
+        path = path.substring(1);
+      }
+
+      return path;
     } catch (error) {
-      // If not a valid URL, assume it's a key
+      // If URL parsing fails, try to extract the path portion after the bucket name
+      const bucketPattern = new RegExp(
+        `https?://${this.bucket}.s3.${this.region}.amazonaws.com/(.*)`
+      );
+      const match = url.match(bucketPattern);
+
+      if (match && match[1]) {
+        return match[1];
+      }
+
+      // If all else fails, return the original URL (though this may cause issues)
+      console.warn(`Failed to parse S3 URL: ${url}`);
       return url;
     }
   }
 
   private validateS3Url(url: string): string {
-    if (url.startsWith("https://") || url.startsWith("s3://")) {
-      return url;
+    if (!url) {
+      throw new Error("Empty S3 URL provided");
     }
-    // If it's just a key, convert it to a full URL
-    return this.getS3UrlFromKey(url);
+
+    try {
+      // Validate URL format
+      new URL(url);
+      return url;
+    } catch (error) {
+      // If it's not a valid URL, try to construct one
+      if (url.startsWith("s3://")) {
+        // Handle s3:// protocol format
+        const path = url.substring(5);
+        return `https://${this.bucket}.s3.${this.region}.amazonaws.com/${path}`;
+      } else if (!url.startsWith("http")) {
+        // Treat as a key if it doesn't start with http
+        return this.getS3UrlFromKey(url);
+      }
+
+      throw new Error(`Invalid S3 URL format: ${url}`);
+    }
   }
 
   private async verifyS3Asset(s3Key: string): Promise<boolean> {
