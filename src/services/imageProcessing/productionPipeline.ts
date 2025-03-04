@@ -1233,7 +1233,7 @@ export class ProductionPipeline {
               outputPath,
               s3Key
             );
-
+            logger.debug(`[${jobId}] Uploaded video URL: ${url}`);
             // Verify the uploaded file is accessible
             const uploadedS3Key = this.getS3KeyFromUrl(url);
             const isAvailable = await this.waitForS3ObjectAvailability(
