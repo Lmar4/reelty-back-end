@@ -1175,31 +1175,106 @@ export class ProductionPipeline {
     try {
       await fs.mkdir(tempDir, { recursive: true });
 
-      let clips: VideoClip[] = runwayVideos.map((path, i) => ({
-        path,
-        duration: Array.isArray(templateConfig.durations)
-          ? templateConfig.durations[i] || 5
-          : (templateConfig.durations as Record<string | number, number>)[i] ||
-            5,
-        colorCorrection: templateConfig.colorCorrection,
-      }));
+      // Create clips array with proper handling for map video
+      let clips: VideoClip[] = [];
 
-      if (template === "googlezoomintro" && mapVideo) {
-        clips = [
-          {
-            path: mapVideo,
-            duration: (templateConfig.durations as any)?.map || 3,
-            isMapVideo: true,
-          },
-          ...clips,
-        ];
-      }
+      // Special handling for googlezoomintro template
+      if (template === "googlezoomintro") {
+        if (!mapVideo) {
+          logger.warn(
+            `[${jobId}] Map video missing for googlezoomintro template`,
+            {
+              coordinates,
+              hasMapVideo: !!mapVideo,
+            }
+          );
+          // Continue without map video, using only runway videos
+          clips = runwayVideos.map((path, i) => ({
+            path,
+            duration: Array.isArray(templateConfig.durations)
+              ? templateConfig.durations[i] || 5
+              : (templateConfig.durations as Record<string | number, number>)[
+                  i + 1
+                ] || 5,
+            colorCorrection: templateConfig.colorCorrection,
+          }));
+        } else {
+          // Validate map video before using it
+          const isMapValid = await this.validateMapVideo(mapVideo, jobId);
+          if (!isMapValid) {
+            logger.warn(
+              `[${jobId}] Map video validation failed, proceeding without map`,
+              {
+                mapVideoPath: mapVideo,
+              }
+            );
+            // Continue without map video
+            clips = runwayVideos.map((path, i) => ({
+              path,
+              duration: Array.isArray(templateConfig.durations)
+                ? templateConfig.durations[i] || 5
+                : (templateConfig.durations as Record<string | number, number>)[
+                    i + 1
+                  ] || 5,
+              colorCorrection: templateConfig.colorCorrection,
+            }));
+          } else {
+            // Map video is valid, add it as first clip
+            clips = [
+              {
+                path: mapVideo,
+                duration: (templateConfig.durations as any)?.map || 3,
+                isMapVideo: true,
+              },
+              ...runwayVideos.map((path, i) => ({
+                path,
+                duration: Array.isArray(templateConfig.durations)
+                  ? templateConfig.durations[i] || 5
+                  : (
+                      templateConfig.durations as Record<
+                        string | number,
+                        number
+                      >
+                    )[i + 1] || 5,
+                colorCorrection: templateConfig.colorCorrection,
+              })),
+            ];
 
-      // Pre-process Wes Anderson clips
-      if (template === "wesanderson") {
+            logger.info(
+              `[${jobId}] Successfully added map video to googlezoomintro template`,
+              {
+                mapVideoPath: mapVideo,
+                totalClips: clips.length,
+              }
+            );
+          }
+        }
+      } else if (template === "wesanderson") {
+        clips = runwayVideos.map((path, i) => ({
+          path,
+          duration: Array.isArray(templateConfig.durations)
+            ? templateConfig.durations[i] || 5
+            : (templateConfig.durations as Record<string | number, number>)[
+                i
+              ] || 5,
+          colorCorrection: templateConfig.colorCorrection,
+        }));
+
+        // Pre-process Wes Anderson clips
         clips = await Promise.all(
           clips.map((clip, i) => this.preProcessWesAndersonClip(clip, i, jobId))
         );
+      } else {
+        // For other templates, just use runway videos
+        clips = runwayVideos.map((path, i) => ({
+          path,
+          duration: Array.isArray(templateConfig.durations)
+            ? templateConfig.durations[i] || 5
+            : (templateConfig.durations as Record<string | number, number>)[
+                i
+              ] || 5,
+          colorCorrection: templateConfig.colorCorrection,
+        }));
       }
 
       const timeout = templateConfig.timeout || 120000;
@@ -1324,12 +1399,25 @@ export class ProductionPipeline {
       const isRegeneration = await this.isRegeneration(jobId); // Helper to check job metadata
       const BATCH_SIZE = this.getDefaultBatchSize(isRegeneration);
 
-      const mapDependentTemplates = templates.filter(
-        (t) => reelTemplates[t].sequence[0] === "map"
-      );
+      // Improved detection of map-dependent templates
+      const mapDependentTemplates = templates.filter((t) => {
+        const template = reelTemplates[t];
+        return (
+          Array.isArray(template.sequence) &&
+          (template.sequence.includes("map") || t === "googlezoomintro")
+        );
+      });
+
       const regularTemplates = templates.filter(
-        (t) => reelTemplates[t].sequence[0] !== "map"
+        (t) => !mapDependentTemplates.includes(t)
       );
+
+      logger.info(`[${jobId}] Template processing plan`, {
+        mapDependentTemplates,
+        regularTemplates,
+        hasCoordinates: !!coordinates,
+        hasMapVideo: !!mapVideo,
+      });
 
       if (mapDependentTemplates.length > 0) {
         if (!coordinates) {
@@ -1351,15 +1439,43 @@ export class ProductionPipeline {
               jobId,
               listingId
             );
+
+            // Validate the generated map video
+            if (mapVideo) {
+              const isValid = await this.validateMapVideo(mapVideo, jobId);
+              if (!isValid) {
+                logger.warn(
+                  `[${jobId}] Generated map video failed validation`,
+                  {
+                    mapVideoPath: mapVideo,
+                  }
+                );
+                mapVideo = null;
+              } else {
+                logger.info(
+                  `[${jobId}] Map video generated and validated successfully`,
+                  {
+                    mapVideoPath: mapVideo,
+                  }
+                );
+              }
+            }
+
             if (!mapVideo) {
-              throw new Error("Map video generation failed");
+              logger.warn(
+                `[${jobId}] Map video generation failed or validation failed, will process templates without map`,
+                {
+                  coordinates,
+                }
+              );
+              // We'll still process map-dependent templates, but they'll handle the missing map video
             }
           } catch (error) {
             logger.error(`[${jobId}] Failed to generate map video`, {
               error: error instanceof Error ? error.message : String(error),
               coordinates,
             });
-            templates = regularTemplates;
+            // We'll still process map-dependent templates, but they'll handle the missing map video
           }
         }
       }
@@ -1443,97 +1559,79 @@ export class ProductionPipeline {
         }
       }
 
-      // Process map-dependent templates if map video is available
-      if (mapDependentTemplates.length > 0 && mapVideo) {
+      // Process map-dependent templates
+      if (mapDependentTemplates.length > 0) {
         logger.info(`[${jobId}] Processing map-dependent templates`, {
           templates: mapDependentTemplates,
-          mapVideoPath: mapVideo,
+          mapVideoPath: mapVideo || "No map video available",
         });
 
-        // Validate map video before processing
-        try {
-          const isMapValid = await this.validateMapVideo(mapVideo, jobId);
-          if (!isMapValid) {
-            throw new Error("Map video validation failed");
-          }
+        // Process map-dependent templates one at a time
+        for (const template of mapDependentTemplates) {
+          try {
+            logger.info(`[${jobId}] Processing map template: ${template}`, {
+              mapVideo: mapVideo || "No map video available",
+              runwayVideosCount: runwayVideos.length,
+            });
 
-          // Process map-dependent templates one at a time
-          for (const template of mapDependentTemplates) {
-            try {
-              logger.info(`[${jobId}] Processing map template: ${template}`, {
-                mapVideo,
-                runwayVideosCount: runwayVideos.length,
+            const result = await this.processTemplate(
+              template,
+              runwayVideos,
+              jobId,
+              listingId,
+              coordinates,
+              mapVideo
+            );
+
+            if (result.status === "SUCCESS" && result.outputPath) {
+              results.push(result.outputPath);
+              processedTemplates.push({
+                key: template,
+                path: result.outputPath,
+                usedFallback: result.usedFallback,
               });
 
-              const result = await this.processTemplate(
+              logger.info(`[${jobId}] Map template processed successfully`, {
                 template,
-                runwayVideos,
-                jobId,
-                listingId,
-                coordinates,
-                mapVideo
-              );
+                processingTime: result.processingTime,
+                usedFallback: result.usedFallback,
+              });
+            } else {
+              logger.warn(`[${jobId}] Map template processing failed`, {
+                template,
+                error:
+                  result.error || "Unknown error in map template processing",
+              });
 
-              if (result.status === "SUCCESS" && result.outputPath) {
-                results.push(result.outputPath);
+              // Even if a template fails, we'll continue with the rest
+              if (result.error?.includes("not accessible") && runwayVideos[0]) {
+                // Use first image as fallback for template thumbnail
+                const fallbackPhotoUrl = runwayVideos[0]
+                  .replace("/videos/runway/", "/images/processed/")
+                  .replace(".mp4", ".webp");
                 processedTemplates.push({
                   key: template,
-                  path: result.outputPath,
-                  usedFallback: result.usedFallback,
+                  path: fallbackPhotoUrl,
+                  usedFallback: true,
                 });
-
-                logger.info(`[${jobId}] Map template processed successfully`, {
-                  template,
-                  processingTime: result.processingTime,
-                  usedFallback: result.usedFallback,
-                });
-              } else {
-                logger.warn(`[${jobId}] Map template processing failed`, {
-                  template,
-                  error:
-                    result.error || "Unknown error in map template processing",
-                });
-
-                // Even if a template fails, we'll continue with the rest
-                if (
-                  result.error?.includes("not accessible") &&
-                  runwayVideos[0]
-                ) {
-                  // Use first image as fallback for template thumbnail
-                  const fallbackPhotoUrl = runwayVideos[0]
-                    .replace("/videos/runway/", "/images/processed/")
-                    .replace(".mp4", ".webp");
-                  processedTemplates.push({
-                    key: template,
-                    path: fallbackPhotoUrl,
-                    usedFallback: true,
-                  });
-                  logger.info(
-                    `[${jobId}] Using fallback image for map template ${template}`,
-                    {
-                      fallbackPhotoUrl,
-                    }
-                  );
-                }
+                logger.info(
+                  `[${jobId}] Using fallback image for map template ${template}`,
+                  {
+                    fallbackPhotoUrl,
+                  }
+                );
               }
-            } catch (error) {
-              logger.error(
-                `[${jobId}] Error processing map template ${template}`,
-                {
-                  error: error instanceof Error ? error.message : String(error),
-                }
-              );
-              // Continue with next template despite errors
-              continue;
             }
+          } catch (error) {
+            logger.error(
+              `[${jobId}] Error processing map template ${template}`,
+              {
+                error: error instanceof Error ? error.message : String(error),
+              }
+            );
+            // Continue with next template despite errors
+            continue;
           }
-        } catch (mapValidationError) {
-          logger.error(`[${jobId}] Map video validation failed`, {
-            error:
-              mapValidationError instanceof Error
-                ? mapValidationError.message
-                : String(mapValidationError),
-          });
         }
       }
 
@@ -2632,18 +2730,25 @@ export class ProductionPipeline {
     try {
       let localPath = videoPath;
 
-      if (videoPath.startsWith("https://")) {
+      if (videoPath.startsWith("https://") || videoPath.startsWith("s3://")) {
         localPath = path.join(
           process.cwd(),
           "temp",
-          `${jobId}_map_validate.mp4`
+          `${jobId}_map_validate_${crypto.randomUUID()}.mp4`
         );
         await this.s3Service.downloadFile(videoPath, localPath);
         await this.resourceManager.trackResource(localPath);
+
+        logger.debug(`[${jobId}] Downloaded map video for validation`, {
+          s3Path: videoPath,
+          localPath,
+        });
       }
 
+      // Check if file exists and is readable
       await fs.access(localPath, fs.constants.R_OK);
 
+      // Check file size
       const stats = await fs.stat(localPath);
       if (stats.size < 1024) {
         logger.warn(`[${jobId}] Map video file too small`, {
@@ -2653,6 +2758,7 @@ export class ProductionPipeline {
         return false;
       }
 
+      // Check duration
       const duration = await videoProcessingService.getVideoDuration(localPath);
       if (duration < 1) {
         logger.warn(`[${jobId}] Map video duration too short`, {
@@ -2662,6 +2768,7 @@ export class ProductionPipeline {
         return false;
       }
 
+      // Check integrity
       const isIntegrityValid =
         await videoProcessingService.validateVideoIntegrity(localPath);
       if (!isIntegrityValid) {
@@ -2671,12 +2778,16 @@ export class ProductionPipeline {
         return false;
       }
 
+      // Get and check metadata
       const metadata = await videoProcessingService.getVideoMetadata(localPath);
-      logger.debug(`[${jobId}] Video metadata before validation`, {
+
+      // Log full metadata for debugging
+      logger.debug(`[${jobId}] Map video metadata`, {
         path: videoPath,
-        fullMetadata: metadata, // Log full metadata for debugging
+        metadata,
       });
 
+      // Check for video stream
       if (!metadata.hasVideo || !metadata.width || !metadata.height) {
         logger.warn(`[${jobId}] Map video missing required metadata`, {
           path: videoPath,
@@ -2697,9 +2808,21 @@ export class ProductionPipeline {
           });
           return false;
         }
+
+        // If FFprobe found a video stream, we'll continue despite the initial check failing
+        logger.info(
+          `[${jobId}] FFprobe found video stream despite metadata check failure`,
+          {
+            path: videoPath,
+          }
+        );
       }
 
-      if (videoPath.startsWith("https://")) {
+      // Clean up downloaded file if needed
+      if (
+        (videoPath.startsWith("https://") || videoPath.startsWith("s3://")) &&
+        localPath !== videoPath
+      ) {
         await fs.unlink(localPath).catch((error) => {
           logger.warn(
             `[${jobId}] Failed to cleanup temporary validation file`,
@@ -2715,7 +2838,12 @@ export class ProductionPipeline {
         path: videoPath,
         duration,
         size: stats.size,
-        metadata,
+        metadata: {
+          hasVideo: metadata.hasVideo,
+          width: metadata.width,
+          height: metadata.height,
+          codec: metadata.codec,
+        },
       });
 
       return true;
@@ -2729,27 +2857,46 @@ export class ProductionPipeline {
     }
   }
 
-  // Helper method to run FFprobe (you may need to install ffprobe or use a library like fluent-ffmpeg for this)
+  // Helper method to run FFprobe
   private async runFFprobe(filePath: string): Promise<FfprobeData> {
     // Use shorter timeout for FFprobe which is typically quick
     const timeout = 30000; // 30 seconds for FFprobe
     const maxRetries = 2; // 2 retries for FFprobe
 
-    return ffmpegQueueManager.enqueueJob(
-      () => {
-        return new Promise((resolve, reject) => {
-          ffmpeg.ffprobe(
-            filePath,
-            (err: Error | null, metadata: FfprobeData) => {
-              if (err) reject(err);
-              else resolve(metadata);
-            }
-          );
-        });
-      },
-      timeout,
-      maxRetries
-    );
+    try {
+      return await ffmpegQueueManager.enqueueJob(
+        () => {
+          return new Promise<FfprobeData>((resolve, reject) => {
+            ffmpeg.ffprobe(
+              filePath,
+              (err: Error | null, metadata: FfprobeData) => {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve(metadata);
+                }
+              }
+            );
+          });
+        },
+        timeout,
+        maxRetries
+      );
+    } catch (error) {
+      logger.error(`FFprobe failed for file: ${filePath}`, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Return a minimal valid structure to avoid null reference errors
+      return {
+        streams: [],
+        format: {
+          duration: 0,
+          size: 0,
+          bit_rate: 0,
+        },
+        chapters: [],
+      };
+    }
   }
 
   /**
