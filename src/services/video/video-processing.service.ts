@@ -1476,21 +1476,15 @@ export class VideoProcessingService {
         })
         .filter((clip): clip is VideoClip => clip !== null);
 
-      const currentTotal = sequenceClips.reduce(
+      // Calculate total duration for logging purposes only
+      const totalDuration = sequenceClips.reduce(
         (sum, clip) => sum + clip.duration,
         0
       );
-      if (currentTotal !== targetDuration && targetDuration > 0) {
-        const scaleFactor = targetDuration / currentTotal;
-        sequenceClips = sequenceClips.map((clip) => ({
-          ...clip,
-          duration: clip.duration * scaleFactor,
-        }));
-        logger.info(`[${jobId}] Scaled clip durations`, {
-          scaleFactor,
-          targetDuration,
-        });
-      }
+      logger.info(`[${jobId}] Using exact template durations`, {
+        totalDuration,
+        clipCount: sequenceClips.length,
+      });
     } else {
       sequenceClips = processedClips;
     }
