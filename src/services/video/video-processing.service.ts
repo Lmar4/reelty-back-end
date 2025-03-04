@@ -114,6 +114,12 @@ export class VideoProcessingService {
   // Add a private property to cache the codec
   private _cachedCodec: string | null = null;
 
+  // Add this property to the class
+  private _lastLoggedPercent: number | null = null;
+
+  // Add this property to the class
+  private _lastEmittedPercent: number | null = null;
+
   private constructor() {
     this.s3Service = new S3Service();
     this.s3VideoService = S3VideoService.getInstance();
@@ -655,14 +661,21 @@ export class VideoProcessingService {
 
   private createFFmpegCommand(): ffmpeg.FfmpegCommand {
     const command = ffmpeg();
+
+    // Calculate optimal thread count based on available CPU cores
+    // Use 75% of available cores, minimum 2, maximum 16
+    const cpuCount = require("os").cpus().length;
+    const threadCount = Math.max(2, Math.min(Math.floor(cpuCount * 0.75), 16));
+
     return command
-      .outputOptions(["-threads", "1"])
+      .outputOptions(["-threads", String(threadCount)]) // Use calculated thread count instead of hardcoded 1
       .on("start", async (commandLine) => {
         const codec = await this.getAvailableCodec();
         logger.info("FFmpeg process started", {
           commandLine,
           codec,
           activeJobs: ffmpegQueueManager.getActiveCount(),
+          threadCount, // Log the thread count being used
         });
       })
       .on("progress", (progress) =>
@@ -698,16 +711,28 @@ export class VideoProcessingService {
     progress: FFmpegProgress,
     context: string
   ): void {
-    // Log all progress info for enhanced debugging
-    logger.info(`[video-processing] Processing progress`, {
-      ...progress,
-      context,
-      timestamp: new Date().toISOString(),
-    });
+    // Calculate the current percentage rounded to the nearest integer
+    const currentPercent = Math.round(progress.percent || 0);
 
-    // Also log memory usage every few frames for resource monitoring
-    if (progress.frames % 30 === 0) {
-      logger.info(`[video-processing] Resource usage during encoding`, {
+    // Only log at 10% intervals or when frames are divisible by 30 for resource monitoring
+    const shouldLogProgress =
+      currentPercent % 10 === 0 &&
+      (!this._lastLoggedPercent || currentPercent !== this._lastLoggedPercent);
+
+    if (shouldLogProgress) {
+      // Store the last logged percentage to avoid duplicate logs
+      this._lastLoggedPercent = currentPercent;
+
+      logger.info(`[${context}] Processing progress`, {
+        ...progress,
+        context,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Log memory usage less frequently - every 90 frames instead of 30
+    if (progress.frames % 90 === 0) {
+      logger.info(`[${context}] Resource usage during encoding`, {
         ...this.getMemoryUsageInfo(),
         context,
         timestamp: new Date().toISOString(),
@@ -1347,10 +1372,10 @@ export class VideoProcessingService {
       hours * 3600 + minutes * 60 + seconds + milliseconds;
 
     // Calculate percentage based on current time and total duration
-    return Math.min(
-      Math.round((currentTimeInSeconds / totalDuration) * 100),
-      100
-    );
+    const exactPercent = (currentTimeInSeconds / totalDuration) * 100;
+
+    // Return the percentage rounded to the nearest integer
+    return Math.min(Math.round(exactPercent), 100);
   }
 
   // In the `stitchVideoClips` method, update clip validation and filter generation
@@ -1660,14 +1685,24 @@ export class VideoProcessingService {
               progress,
               totalDuration
             );
-            logger.info(`[${jobId}] FFmpeg progress`, {
-              percent: normalizedPercent,
-            });
-            progressEmitter?.emit("progress", {
-              ...progress,
-              percent: normalizedPercent,
-              jobId,
-            });
+
+            // Only emit progress events at 10% intervals to reduce overhead
+            const shouldEmitProgress =
+              normalizedPercent % 10 === 0 &&
+              (!this._lastEmittedPercent ||
+                normalizedPercent !== this._lastEmittedPercent);
+
+            if (shouldEmitProgress) {
+              this._lastEmittedPercent = normalizedPercent;
+              logger.info(`[${jobId}] FFmpeg progress`, {
+                percent: normalizedPercent,
+              });
+              progressEmitter?.emit("progress", {
+                ...progress,
+                percent: normalizedPercent,
+                jobId,
+              });
+            }
           })
           .on("error", (err) => {
             clearTimeout(timeoutId);
