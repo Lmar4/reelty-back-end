@@ -1433,6 +1433,15 @@ export class VideoProcessingService {
         );
       }
 
+      // Mejorar el logging para mostrar más información sobre la secuencia y los clips disponibles
+      logger.info(`[${jobId}] Processing template ${reelTemplate.name}`, {
+        sequenceLength: reelTemplate.sequence.length,
+        availableClips: processedClips.length,
+        maxClips,
+        targetDuration,
+        sequence: reelTemplate.sequence.slice(0, 20).join(","), // Mostrar parte de la secuencia para depuración
+      });
+
       sequenceClips = reelTemplate.sequence
         .slice(0, maxClips)
         .map((seq, index) => {
@@ -1468,10 +1477,23 @@ export class VideoProcessingService {
           }
           const clip = processedClips[clipIndex];
           if (!clip) return null;
+
+          // Obtener la duración basada en la posición en la secuencia resultante (index)
           const duration =
             durations && typeof durations === "object" && index in durations
               ? durations[index as keyof typeof durations]
               : this.getClipDuration(reelTemplate, index, clip.duration);
+
+          // Mejorar el logging para mostrar la asignación de duraciones
+          logger.debug(
+            `[${jobId}] Assigning duration for clip at sequence position ${index}`,
+            {
+              clipIndex,
+              assignedDuration: duration,
+              originalDuration: clip.duration,
+            }
+          );
+
           return { ...clip, duration };
         })
         .filter((clip): clip is VideoClip => clip !== null);
@@ -1484,7 +1506,9 @@ export class VideoProcessingService {
       logger.info(`[${jobId}] Using exact template durations`, {
         totalDuration,
         clipCount: sequenceClips.length,
-        validIndices: sequenceClips.map((_, i) => i).join(","),
+        validIndices: sequenceClips
+          .map((clip, i) => `${i}:${clip.duration}`)
+          .join(","),
       });
     } else {
       sequenceClips = processedClips;
@@ -1610,9 +1634,18 @@ export class VideoProcessingService {
       typeof template.durations === "object" &&
       !Array.isArray(template.durations)
     ) {
-      return (template.durations as any)[String(index)] || defaultDuration;
+      // For object-based durations, try to get by index first, then by string index
+      const objDurations = template.durations as Record<
+        string | number,
+        number
+      >;
+      return (
+        objDurations[index] ?? objDurations[String(index)] ?? defaultDuration
+      );
     } else if (Array.isArray(template.durations)) {
-      return template.durations[index] || defaultDuration;
+      return index < template.durations.length
+        ? template.durations[index]
+        : defaultDuration;
     }
     return defaultDuration;
   }

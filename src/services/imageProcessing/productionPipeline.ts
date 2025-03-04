@@ -1165,7 +1165,7 @@ export class ProductionPipeline {
             );
           }
         }
-      } else if (template === "wesanderson") {
+      } else if (template.toLowerCase() === "wesanderson") {
         clips = runwayVideos.map((path, i) => ({
           path,
           duration: Array.isArray(templateConfig.durations)
@@ -1183,45 +1183,90 @@ export class ProductionPipeline {
           )
         );
       } else {
-        // For other templates, use runway videos with proper sequence mapping
-        const sequence = templateConfig.sequence.slice(0, runwayVideos.length);
-        const validIndices = sequence.filter(
-          (idx): idx is number =>
-            typeof idx === "number" && idx < runwayVideos.length
-        );
+        // For other templates, properly map sequence to available videos
+        const templateSequence = templateConfig.sequence;
 
-        logger.info(`[${jobId}] Creating clips for template ${template}`, {
-          availableClips: runwayVideos.length,
-          sequenceLength: sequence.length,
-          validIndicesCount: validIndices.length,
+        // Create a mapping of available videos by index
+        const availableVideos = new Map<number | string, string>();
+        runwayVideos.forEach((path, index) => {
+          availableVideos.set(index, path);
         });
 
-        // Map valid sequence indices to clips with correct durations
-        clips = validIndices.map((seqIdx, i) => {
-          // Get correct duration based on position in result sequence
-          const duration = Array.isArray(templateConfig.durations)
-            ? i < templateConfig.durations.length
-              ? templateConfig.durations[i]
-              : 2.5
-            : (templateConfig.durations as Record<string | number, number>)[
-                i
-              ] ?? 2.5;
+        // If we have a map video, add it to available videos
+        if (mapVideo && template.toLowerCase().includes("googlezoomintro")) {
+          availableVideos.set("map", mapVideo);
+        }
 
-          return {
-            path: runwayVideos[seqIdx],
+        // Log available resources
+        logger.info(`[${jobId}] Available resources for template ${template}`, {
+          availableVideoCount: runwayVideos.length,
+          hasMapVideo: !!mapVideo,
+          sequenceLength: templateSequence.length,
+        });
+
+        // Create clips by mapping sequence to available videos
+        const validClips: VideoClip[] = [];
+        let durationIndex = 0;
+
+        for (const seqItem of templateSequence) {
+          const videoPath = availableVideos.get(seqItem);
+          if (!videoPath) {
+            continue; // Skip if video not available
+          }
+
+          // Get the appropriate duration
+          let duration = templateConfig.durations[durationIndex] || 2.5;
+
+          // Add to valid clips
+          validClips.push({
+            path: videoPath,
             duration,
             colorCorrection: templateConfig.colorCorrection,
-          };
-        });
+            isMapVideo: seqItem === "map",
+          });
 
-        logger.info(
-          `[${jobId}] Created ${clips.length} clips with correct durations`,
+          durationIndex++;
+        }
+
+        clips = validClips;
+
+        logger.info(`[${jobId}] Created clips for template ${template}`, {
+          clipCount: clips.length,
+          totalDuration: clips.reduce((sum, clip) => sum + clip.duration, 0),
+          expectedDuration: Array.isArray(templateConfig.durations)
+            ? templateConfig.durations.reduce((sum, d) => sum + d, 0)
+            : Object.values(templateConfig.durations).reduce(
+                (sum, d) => sum + d,
+                0
+              ),
+        });
+      }
+
+      // After creating clips, add this check:
+      if (clips.length === 0) {
+        logger.warn(
+          `[${jobId}] No valid clips created for template ${template}`,
           {
-            template,
-            durationSum: clips.reduce((sum, clip) => sum + clip.duration, 0),
-            totalClips: clips.length,
+            availableVideos: runwayVideos.length,
+            templateSequence: templateConfig.sequence.length,
           }
         );
+        return {
+          template,
+          status: "FAILED",
+          outputPath: null,
+          error: "No valid clips available for template",
+        };
+      }
+
+      if (
+        Array.isArray(templateConfig.durations) &&
+        clips.length < templateConfig.durations.length
+      ) {
+        logger.warn(`[${jobId}] Not enough clips for template ${template}`, {
+          expected: templateConfig.durations.length,
+          actual: clips.length,
+        });
       }
 
       // Replace stitchVideos with stitchVideoClips and pass the template configuration
