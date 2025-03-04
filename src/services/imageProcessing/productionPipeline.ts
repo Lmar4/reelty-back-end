@@ -1216,24 +1216,36 @@ export class ProductionPipeline {
               throw new Error(`Video file not found at ${outputPath}`);
             }
 
-            // Upload the template video to S3
-            logger.info(`[${jobId}] Uploading template ${template} to S3`, {
-              listingId,
-              template,
-              localPath: outputPath,
-            });
+            // Fix the S3 path construction before uploading
+            const s3Path = `properties/${listingId}/videos/templates/${template}/${template}.mp4`;
 
-            // Define S3 key using the appropriate path pattern
-            const s3Key = `properties/${listingId}/videos/templates/${template}/${path.basename(
-              outputPath
-            )}`;
+            // Ensure we're passing a properly formatted S3 path, not trying to construct a URL here
+            const url = await this.retryWithBackoff(
+              async () => {
+                logger.info(`[${jobId}] Uploading template ${template} to S3`, {
+                  template,
+                  listingId,
+                  localPath: outputPath,
+                });
 
-            // Upload to S3 using the S3VideoService
-            const url = await this.s3VideoService.uploadVideo(
-              outputPath,
-              s3Key
+                // Pass the path components separately instead of a pre-constructed URL
+                return this.s3VideoService.uploadVideo(outputPath, s3Path, {
+                  contentType: "video/mp4",
+                  metadata: {
+                    jobId,
+                    template,
+                    listingId,
+                  },
+                });
+              },
+              this.MAX_RETRIES,
+              `Video creation for ${template}`,
+              jobId
             );
+
+            // Add debug logging to see the returned URL
             logger.debug(`[${jobId}] Uploaded video URL: ${url}`);
+
             // Verify the uploaded file is accessible
             const uploadedS3Key = this.getS3KeyFromUrl(url);
             const isAvailable = await this.waitForS3ObjectAvailability(
