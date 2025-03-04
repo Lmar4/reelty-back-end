@@ -2,7 +2,7 @@
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
     "numReplicas": 1,
-    "startCommand": "node --max-old-space-size=7680 build/server.js",
+    "startCommand": "NODE_OPTIONS='--max-old-space-size=7680' node build/server.js",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10,
     "runtime": "V2",
