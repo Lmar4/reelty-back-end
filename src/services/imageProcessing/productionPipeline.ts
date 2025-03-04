@@ -1203,8 +1203,7 @@ export class ProductionPipeline {
         clips,
         outputPath,
         templateConfig,
-        undefined, // No watermark config
-        undefined // No progress emitter
+        undefined // No watermark config
       );
 
       try {

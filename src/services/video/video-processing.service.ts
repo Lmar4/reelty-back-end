@@ -1384,8 +1384,7 @@ export class VideoProcessingService {
     clips: VideoClip[],
     outputPath: string,
     template: VideoTemplate | ReelTemplate,
-    watermarkConfig?: WatermarkConfig,
-    progressEmitter?: EventEmitter
+    watermarkConfig?: WatermarkConfig
   ): Promise<void> {
     const jobId = crypto.randomUUID();
     logger.info(`[${jobId}] Starting stitchVideoClips`, {
@@ -1394,340 +1393,190 @@ export class VideoProcessingService {
       outputPath,
       hasMusic: !!template.music,
       hasWatermark: !!watermarkConfig,
-      memoryUsage: this.getMemoryUsageInfo(),
-      activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
-      queuedJobs: ffmpegQueueManager.getQueueLength(),
     });
 
-    try {
-      const isReelTemplate = "sequence" in template && "durations" in template;
+    const isReelTemplate = "sequence" in template && "durations" in template;
+    let processedClips = [...clips];
 
-      // Pre-process clips for Wes Anderson template
-      let processedClips = [...clips];
-      if (template.name.toLowerCase() === "wesanderson") {
-        logger.info(`[${jobId}] Pre-processing Wes Anderson clips`, {
-          clipCount: processedClips.length,
-        });
-        processedClips = await Promise.all(
-          processedClips.map((clip, i) =>
-            this.preProcessWesAndersonClip(clip, i, jobId)
-          )
+    if (template.name.toLowerCase() === "wesanderson") {
+      processedClips = await Promise.all(
+        processedClips.map((clip, i) =>
+          this.preProcessWesAndersonClip(clip, i, jobId)
+        )
+      );
+    }
+
+    let sequenceClips: VideoClip[] = [];
+    if (isReelTemplate) {
+      const reelTemplate = template as ReelTemplate;
+      const isGoogleZoomIntro = reelTemplate.name
+        .toLowerCase()
+        .includes("googlezoomintro");
+      const durations = reelTemplate.durations;
+
+      // Calculate target duration and max clips
+      let targetDuration = 0;
+      let maxClips = processedClips.length;
+      if (Array.isArray(durations)) {
+        targetDuration = durations.reduce((sum, d) => sum + d, 0);
+        maxClips = Math.min(durations.length, processedClips.length);
+      } else if (durations && typeof durations === "object") {
+        // Handle object-based durations (e.g., googlezoomintro)
+        const durationValues = Object.keys(durations)
+          .filter((key) => key !== "map") // Exclude 'map' for now, handle separately
+          .map((key) => durations[key as keyof typeof durations]);
+        targetDuration =
+          durationValues.reduce((sum, d) => sum + d, 0) + (durations.map || 0);
+        maxClips = Math.min(
+          durationValues.length + (durations.map ? 1 : 0),
+          processedClips.length
         );
       }
 
-      let sequenceClips = [...processedClips];
-      if (isReelTemplate) {
-        const reelTemplate = template as ReelTemplate;
-        if (reelTemplate.sequence && Array.isArray(reelTemplate.sequence)) {
-          const isGoogleZoomIntro = template.name
-            .toLowerCase()
-            .includes("googlezoomintro");
-
-          // Map sequence to available clips
-          sequenceClips = reelTemplate.sequence
-            .map((seq, index) => {
-              if (
-                typeof seq === "string" &&
-                seq === "map" &&
-                isGoogleZoomIntro
-              ) {
-                const mapClip =
-                  processedClips.find((c) => c.isMapVideo) || processedClips[0];
-                if (!mapClip) {
-                  logger.error(
-                    `[${jobId}] Missing map video for googlezoomintro`,
-                    { index }
-                  );
-                  throw new Error(
-                    "Map video required for googlezoomintro template is missing"
-                  );
-                }
-                return {
-                  ...mapClip,
-                  duration: (reelTemplate.durations as any)?.map || 3,
-                  isMapVideo: true,
-                };
-              }
-
-              const clipIndex =
-                typeof seq === "string" ? parseInt(seq, 10) : seq;
-              const clip = processedClips[clipIndex];
-              if (!clip) {
-                logger.warn(
-                  `[${jobId}] No clip available for sequence ${index}, using next available`,
-                  { clipIndex }
-                );
-                const nextAvailable =
-                  processedClips.find(
-                    (c, i) => i >= clipIndex && !c.isMapVideo
-                  ) || processedClips[0];
-                return nextAvailable
-                  ? {
-                      ...nextAvailable,
-                      duration: this.getClipDuration(
-                        reelTemplate,
-                        index,
-                        nextAvailable.duration
-                      ),
-                    }
-                  : null;
-              }
-              return {
-                ...clip,
-                duration: this.getClipDuration(
-                  reelTemplate,
-                  index,
-                  clip.duration
-                ),
-              };
-            })
-            .filter(Boolean) as VideoClip[];
-        }
-      }
-
-      // Validate and normalize clips
-      const validatedClips = await Promise.all(
-        sequenceClips.map(async (clip, index) => {
-          if (!clip || !clip.path) {
-            logger.warn(`[${jobId}] Skipping invalid clip at index ${index}`);
-            return null;
-          }
-
-          const resolvedPath =
-            clip.path.startsWith("http") || clip.path.startsWith("s3://")
-              ? await this.resolveAssetPath(clip.path, "video", true)
-              : clip.path;
-
-          const metadata = await this.getVideoMetadata(resolvedPath);
-          if (!metadata.hasVideo || !metadata.duration) {
-            logger.error(`[${jobId}] Invalid clip at index ${index}`, {
-              path: resolvedPath,
-            });
-            throw new Error(`Clip at index ${index} is invalid`);
-          }
-
-          // Normalize frame rate to TARGET_FRAME_RATE (24 fps)
-          const tempPath = path.join(
-            this.TEMP_DIR,
-            `normalized_${jobId}_${index}.mp4`
-          );
-          if (metadata.fps !== TARGET_FRAME_RATE) {
-            await this.normalizeFrameRate(
-              resolvedPath,
-              tempPath,
-              TARGET_FRAME_RATE,
-              jobId
+      sequenceClips = reelTemplate.sequence
+        .slice(0, maxClips)
+        .map((seq, index) => {
+          if (isGoogleZoomIntro && typeof seq === "string" && seq === "map") {
+            // Check if map was already used
+            const mapAlreadyUsed = sequenceClips.some(
+              (clip) => clip.isMapVideo
             );
-            resourceManager.trackResource(jobId, tempPath);
-          } else {
+            if (mapAlreadyUsed) {
+              logger.debug(
+                `[${jobId}] Skipping repeated map clip at index ${index}`
+              );
+              return null;
+            }
+            const mapClip =
+              processedClips.find((c) => c.isMapVideo) || processedClips[0];
+            if (!mapClip) {
+              logger.error(`[${jobId}] Missing map video for googlezoomintro`);
+              return null;
+            }
             return {
-              ...clip,
-              path: resolvedPath,
-              duration: clip.duration || metadata.duration,
-              hasAudio: metadata.hasAudio,
-              isMapVideo: clip.isMapVideo || false,
+              ...mapClip,
+              duration: durations && "map" in durations ? durations.map : 3,
+              isMapVideo: true,
             };
           }
-
-          return {
-            ...clip,
-            path: tempPath,
-            duration: clip.duration || metadata.duration,
-            hasAudio: metadata.hasAudio,
-            isMapVideo: clip.isMapVideo || false,
-          };
+          const clipIndex = typeof seq === "string" ? parseInt(seq, 10) : seq;
+          if (clipIndex >= processedClips.length) {
+            logger.debug(
+              `[${jobId}] Skipping unavailable clip at index ${clipIndex}`
+            );
+            return null;
+          }
+          const clip = processedClips[clipIndex];
+          if (!clip) return null;
+          const duration =
+            durations && typeof durations === "object" && index in durations
+              ? durations[index as keyof typeof durations]
+              : this.getClipDuration(reelTemplate, index, clip.duration);
+          return { ...clip, duration };
         })
-      );
+        .filter((clip): clip is VideoClip => clip !== null);
 
-      const validClips = validatedClips.filter(
-        (clip): clip is NonNullable<typeof clip> => clip !== null
-      );
-      if (validClips.length === 0) {
-        throw new Error("No valid clips to stitch");
-      }
-
-      const command = this.createFFmpegCommand();
-      const totalDuration = validClips.reduce(
+      const currentTotal = sequenceClips.reduce(
         (sum, clip) => sum + clip.duration,
         0
       );
-
-      validClips.forEach((clip) => command.input(clip.path));
-      const musicPath = template.music?.path
-        ? await this.resolveAssetPath(template.music.path, "music", false)
-        : undefined;
-      const musicIndex = musicPath ? validClips.length : -1;
-      if (musicPath) command.input(musicPath);
-
-      const watermarkPath = watermarkConfig?.path
-        ? await this.resolveAssetPath(watermarkConfig.path, "watermark", false)
-        : undefined;
-      const watermarkIndex = watermarkPath
-        ? musicIndex !== -1
-          ? musicIndex + 1
-          : validClips.length
-        : -1;
-      if (watermarkPath) command.input(watermarkPath);
-
-      // Use simpler filter graph unless truly complex
-      const isGoogleZoomIntro = template.name
-        .toLowerCase()
-        .includes("googlezoomintro");
-      const useFilterFile = isGoogleZoomIntro && validClips.length > 10; // Only use filter file for >10 clips
-
-      const filterCommands: ffmpeg.FilterSpecification[] = [];
-      validClips.forEach((clip, i) => {
-        filterCommands.push({
-          filter: "trim",
-          options: `duration=${clip.duration}`,
-          inputs: [`${i}:v`],
-          outputs: [`v${i}`],
-        });
-        filterCommands.push({
-          filter: "setpts",
-          options: "PTS-STARTPTS",
-          inputs: [`v${i}`],
-          outputs: [`pts${i}`],
-        });
-        filterCommands.push({
-          filter: "eq",
-          options: clip.isMapVideo
-            ? "contrast=1.0:brightness=0.0:saturation=1.0"
-            : clip.colorCorrection?.ffmpegFilter ||
-              "contrast=1.05:brightness=0.02:saturation=1.1",
-          inputs: [`pts${i}`],
-          outputs: [`color${i}`],
-        });
-      });
-
-      const concatInputs = validClips.map((_, i) => `color${i}`);
-      filterCommands.push({
-        filter: "concat",
-        options: `n=${validClips.length}:v=1:a=0`,
-        inputs: concatInputs,
-        outputs: ["vconcat"],
-      });
-
-      if (musicIndex !== -1) {
-        filterCommands.push({
-          filter: "atrim",
-          options: `duration=${totalDuration}`,
-          inputs: [`${musicIndex}:a`],
-          outputs: ["atrimmed"],
-        });
-        filterCommands.push({
-          filter: "asetpts",
-          options: "PTS-STARTPTS",
-          inputs: ["atrimmed"],
-          outputs: ["apts"],
-        });
-        filterCommands.push({
-          filter: "aformat",
-          options: "sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
-          inputs: ["apts"],
-          outputs: ["aout"],
+      if (currentTotal !== targetDuration && targetDuration > 0) {
+        const scaleFactor = targetDuration / currentTotal;
+        sequenceClips = sequenceClips.map((clip) => ({
+          ...clip,
+          duration: clip.duration * scaleFactor,
+        }));
+        logger.info(`[${jobId}] Scaled clip durations`, {
+          scaleFactor,
+          targetDuration,
         });
       }
+    } else {
+      sequenceClips = processedClips;
+    }
 
-      if (watermarkIndex !== -1) {
-        const position = watermarkConfig?.position || {
-          x: "(main_w-overlay_w)/2",
-          y: "main_h-overlay_h-300",
-        };
-        filterCommands.push({
-          filter: "overlay",
-          options: `${position.x}:${position.y}`,
-          inputs: ["vconcat", `${watermarkIndex}:v`],
-          outputs: ["vout"],
-        });
-      }
-
-      if (useFilterFile) {
-        const filterFilePath = path.join(this.TEMP_DIR, `filter_${jobId}.txt`);
-        const filterScript = this.buildFilterScript(
-          validClips,
-          !!musicPath,
-          !!watermarkPath
+    const validClips = await Promise.all(
+      sequenceClips.map(async (clip, index) => {
+        const resolvedPath = await this.resolveAssetPath(
+          clip.path,
+          "video",
+          true
         );
-        await fs.writeFile(filterFilePath, filterScript);
-        resourceManager.trackResource(jobId, filterFilePath);
-        command.outputOptions(["-filter_complex_script", filterFilePath]);
-      } else {
-        command.complexFilter(filterCommands);
-      }
+        const metadata = await this.getVideoMetadata(resolvedPath);
+        if (!metadata.hasVideo || !metadata.duration) {
+          throw new Error(`Clip at index ${index} is invalid`);
+        }
+        return { ...clip, path: resolvedPath, hasAudio: metadata.hasAudio };
+      })
+    );
+
+    if (validClips.length === 0) throw new Error("No valid clips to stitch");
+
+    const command = this.createFFmpegCommand();
+    const totalDuration = validClips.reduce(
+      (sum, clip) => sum + clip.duration,
+      0
+    );
+    validClips.forEach((clip) => command.input(clip.path));
+
+    const musicPath = template.music?.path
+      ? await this.resolveAssetPath(template.music.path, "music", false)
+      : undefined;
+    const musicIndex = musicPath ? validClips.length : -1;
+    if (musicPath) command.input(musicPath);
+
+    const watermarkPath = watermarkConfig?.path
+      ? await this.resolveAssetPath(watermarkConfig.path, "watermark", false)
+      : undefined;
+    const watermarkIndex = watermarkPath ? musicIndex + 1 : -1;
+    if (watermarkPath) command.input(watermarkPath);
+
+    const filterCommands =
+      this.buildFilterGraph(
+        validClips,
+        watermarkConfig,
+        musicIndex,
+        watermarkIndex
+      ) || [];
+    command
+      .complexFilter(filterCommands)
+      .outputOptions(["-map", "[vconcat]"])
+      .outputOptions(musicIndex !== -1 ? ["-map", "[aout]"] : [])
+      .outputOptions([
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "20",
+        "-r",
+        String(TARGET_FRAME_RATE),
+      ])
+      .outputOptions(musicIndex !== -1 ? ["-c:a", "aac", "-b:a", "96k"] : [])
+      .output(outputPath);
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = (template as ReelTemplate)?.timeout || 180000;
+      const timeoutId = setTimeout(() => {
+        command.kill("SIGKILL");
+        reject(new Error(`FFmpeg timed out after ${timeout}ms`));
+      }, timeout);
 
       command
-        .outputOptions(["-map", "[vconcat]"])
-        .outputOptions(musicIndex !== -1 ? ["-map", "[aout]"] : [])
-        .outputOptions([
-          "-c:v",
-          "libx264",
-          "-preset",
-          "medium",
-          "-crf",
-          "20",
-          "-r",
-          String(TARGET_FRAME_RATE),
-        ])
-        .outputOptions(musicIndex !== -1 ? ["-c:a", "aac", "-b:a", "96k"] : [])
-        .output(outputPath);
-
-      await new Promise<void>((resolve, reject) => {
-        const timeout = (template as ReelTemplate)?.timeout || 180000; // Default 3 minutes
-        const timeoutId = setTimeout(() => {
-          command.kill("SIGKILL");
-          reject(new Error(`FFmpeg timed out after ${timeout}ms`));
-        }, timeout);
-
-        command
-          .on("start", () => logger.info(`[${jobId}] FFmpeg started`))
-          .on("progress", (progress) => {
-            const normalizedPercent = this.normalizeProgress(
-              progress,
-              totalDuration
-            );
-
-            // Only emit progress events at 10% intervals to reduce overhead
-            const shouldEmitProgress =
-              normalizedPercent % 10 === 0 &&
-              (!this._lastEmittedPercent ||
-                normalizedPercent !== this._lastEmittedPercent);
-
-            if (shouldEmitProgress) {
-              this._lastEmittedPercent = normalizedPercent;
-              logger.info(`[${jobId}] FFmpeg progress`, {
-                percent: normalizedPercent,
-              });
-              progressEmitter?.emit("progress", {
-                ...progress,
-                percent: normalizedPercent,
-                jobId,
-              });
-            }
-          })
-          .on("error", (err) => {
-            clearTimeout(timeoutId);
-            logger.error(`[${jobId}] FFmpeg error`, { error: err.message });
-            reject(err);
-          })
-          .on("end", () => {
-            clearTimeout(timeoutId);
-            logger.info(`[${jobId}] FFmpeg completed`);
-            resolve();
-          })
-          .run();
-      });
-
-      if (!(await this.validateVideoFile(outputPath))) {
-        throw new Error(`Output validation failed: ${outputPath}`);
-      }
-    } catch (error) {
-      logger.error(`[${jobId}] Error in stitchVideoClips`, {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-      throw error;
-    }
+        .on("end", () => {
+          clearTimeout(timeoutId);
+          logger.info(`[${jobId}] Video stitching completed`, {
+            outputPath,
+            totalDuration,
+          });
+          resolve();
+        })
+        .on("error", (err) => {
+          clearTimeout(timeoutId);
+          reject(err);
+        })
+        .run();
+    });
   }
 
   // Helper method to normalize frame rate
