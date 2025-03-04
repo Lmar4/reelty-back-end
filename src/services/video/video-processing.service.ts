@@ -1442,61 +1442,42 @@ export class VideoProcessingService {
         sequence: reelTemplate.sequence.slice(0, 20).join(","), // Mostrar parte de la secuencia para depuración
       });
 
-      sequenceClips = reelTemplate.sequence
-        .slice(0, maxClips)
-        .map((seq, index) => {
-          if (isGoogleZoomIntro && typeof seq === "string" && seq === "map") {
-            // Check if map was already used
-            const mapAlreadyUsed = sequenceClips.some(
-              (clip) => clip.isMapVideo
-            );
-            if (mapAlreadyUsed) {
-              logger.debug(
-                `[${jobId}] Skipping repeated map clip at index ${index}`
-              );
-              return null;
-            }
-            const mapClip =
-              processedClips.find((c) => c.isMapVideo) || processedClips[0];
-            if (!mapClip) {
-              logger.error(`[${jobId}] Missing map video for googlezoomintro`);
-              return null;
-            }
-            return {
-              ...mapClip,
-              duration: durations && "map" in durations ? durations.map : 3,
-              isMapVideo: true,
-            };
+      // The clips are already selected and ordered in productionPipeline.ts
+      // Here we just need to ensure the durations are applied correctly
+      sequenceClips = processedClips.map((clip, index) => {
+        // Get the duration based on the position in the result (index)
+        let duration;
+
+        if (Array.isArray(durations)) {
+          // Use the duration from the array based on the index
+          duration =
+            index < durations.length ? durations[index] : clip.duration;
+        } else if (durations && typeof durations === "object") {
+          // For object-based durations (like googlezoomintro)
+          if (clip.isMapVideo && "map" in durations) {
+            duration = durations.map;
+          } else if (index in durations) {
+            duration = durations[index as keyof typeof durations];
+          } else {
+            duration = clip.duration;
           }
-          const clipIndex = typeof seq === "string" ? parseInt(seq, 10) : seq;
-          if (clipIndex >= processedClips.length) {
-            logger.debug(
-              `[${jobId}] Skipping unavailable clip at index ${clipIndex}`
-            );
-            return null;
+        } else {
+          duration = clip.duration;
+        }
+
+        // Log the duration assignment for debugging
+        logger.debug(
+          `[${jobId}] Assigning duration for clip at position ${index}`,
+          {
+            clipIndex: index,
+            assignedDuration: duration,
+            originalDuration: clip.duration,
+            isMapVideo: clip.isMapVideo,
           }
-          const clip = processedClips[clipIndex];
-          if (!clip) return null;
+        );
 
-          // Obtener la duración basada en la posición en la secuencia resultante (index)
-          const duration =
-            durations && typeof durations === "object" && index in durations
-              ? durations[index as keyof typeof durations]
-              : this.getClipDuration(reelTemplate, index, clip.duration);
-
-          // Mejorar el logging para mostrar la asignación de duraciones
-          logger.debug(
-            `[${jobId}] Assigning duration for clip at sequence position ${index}`,
-            {
-              clipIndex,
-              assignedDuration: duration,
-              originalDuration: clip.duration,
-            }
-          );
-
-          return { ...clip, duration };
-        })
-        .filter((clip): clip is VideoClip => clip !== null);
+        return { ...clip, duration };
+      });
 
       // Calculate total duration for logging purposes only
       const totalDuration = sequenceClips.reduce(
@@ -1514,6 +1495,7 @@ export class VideoProcessingService {
       sequenceClips = processedClips;
     }
 
+    // Validate and resolve paths for all clips
     const validClips = await Promise.all(
       sequenceClips.map(async (clip, index) => {
         const resolvedPath = await this.resolveAssetPath(

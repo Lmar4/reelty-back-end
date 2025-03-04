@@ -1208,6 +1208,7 @@ export class ProductionPipeline {
         const validClips: VideoClip[] = [];
         let durationIndex = 0;
 
+        // First pass: try to follow the sequence
         for (const seqItem of templateSequence) {
           const videoPath = availableVideos.get(seqItem);
           if (!videoPath) {
@@ -1226,20 +1227,72 @@ export class ProductionPipeline {
           });
 
           durationIndex++;
+
+          // If we have enough clips to match all durations, we can stop
+          if (durationIndex >= templateConfig.durations.length) {
+            break;
+          }
         }
 
-        clips = validClips;
+        // Second pass: if we don't have enough clips, use any available videos
+        // This ensures we have at least 10 clips for the 10 durations
+        if (
+          validClips.length < templateConfig.durations.length &&
+          availableVideos.size > 0
+        ) {
+          logger.info(
+            `[${jobId}] Not enough clips from sequence (${validClips.length}/${templateConfig.durations.length}), adding additional clips`,
+            {
+              validClipsCount: validClips.length,
+              requiredClipsCount: templateConfig.durations.length,
+              availableVideosCount: availableVideos.size,
+            }
+          );
 
-        logger.info(`[${jobId}] Created clips for template ${template}`, {
-          clipCount: clips.length,
-          totalDuration: clips.reduce((sum, clip) => sum + clip.duration, 0),
-          expectedDuration: Array.isArray(templateConfig.durations)
-            ? templateConfig.durations.reduce((sum, d) => sum + d, 0)
-            : Object.values(templateConfig.durations).reduce(
-                (sum, d) => sum + d,
-                0
-              ),
-        });
+          // Get all available video indices that weren't used yet
+          const usedIndices = new Set(
+            templateSequence.slice(0, validClips.length)
+          );
+          const remainingIndices = Array.from(availableVideos.keys()).filter(
+            (key) => !usedIndices.has(key) && key !== "map"
+          );
+
+          // Add remaining videos until we have enough clips
+          for (const index of remainingIndices) {
+            if (durationIndex >= templateConfig.durations.length) {
+              break; // We have enough clips
+            }
+
+            const videoPath = availableVideos.get(index);
+            if (!videoPath) {
+              continue;
+            }
+
+            // Get the appropriate duration
+            let duration = templateConfig.durations[durationIndex] || 2.5;
+
+            // Add to valid clips
+            validClips.push({
+              path: videoPath,
+              duration,
+              colorCorrection: templateConfig.colorCorrection,
+              isMapVideo: false,
+            });
+
+            durationIndex++;
+          }
+        }
+
+        logger.info(
+          `[${jobId}] Created ${validClips.length} valid clips for template ${template}`,
+          {
+            requestedDurations: templateConfig.durations.length,
+            actualClips: validClips.length,
+          }
+        );
+
+        // Assign validClips to clips for further processing
+        clips = validClips;
       }
 
       // After creating clips, add this check:
