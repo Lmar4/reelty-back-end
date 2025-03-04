@@ -308,25 +308,6 @@ export class ProductionPipeline {
     return path.join(process.cwd(), this.TEMP_DIRS[type], filename);
   }
 
-  private async withRetry<T>(
-    operation: () => Promise<T>,
-    retries = this.MAX_RETRIES
-  ): Promise<T> {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        return await operation();
-      } catch (error) {
-        if (attempt === retries) throw error;
-        const delay = attempt * 1000;
-        logger.warn(`Retry attempt ${attempt}/${retries}, waiting ${delay}ms`, {
-          error,
-        });
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
-    }
-    throw new Error("Retry failed");
-  }
-
   private async updateJobProgress(
     jobId: string,
     progress: JobProgress
@@ -571,41 +552,6 @@ export class ProductionPipeline {
         });
       }
     }
-  }
-
-  private async validateWithCache(
-    s3Url: string,
-    index: number,
-    jobId: string
-  ): Promise<ValidationCache | null> {
-    const cacheKey = `${jobId}_${index}`;
-    const cached = this.validationCache.get(cacheKey);
-
-    if (
-      cached &&
-      Date.now() - cached.validatedAt.getTime() < this.VALIDATION_CACHE_TTL
-    ) {
-      logger.debug(`[${jobId}] Using cached validation for video`, {
-        s3Url,
-        index,
-        cachedAt: cached.validatedAt,
-      });
-      return cached;
-    }
-
-    const validation = await this.validateRunwayVideo(s3Url, index, jobId);
-    if (!validation.success) {
-      return null;
-    }
-
-    const cacheEntry: ValidationCache = {
-      s3Url,
-      duration: validation.duration!,
-      validatedAt: new Date(),
-    };
-
-    this.validationCache.set(cacheKey, cacheEntry);
-    return cacheEntry;
   }
 
   private async retryRunwayGeneration(
@@ -1100,63 +1046,6 @@ export class ProductionPipeline {
 
     // Ensure we always return a value
     return null;
-  }
-
-  private async getSharedWatermarkPath(
-    jobId: string
-  ): Promise<string | undefined> {
-    const sharedPath = path.join(
-      process.cwd(),
-      "temp",
-      `${jobId}_watermark.png`
-    );
-
-    try {
-      // Check if watermark already exists
-      if (!existsSync(sharedPath)) {
-        const watermarkAssetPath = await this.assetManager.getAssetPath(
-          AssetType.WATERMARK,
-          // "reelty_watermark.png"
-          "watermark_transparent_v1.png"
-        );
-
-        await this.s3Service.downloadFile(watermarkAssetPath, sharedPath);
-        await this.resourceManager.trackResource(sharedPath);
-
-        logger.info(`[${jobId}] Downloaded shared watermark`, {
-          path: sharedPath,
-          source: watermarkAssetPath,
-        });
-      } else {
-        logger.debug(`[${jobId}] Using existing shared watermark`, {
-          path: sharedPath,
-        });
-      }
-
-      return sharedPath;
-    } catch (error) {
-      logger.warn(`[${jobId}] Failed to download shared watermark`, {
-        error: error instanceof Error ? error.message : "Unknown error",
-        stack: error instanceof Error ? error.stack : undefined,
-      });
-      return undefined;
-    }
-  }
-
-  private async withResourceTracking<T>(
-    jobId: string,
-    operation: () => Promise<T>,
-    resources: ResourceTracker[]
-  ): Promise<T> {
-    for (const resource of resources) {
-      await this.resourceManager.trackResource(resource.path);
-      logger.debug(`[${jobId}] Tracking resource`, {
-        path: resource.path,
-        type: resource.type,
-        metadata: resource.metadata,
-      });
-    }
-    return operation();
   }
 
   private async processTemplate(
@@ -2998,166 +2887,6 @@ export class ProductionPipeline {
     return false;
   }
 
-  private async uploadToS3(
-    filePath: string,
-    s3Key: string,
-    jobId?: string
-  ): Promise<string> {
-    const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
-    const region = process.env.AWS_REGION || "us-east-2";
-    const MAX_RETRIES = 3;
-
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        await resourceManager.trackResource(filePath, "s3-upload");
-        await resourceManager.updateResourceState(
-          filePath,
-          ResourceState.PROCESSING,
-          {
-            operation: "upload",
-            s3Key,
-            attempt,
-          }
-        );
-
-        // Verify file exists and is readable before upload
-        await fs.access(filePath, fs.constants.R_OK);
-        const stats = await fs.stat(filePath);
-        if (stats.size === 0) {
-          throw new Error("File is empty");
-        }
-
-        const fileStream = createReadStream(filePath);
-        const upload = new Upload({
-          client: this.s3Client,
-          params: {
-            Bucket: bucket,
-            Key: s3Key,
-            Body: fileStream,
-            ContentType: this.getContentType(filePath),
-          },
-          tags: [{ Key: "source", Value: "production-pipeline" }],
-        });
-
-        await upload.done();
-        const s3Url = `https://${bucket}.s3.${region}.amazonaws.com/${s3Key}`;
-
-        // Verify upload success with metadata check
-        const headCommand = new HeadObjectCommand({
-          Bucket: bucket,
-          Key: s3Key,
-        });
-
-        const headResponse = await this.s3Client.send(headCommand);
-
-        if (!headResponse.ContentLength || headResponse.ContentLength === 0) {
-          throw new Error("Uploaded file is empty");
-        }
-
-        if (headResponse.ContentLength !== stats.size) {
-          throw new Error(
-            `Upload size mismatch: expected ${stats.size}, got ${headResponse.ContentLength}`
-          );
-        }
-
-        await resourceManager.updateResourceState(
-          filePath,
-          ResourceState.UPLOADED,
-          {
-            s3Url,
-            contentLength: headResponse.ContentLength,
-            contentType: headResponse.ContentType,
-          }
-        );
-
-        logger.info("Successfully uploaded file to S3", {
-          filePath,
-          s3Key,
-          attempt,
-          size: stats.size,
-          contentType: headResponse.ContentType,
-        });
-
-        // Wait for the object to be fully available in S3 before returning
-        // This helps prevent subsequent access issues due to S3's eventual consistency
-        const isAvailable = await this.waitForS3ObjectAvailability(
-          s3Key,
-          jobId
-        );
-        if (!isAvailable && jobId) {
-          logger.warn(
-            `[${jobId}] S3 object not fully available after upload, but continuing`,
-            {
-              s3Key,
-              filePath,
-            }
-          );
-        }
-
-        return s3Url;
-      } catch (error) {
-        const isLastAttempt = attempt === MAX_RETRIES;
-        const errorMessage =
-          error instanceof Error ? error.message : "Unknown error";
-
-        logger.warn("S3 upload attempt failed", {
-          error: errorMessage,
-          filePath,
-          s3Key,
-          attempt,
-          isLastAttempt,
-          stack: error instanceof Error ? error.stack : undefined,
-        });
-
-        await resourceManager.updateResourceState(
-          filePath,
-          isLastAttempt ? ResourceState.FAILED : ResourceState.PROCESSING,
-          {
-            error: errorMessage,
-            attempt,
-          }
-        );
-
-        if (isLastAttempt) {
-          throw new Error(
-            `Failed to upload ${filePath} to S3 after ${MAX_RETRIES} attempts: ${errorMessage}`
-          );
-        }
-
-        // Exponential backoff with jitter
-        const delay = Math.min(
-          1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random()),
-          10000
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
-
-        // Clean up any partial upload
-        try {
-          await this.s3Client.send(
-            new DeleteObjectCommand({
-              Bucket: bucket,
-              Key: s3Key,
-            })
-          );
-        } catch (cleanupError) {
-          logger.warn("Failed to cleanup partial upload", {
-            error:
-              cleanupError instanceof Error
-                ? cleanupError.message
-                : "Unknown error",
-            s3Key,
-            attempt,
-          });
-        }
-      }
-    }
-
-    // This line ensures all code paths return a value
-    throw new Error(
-      `Failed to upload ${filePath} to S3 after ${MAX_RETRIES} attempts`
-    );
-  }
-
   private getContentType(filePath: string): string {
     const ext = path.extname(filePath).toLowerCase();
     const contentTypes: Record<string, string> = {
@@ -3465,106 +3194,6 @@ export class ProductionPipeline {
     }));
   }
 
-  private async processRunwayVideo(
-    jobId: string,
-    video: ProcessingVideo
-  ): Promise<void> {
-    logger.info(`[${jobId}] Processing runway video`, {
-      order: video.order,
-      path: video.path,
-    });
-
-    // Implement the actual video processing logic here
-    // This would include the existing logic from handleNormalProcessing
-    // but adapted for a single video
-  }
-
-  private async processVisionImage(
-    jobId: string,
-    image: ProcessingImage
-  ): Promise<void> {
-    logger.info(`[${jobId}] Processing vision image`, {
-      order: image.order,
-      path: image.path,
-    });
-
-    // Implement the actual image processing logic here
-    // This would include the existing logic from the original processImage function
-    // but adapted for a single image
-  }
-
-  // Add this helper function
-  private async validateClipDuration(
-    clip: VideoClip,
-    index: number,
-    jobId: string,
-    template?: ReelTemplate
-  ): Promise<boolean> {
-    return videoProcessingService.validateClipDuration(
-      clip,
-      index,
-      jobId,
-      template
-    );
-  }
-
-  // In your existing clip processing code
-  private async processClips(
-    clips: VideoClip[],
-    jobId: string,
-    outputPath: string,
-    template: ReelTemplate
-  ): Promise<void> {
-    logger.info(
-      `[${jobId}] Processing ${clips.length} clips for template ${template.name}`,
-      {
-        outputPath,
-        clipCount: clips.length,
-      }
-    );
-
-    // Validate all clips first using VideoProcessingService
-    const validationResults = await Promise.all(
-      clips.map((clip, index) =>
-        videoProcessingService.validateClipDuration(
-          clip,
-          index,
-          jobId,
-          template
-        )
-      )
-    );
-
-    // Filter out invalid clips
-    const validClips = clips.filter((_, index) => validationResults[index]);
-
-    if (validClips.length === 0) {
-      throw new Error("No valid clips available for processing");
-    }
-
-    if (validClips.length < clips.length) {
-      logger.warn(`[${jobId}] Some clips were invalid and will be skipped`, {
-        originalCount: clips.length,
-        validCount: validClips.length,
-      });
-    }
-
-    // Continue with processing using validClips and VideoProcessingService
-    await videoProcessingService.createVideoFromClips(
-      validClips,
-      outputPath,
-      template
-    );
-
-    logger.info(
-      `[${jobId}] Successfully processed clips for template ${template.name}`,
-      {
-        outputPath,
-        validClipCount: validClips.length,
-      }
-    );
-  }
-
   public static async reprocessUserVideos(userId: string): Promise<void> {
     const prisma = new PrismaClient();
 
@@ -3681,37 +3310,11 @@ export class ProductionPipeline {
     }
   }
 
-  private async fileExists(path: string): Promise<boolean> {
-    try {
-      await fs.access(path);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   private async isRegeneration(jobId: string): Promise<boolean> {
     const job = await this.prisma.videoJob.findUnique({
       where: { id: jobId },
       select: { metadata: true },
     });
     return (job?.metadata as any)?.isRegeneration === true;
-  }
-
-  private getMemoryUsageInfo(): {
-    rss: string;
-    heapTotal: string;
-    heapUsed: string;
-  } {
-    const memoryUsage = process.memoryUsage();
-    return {
-      rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
-      heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
-      heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
-    };
-  }
-
-  private createFFmpegCommand(): ffmpeg.FfmpegCommand {
-    return ffmpeg(); // Use imported ffmpeg directly
   }
 }
