@@ -1183,20 +1183,46 @@ export class ProductionPipeline {
           )
         );
       } else {
-        // For other templates, just use runway videos
-        clips = runwayVideos.map((path, i) => ({
-          path,
-          duration: Array.isArray(templateConfig.durations)
-            ? templateConfig.durations[i] || 5
+        // For other templates, use runway videos with proper sequence mapping
+        const sequence = templateConfig.sequence.slice(0, runwayVideos.length);
+        const validIndices = sequence.filter(
+          (idx): idx is number =>
+            typeof idx === "number" && idx < runwayVideos.length
+        );
+
+        logger.info(`[${jobId}] Creating clips for template ${template}`, {
+          availableClips: runwayVideos.length,
+          sequenceLength: sequence.length,
+          validIndicesCount: validIndices.length,
+        });
+
+        // Map valid sequence indices to clips with correct durations
+        clips = validIndices.map((seqIdx, i) => {
+          // Get correct duration based on position in result sequence
+          const duration = Array.isArray(templateConfig.durations)
+            ? i < templateConfig.durations.length
+              ? templateConfig.durations[i]
+              : 2.5
             : (templateConfig.durations as Record<string | number, number>)[
                 i
-              ] || 5,
-          colorCorrection: templateConfig.colorCorrection,
-        }));
-      }
+              ] ?? 2.5;
 
-      const timeout = templateConfig.timeout || 120000;
-      const maxRetries = templateConfig.maxRetries || 2;
+          return {
+            path: runwayVideos[seqIdx],
+            duration,
+            colorCorrection: templateConfig.colorCorrection,
+          };
+        });
+
+        logger.info(
+          `[${jobId}] Created ${clips.length} clips with correct durations`,
+          {
+            template,
+            durationSum: clips.reduce((sum, clip) => sum + clip.duration, 0),
+            totalClips: clips.length,
+          }
+        );
+      }
 
       // Replace stitchVideos with stitchVideoClips and pass the template configuration
       await videoProcessingService.stitchVideoClips(

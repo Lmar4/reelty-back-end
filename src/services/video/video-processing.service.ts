@@ -1484,6 +1484,7 @@ export class VideoProcessingService {
       logger.info(`[${jobId}] Using exact template durations`, {
         totalDuration,
         clipCount: sequenceClips.length,
+        validIndices: sequenceClips.map((_, i) => i).join(","),
       });
     } else {
       sequenceClips = processedClips;
