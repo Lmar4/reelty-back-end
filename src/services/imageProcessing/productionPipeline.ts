@@ -962,7 +962,7 @@ export class ProductionPipeline {
   ): Promise<string | null> {
     const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
     const s3Key = this.getS3KeyFromUrl(path);
-    const MAX_TIMEOUT = 30000; // 30 seconds total timeout
+    const MAX_TIMEOUT = 60000; // Increased from 30s to 60s total timeout
     const startTime = Date.now();
 
     logger.debug(`[${jobId}] Verifying S3 video access`, {
@@ -971,6 +971,21 @@ export class ProductionPipeline {
       bucket: bucketName,
     });
 
+    // First try using our more robust waitForS3ObjectAvailability method
+    const isAvailable = await this.waitForS3ObjectAvailability(s3Key, jobId, 3);
+    if (isAvailable) {
+      logger.info(
+        `[${jobId}] Video verified accessible using waitForS3ObjectAvailability`,
+        {
+          path,
+          s3Key,
+          verificationTime: Date.now() - startTime,
+        }
+      );
+      return path;
+    }
+
+    // If that fails, fall back to the original retry logic
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
         // Check if we've exceeded the total timeout
@@ -983,9 +998,10 @@ export class ProductionPipeline {
         }
 
         // Use HEAD request to verify file existence and metadata
-        const exists = await this.s3VideoService.checkFileExists(
+        const exists = await this.s3VideoService.verifyS3FileWithRetries(
           bucketName,
-          s3Key
+          s3Key,
+          2 // Use 2 internal retries for each main retry attempt
         );
 
         if (exists) {
@@ -1006,9 +1022,9 @@ export class ProductionPipeline {
         });
 
         if (attempt < retries - 1) {
-          // Exponential backoff with jitter
+          // Enhanced exponential backoff with longer initial delay (2s instead of 1s)
           const delay = Math.min(
-            1000 * Math.pow(2, attempt) * (0.5 + Math.random()),
+            2000 * Math.pow(2, attempt) * (0.5 + Math.random()),
             MAX_TIMEOUT - (Date.now() - startTime) // Don't wait longer than remaining timeout
           );
 
@@ -1034,7 +1050,7 @@ export class ProductionPipeline {
 
         if (attempt < retries - 1 && Date.now() - startTime < MAX_TIMEOUT) {
           const delay = Math.min(
-            1000 * Math.pow(2, attempt) * (0.5 + Math.random()),
+            2000 * Math.pow(2, attempt) * (0.5 + Math.random()),
             MAX_TIMEOUT - (Date.now() - startTime)
           );
 
@@ -1049,6 +1065,8 @@ export class ProductionPipeline {
       s3Key,
       totalTime: Date.now() - startTime,
     });
+
+    // Ensure we always return a value
     return null;
   }
 
@@ -1165,12 +1183,37 @@ export class ProductionPipeline {
       );
 
       try {
-        // Try to verify the file accessibility
+        // Try to verify the file accessibility with improved retry logic
         const verifiedUrl = await this.retryWithBackoff(
           async () => {
-            const url = await this.verifyS3VideoAccess(outputPath, jobId);
-            if (!url)
-              throw new Error(`Uploaded video not accessible at ${outputPath}`);
+            // First try our enhanced verification method
+            const url = await this.verifyS3VideoAccess(outputPath, jobId, 3);
+            if (!url) {
+              // If that fails, try waiting for S3 object availability directly
+              logger.warn(
+                `[${jobId}] Video verification failed, trying direct S3 availability check`,
+                {
+                  outputPath,
+                  template,
+                }
+              );
+
+              const s3Key = this.getS3KeyFromUrl(outputPath);
+              const isAvailable = await this.waitForS3ObjectAvailability(
+                s3Key,
+                jobId,
+                5
+              );
+
+              if (!isAvailable) {
+                throw new Error(
+                  `Uploaded video not accessible at ${outputPath} after extended verification`
+                );
+              }
+
+              // Return the path as a string (not undefined)
+              return outputPath as string;
+            }
             return url;
           },
           this.MAX_RETRIES,
@@ -2312,6 +2355,13 @@ export class ProductionPipeline {
     jobId: string
   ): Promise<T> {
     let lastError: unknown;
+    const isS3Operation =
+      context.toLowerCase().includes("video") ||
+      context.toLowerCase().includes("s3") ||
+      context.toLowerCase().includes("upload");
+
+    // Use longer initial delay for S3 operations (2s vs 1s)
+    const initialDelay = isS3Operation ? 2000 : 1000;
 
     for (let attempt = 1; attempt <= retries + 1; attempt++) {
       try {
@@ -2333,12 +2383,17 @@ export class ProductionPipeline {
           );
         }
 
-        const delay = 1000 * Math.pow(2, attempt - 1) * (0.5 + Math.random());
+        // Enhanced exponential backoff with longer delays for S3 operations
+        const delay =
+          initialDelay * Math.pow(2, attempt - 1) * (0.5 + Math.random());
+
         logger.warn(
           `[${jobId}] ${context} failed, retrying in ${Math.round(delay)}ms`,
           {
             attempt,
             error: error instanceof Error ? error.message : "Unknown error",
+            isS3Operation,
+            initialDelay,
           }
         );
         await new Promise((resolve) => setTimeout(resolve, delay));
@@ -2665,7 +2720,77 @@ export class ProductionPipeline {
     );
   }
 
-  private async uploadToS3(filePath: string, s3Key: string): Promise<string> {
+  /**
+   * Waits for an S3 object to become available with exponential backoff
+   * @param s3Key The S3 key to check
+   * @param jobId Optional job ID for logging
+   * @param maxRetries Maximum number of retries
+   * @returns True if the object is available, false otherwise
+   */
+  private async waitForS3ObjectAvailability(
+    s3Key: string,
+    jobId?: string,
+    maxRetries = 5
+  ): Promise<boolean> {
+    const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
+    const startTime = Date.now();
+
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        const exists = await this.s3VideoService.checkFileExists(bucket, s3Key);
+        if (exists) {
+          if (jobId) {
+            logger.info(`[${jobId}] S3 object verified available`, {
+              s3Key,
+              attempt: i + 1,
+              elapsedMs: Date.now() - startTime,
+            });
+          }
+          return true;
+        }
+      } catch (error) {
+        // Ignore error and continue retrying
+        if (jobId) {
+          logger.warn(`[${jobId}] Error checking S3 object availability`, {
+            s3Key,
+            attempt: i + 1,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+        }
+      }
+
+      // Exponential backoff: 2s, 4s, 8s, 16s, 32s
+      const delay = 2000 * Math.pow(2, i);
+      if (jobId) {
+        logger.info(
+          `[${jobId}] S3 object not yet available, waiting ${delay}ms before retry`,
+          {
+            s3Key,
+            attempt: i + 1,
+            nextDelay: delay,
+          }
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+
+    if (jobId) {
+      logger.error(
+        `[${jobId}] S3 object unavailable after ${maxRetries} retries`,
+        {
+          s3Key,
+          totalTimeMs: Date.now() - startTime,
+        }
+      );
+    }
+    return false;
+  }
+
+  private async uploadToS3(
+    filePath: string,
+    s3Key: string,
+    jobId?: string
+  ): Promise<string> {
     const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
     const region = process.env.AWS_REGION || "us-east-2";
     const MAX_RETRIES = 3;
@@ -2741,6 +2866,22 @@ export class ProductionPipeline {
           contentType: headResponse.ContentType,
         });
 
+        // Wait for the object to be fully available in S3 before returning
+        // This helps prevent subsequent access issues due to S3's eventual consistency
+        const isAvailable = await this.waitForS3ObjectAvailability(
+          s3Key,
+          jobId
+        );
+        if (!isAvailable && jobId) {
+          logger.warn(
+            `[${jobId}] S3 object not fully available after upload, but continuing`,
+            {
+              s3Key,
+              filePath,
+            }
+          );
+        }
+
         return s3Url;
       } catch (error) {
         const isLastAttempt = attempt === MAX_RETRIES;
@@ -2799,7 +2940,10 @@ export class ProductionPipeline {
       }
     }
 
-    throw new Error("Upload failed after retries");
+    // This line ensures all code paths return a value
+    throw new Error(
+      `Failed to upload ${filePath} to S3 after ${MAX_RETRIES} attempts`
+    );
   }
 
   private getContentType(filePath: string): string {
