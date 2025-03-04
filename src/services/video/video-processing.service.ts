@@ -1392,117 +1392,68 @@ export class VideoProcessingService {
                       timestamp: new Date().toISOString(),
                     }
                   );
-                  return null;
+                  return null; // Skip if map video is missing
                 }
 
-                // Get map duration safely
-                let duration = 3.0; // Default duration
+                // Get duration safely
+                let duration = 3.0; // Default duration for map
                 if (typeof reelTemplate.durations === "object") {
-                  // Try to get duration from map key
-                  duration =
-                    (reelTemplate.durations["map"] as number) ||
-                    (typeof reelTemplate.durations.map === "number"
-                      ? reelTemplate.durations.map
-                      : 3.0);
-                } else if (Array.isArray(reelTemplate.durations)) {
-                  duration = reelTemplate.durations[index] || 3.0;
+                  duration = (reelTemplate.durations as any)["map"] || 3.0;
                 }
 
-                return { ...mapClip, duration: duration, isMapVideo: true };
+                return { ...mapClip, duration, isMapVideo: true };
               }
 
-              // For non-map sequences
+              // For non-map clips
               const requestedIndex =
                 typeof seq === "string" ? parseInt(seq, 10) : seq;
 
-              // For googlezoomintro, we need to find an available clip
-              if (isGoogleZoomIntro && typeof requestedIndex === "number") {
-                // Try to get the exact requested index first
-                let clip = availableClips.get(requestedIndex);
+              // Try to get the exact requested clip
+              const clipIndex = requestedIndex;
+              const clip = processedClips.find((_, idx) => {
+                // For Google Zoom Intro, skip the map clip (index 0)
+                if (isGoogleZoomIntro && idx === 0) return false;
+                return idx === clipIndex;
+              });
 
-                // If not found, find the next available clip
-                if (!clip && availableClips.size > 0) {
-                  // Get all available indices and sort them
-                  const availableIndices = Array.from(
-                    availableClips.keys()
-                  ).sort((a, b) => a - b);
-
-                  // Find the closest available index
-                  const closestIndex = availableIndices.reduce((prev, curr) =>
-                    Math.abs(curr - requestedIndex) <
-                    Math.abs(prev - requestedIndex)
-                      ? curr
-                      : prev
-                  );
-
-                  clip = availableClips.get(closestIndex);
-
-                  // Remove this clip from available clips to avoid reusing it
-                  if (clip) availableClips.delete(closestIndex);
-
-                  logger.info(
-                    `[${jobId}] Using alternative clip for sequence ${index}`,
-                    {
-                      requestedIndex,
-                      actualIndex: closestIndex,
-                      timestamp: new Date().toISOString(),
-                    }
-                  );
-                } else if (clip) {
-                  // Remove this clip from available clips to avoid reusing it
-                  availableClips.delete(requestedIndex);
-                }
-
-                if (!clip) {
-                  logger.warn(`[${jobId}] Missing clip at sequence ${index}`, {
-                    sequence: seq,
+              // If the requested clip doesn't exist, return null to skip this segment
+              if (!clip) {
+                logger.warn(
+                  `[${jobId}] Missing clip at sequence ${index}, skipping`,
+                  {
+                    requestedIndex,
                     timestamp: new Date().toISOString(),
-                  });
-                  return null;
-                }
-
-                // Get duration safely
-                let duration = clip.duration; // Default to original clip duration
-                if (typeof reelTemplate.durations === "object") {
-                  // Try multiple ways to find the duration
-                  const stringKey = String(requestedIndex);
-                  const numKey = Number(requestedIndex);
-                  duration =
-                    (reelTemplate.durations as Record<string, number>)[
-                      stringKey
-                    ] ||
-                    (reelTemplate.durations as number[])[numKey] ||
-                    clip.duration;
-                } else if (Array.isArray(reelTemplate.durations)) {
-                  duration = reelTemplate.durations[index] || clip.duration;
-                }
-
-                return { ...clip, duration: duration };
-              } else {
-                // For other templates, use the original logic
-                const clipIndex = requestedIndex;
-                const clip = processedClips[clipIndex];
-                if (!clip) {
-                  logger.warn(`[${jobId}] Missing clip at sequence ${index}`, {
-                    sequence: seq,
-                    timestamp: new Date().toISOString(),
-                  });
-                  return null;
-                }
-
-                // Get duration safely
-                let duration = clip.duration; // Default to original clip duration
-                if (Array.isArray(reelTemplate.durations)) {
-                  duration = reelTemplate.durations[index] || clip.duration;
-                } else if (typeof reelTemplate.durations === "object") {
-                  const key = typeof seq === "string" ? seq : String(seq);
-                  duration = reelTemplate.durations[key] || clip.duration;
-                }
-
-                return { ...clip, duration: duration };
+                  }
+                );
+                return null; // Skip this segment entirely
               }
+
+              // Get duration safely
+              let duration = clip.duration; // Default to clip's duration
+              if (typeof reelTemplate.durations === "object") {
+                // For Google Zoom, try to get from the object using index as key
+                if (isGoogleZoomIntro) {
+                  const key = String(index);
+                  duration =
+                    (reelTemplate.durations as any)[key] ||
+                    (reelTemplate.durations as any)[index] ||
+                    clip.duration;
+                } else {
+                  // For other templates with object durations
+                  const key = typeof seq === "string" ? seq : String(seq);
+                  duration =
+                    (reelTemplate.durations as any)[key] || clip.duration;
+                }
+              } else if (Array.isArray(reelTemplate.durations)) {
+                // For array durations, use the appropriate index
+                const durations = reelTemplate.durations as number[];
+                const durationIndex = Math.min(index, durations.length - 1);
+                duration = durations[durationIndex] || clip.duration;
+              }
+
+              return { ...clip, duration };
             })
-            .filter(Boolean) as VideoClip[];
+            .filter(Boolean) as VideoClip[]; // Remove null entries
         }
       }
 
