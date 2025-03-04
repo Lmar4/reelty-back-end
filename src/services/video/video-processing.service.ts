@@ -2158,23 +2158,66 @@ export class VideoProcessingService {
   }
 
   private getMemoryUsageInfo() {
-    try {
-      const memoryUsage = process.memoryUsage();
-      return {
-        rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
-        heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
-        heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
-      };
-    } catch (e) {
-      return { error: String(e) };
-    }
+    const memoryUsage = process.memoryUsage();
+    return {
+      rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+      heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
+      heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+    };
   }
 
   private async fileExists(path: string): Promise<boolean> {
     try {
-      await fs.access(path);
+      await fs.access(path, fs.constants.R_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Validates a clip's duration and adjusts it if necessary
+   * @param clip The video clip to validate
+   * @param index The index of the clip in the sequence
+   * @param jobId The job ID for logging
+   * @param template Optional template with duration information
+   * @returns True if the clip is valid, false otherwise
+   */
+  public async validateClipDuration(
+    clip: VideoClip,
+    index: number,
+    jobId: string,
+    template?: ReelTemplate
+  ): Promise<boolean> {
+    try {
+      const duration = await this.getVideoDuration(clip.path);
+
+      // Get expected duration from template if available
+      const expectedDuration = template?.durations[index];
+      const requestedDuration = clip.duration;
+
+      // If the requested duration is longer than actual video duration
+      if (requestedDuration > duration) {
+        logger.warn(
+          `[${jobId}] Clip ${index} requested duration exceeds actual duration`,
+          {
+            clipPath: clip.path,
+            requestedDuration,
+            actualDuration: duration,
+            templateDuration: expectedDuration,
+          }
+        );
+
+        // Adjust the clip duration to actual duration
+        clip.duration = duration;
+      }
+
       return true;
     } catch (error) {
+      logger.error(`[${jobId}] Failed to validate clip ${index} duration`, {
+        clipPath: clip.path,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
       return false;
     }
   }
@@ -2260,80 +2303,119 @@ export class VideoProcessingService {
       // Track the temporary file for cleanup
       resourceManager.trackResource(jobId, tempPath);
 
-      const command = this.createFFmpegCommand()
-        .input(clip.path)
-        .complexFilter([
-          {
-            filter: "trim",
-            options: `duration=${clip.duration}`,
-            outputs: ["trimmed"],
-          },
-          {
-            filter: "setpts",
-            options: "PTS-STARTPTS",
-            inputs: ["trimmed"],
-            outputs: ["pts"],
-          },
-          {
-            filter: "eq",
-            options: "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
-            inputs: ["pts"],
-            outputs: ["eq"],
-          },
-          {
-            filter: "hue",
-            options: "h=5:s=1.2",
-            inputs: ["eq"],
-            outputs: ["hue"],
-          },
-          {
-            filter: "colorbalance",
-            options: "rm=0.1:gm=-0.05:bm=-0.1",
-            inputs: ["hue"],
-            outputs: ["cb"],
-          },
-          {
-            filter: "curves",
-            options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
-            inputs: ["cb"],
-            outputs: ["curves"],
-          },
-          {
-            filter: "unsharp",
-            options: "5:5:1.5:5:5:0.0",
-            inputs: ["curves"],
-            outputs: ["unsharp"],
-          },
-          {
-            filter: "format",
-            options: "yuv420p",
-            inputs: ["unsharp"],
-            outputs: ["final"],
-          },
-        ])
-        .outputOptions(["-map", "[final]"])
-        .outputOptions(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
-        .output(tempPath);
-
-      await new Promise<void>((resolve, reject) => {
-        command
-          .on("end", () => {
-            logger.info(`[${jobId}] Pre-processed Wes Anderson clip ${index}`, {
-              tempPath,
-            });
-            resolve();
-          })
-          .on("error", (err) => {
-            logger.error(`[${jobId}] Pre-processing failed for clip ${index}`, {
-              error: err.message,
-              path: clip.path,
-            });
-            reject(err);
-          })
-          .run();
+      // Check system resources
+      const memoryUsage = process.memoryUsage();
+      logger.debug(`[${jobId}] Pre-processing resources for clip ${index}`, {
+        memory: {
+          rss: `${Math.round(memoryUsage.rss / 1024 / 1024)} MB`,
+          heapTotal: `${Math.round(memoryUsage.heapTotal / 1024 / 1024)} MB`,
+          heapUsed: `${Math.round(memoryUsage.heapUsed / 1024 / 1024)} MB`,
+        },
       });
 
-      return { ...clip, path: tempPath };
+      // Use reasonable defaults for timeout and retries
+      const timeout = 120000; // 2 minutes
+      const maxRetries = 2;
+
+      await ffmpegQueueManager.enqueueJob(
+        async () => {
+          const command = this.createFFmpegCommand()
+            .input(clip.path)
+            .complexFilter([
+              {
+                filter: "trim",
+                options: `duration=${clip.duration}`,
+                outputs: ["trimmed"],
+              },
+              {
+                filter: "setpts",
+                options: "PTS-STARTPTS",
+                inputs: ["trimmed"],
+                outputs: ["pts"],
+              },
+              {
+                filter: "eq",
+                options:
+                  "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
+                inputs: ["pts"],
+                outputs: ["eq"],
+              },
+              {
+                filter: "hue",
+                options: "h=5:s=1.2",
+                inputs: ["eq"],
+                outputs: ["hue"],
+              },
+              {
+                filter: "colorbalance",
+                options: "rm=0.1:gm=-0.05:bm=-0.1",
+                inputs: ["hue"],
+                outputs: ["cb"],
+              },
+              {
+                filter: "curves",
+                options: "master='0/0 0.2/0.15 0.5/0.55 0.8/0.85 1/1'",
+                inputs: ["cb"],
+                outputs: ["curves"],
+              },
+              {
+                filter: "unsharp",
+                options: "5:5:1.5:5:5:0.0",
+                inputs: ["curves"],
+                outputs: ["unsharp"],
+              },
+              {
+                filter: "format",
+                options: "yuv420p",
+                inputs: ["unsharp"],
+                outputs: ["final"],
+              },
+            ])
+            .outputOptions(["-map", "[final]"])
+            .outputOptions(["-c:v", "libx264", "-preset", "fast", "-crf", "23"])
+            .output(tempPath);
+
+          await new Promise<void>((resolve, reject) => {
+            command
+              .on("end", () => {
+                logger.info(
+                  `[${jobId}] Pre-processed Wes Anderson clip ${index}`,
+                  {
+                    tempPath,
+                  }
+                );
+                resolve();
+              })
+              .on("error", (err) => {
+                logger.error(
+                  `[${jobId}] Pre-processing failed for clip ${index}`,
+                  {
+                    error: err.message,
+                    path: clip.path,
+                  }
+                );
+                reject(err);
+              })
+              .run();
+          });
+        },
+        timeout,
+        maxRetries
+      );
+
+      // Validate the processed clip
+      const processedClip = { ...clip, path: tempPath };
+      const isValid = await this.validateClipDuration(
+        processedClip,
+        index,
+        jobId
+      );
+
+      if (!isValid) {
+        throw new Error(`Processed clip ${index} failed validation`);
+      }
+
+      return processedClip;
     } catch (error) {
       logger.error(
         `[${jobId}] Error in preProcessWesAndersonClip for clip ${index}`,
@@ -2342,8 +2424,14 @@ export class VideoProcessingService {
           path: clip.path,
         }
       );
-      // If pre-processing fails, return the original clip
-      return clip;
+
+      // Validate the original clip as fallback
+      const isOriginalValid = await this.validateClipDuration(
+        clip,
+        index,
+        jobId
+      );
+      return isOriginalValid ? clip : { ...clip, path: "" }; // Empty path signals skip
     }
   }
 
