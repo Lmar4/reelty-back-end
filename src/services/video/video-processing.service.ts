@@ -20,6 +20,7 @@ import { S3VideoService } from "./s3-video.service.js";
 import { resourceManager } from "../video/resource-manager.service.js";
 import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
 import { reelTemplates } from "../imageProcessing/templates/types.js";
+import os from "os";
 
 const TARGET_FRAME_RATE = 24;
 
@@ -664,7 +665,7 @@ export class VideoProcessingService {
 
     // Calculate optimal thread count based on available CPU cores
     // Use 75% of available cores, minimum 2, maximum 16
-    const cpuCount = require("os").cpus().length;
+    const cpuCount = os.cpus().length;
     const threadCount = Math.max(2, Math.min(Math.floor(cpuCount * 0.75), 16));
 
     return command
