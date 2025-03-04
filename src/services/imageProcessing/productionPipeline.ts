@@ -1181,37 +1181,68 @@ export class ProductionPipeline {
       );
 
       try {
-        // Try to verify the file accessibility with improved retry logic
+        // Verify the video was created successfully
         const verifiedUrl = await this.retryWithBackoff(
           async () => {
-            // First try our enhanced verification method
-            const url = await this.verifyS3VideoAccess(outputPath, jobId, 3);
-            if (!url) {
-              // If that fails, try waiting for S3 object availability directly
-              logger.warn(
-                `[${jobId}] Video verification failed, trying direct S3 availability check`,
+            // Check if the file exists and is a valid video
+            if (!(await this.fileExists(outputPath))) {
+              throw new Error(`Video file not found at ${outputPath}`);
+            }
+
+            // Upload the template video to S3
+            logger.info(`[${jobId}] Uploading template ${template} to S3`, {
+              listingId,
+              template,
+              localPath: outputPath,
+            });
+
+            // Define S3 key using the appropriate path pattern
+            const s3Key = `properties/${listingId}/videos/templates/${template}/${path.basename(
+              outputPath
+            )}`;
+
+            // Upload to S3 using the S3VideoService
+            const url = await this.s3VideoService.uploadVideo(
+              outputPath,
+              s3Key
+            );
+
+            // Verify the uploaded file is accessible
+            const uploadedS3Key = this.getS3KeyFromUrl(url);
+            const isAvailable = await this.waitForS3ObjectAvailability(
+              uploadedS3Key,
+              jobId,
+              5
+            );
+
+            if (!isAvailable) {
+              throw new Error(
+                `Uploaded video not accessible at ${url} after extended verification`
+              );
+            }
+
+            // Clean up local file after successful upload
+            try {
+              await fs.unlink(outputPath);
+              logger.info(
+                `[${jobId}] Cleaned up local template file after S3 upload`,
                 {
-                  outputPath,
                   template,
+                  localPath: outputPath,
                 }
               );
-
-              const s3Key = this.getS3KeyFromUrl(outputPath);
-              const isAvailable = await this.waitForS3ObjectAvailability(
-                s3Key,
-                jobId,
-                5
-              );
-
-              if (!isAvailable) {
-                throw new Error(
-                  `Uploaded video not accessible at ${outputPath} after extended verification`
-                );
-              }
-
-              // Return the path as a string (not undefined)
-              return outputPath as string;
+            } catch (cleanupError) {
+              logger.warn(`[${jobId}] Failed to clean up local template file`, {
+                template,
+                localPath: outputPath,
+                error:
+                  cleanupError instanceof Error
+                    ? cleanupError.message
+                    : String(cleanupError),
+              });
             }
+
+            // Return the S3 URL
             return url;
           },
           this.MAX_RETRIES,
@@ -1261,6 +1292,30 @@ export class ProductionPipeline {
         error: error instanceof Error ? error.message : String(error),
         stack: error instanceof Error ? error.stack : undefined,
       });
+
+      // Clean up local file in case of error
+      try {
+        if (await this.fileExists(outputPath)) {
+          await fs.unlink(outputPath);
+          logger.info(`[${jobId}] Cleaned up local template file after error`, {
+            template,
+            localPath: outputPath,
+          });
+        }
+      } catch (cleanupError) {
+        logger.warn(
+          `[${jobId}] Failed to clean up local template file after error`,
+          {
+            template,
+            localPath: outputPath,
+            error:
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : String(cleanupError),
+          }
+        );
+      }
+
       return {
         template,
         status: "FAILED",
@@ -1268,6 +1323,16 @@ export class ProductionPipeline {
         error: error instanceof Error ? error.message : String(error),
         processingTime: Date.now() - startTime,
       };
+    }
+  }
+
+  // Helper method to check if file exists
+  private async fileExists(path: string): Promise<boolean> {
+    try {
+      await fs.access(path, fs.constants.F_OK);
+      return true;
+    } catch {
+      return false;
     }
   }
 
