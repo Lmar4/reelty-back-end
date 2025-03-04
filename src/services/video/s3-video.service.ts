@@ -38,65 +38,92 @@ export class S3VideoService {
   }
 
   public parseS3Path(s3Path: string): { bucket: string; key: string } {
-    // Handle s3:// protocol
-    if (s3Path.startsWith("s3://")) {
-      const [, , bucket, ...keyParts] = s3Path.split("/");
-      return { bucket, key: keyParts.join("/") };
-    }
+    try {
+      // Handle s3:// protocol
+      if (s3Path.startsWith("s3://")) {
+        const parts = s3Path.substring(5).split("/");
+        const bucket = parts[0];
+        const key = parts.slice(1).join("/");
+        return { bucket, key };
+      }
 
-    // Handle https:// protocol
-    const url = new URL(s3Path);
-    const bucket = url.hostname.split(".")[0];
-    const key = decodeURIComponent(url.pathname.substring(1)); // Remove leading slash
-    return { bucket, key: key.split("?")[0] }; // Remove query parameters
+      // Handle https:// protocol
+      if (s3Path.startsWith("http")) {
+        const url = new URL(s3Path);
+        const hostParts = url.hostname.split(".");
+
+        // Extract bucket from hostname (bucket.s3.region.amazonaws.com)
+        const bucket = hostParts[0];
+
+        // Remove leading slash from pathname
+        const key = url.pathname.startsWith("/")
+          ? url.pathname.substring(1)
+          : url.pathname;
+
+        return { bucket, key };
+      }
+
+      // Handle direct path format (no protocol)
+      const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
+      const key = s3Path.startsWith("/") ? s3Path.substring(1) : s3Path;
+
+      return { bucket, key };
+    } catch (error) {
+      console.error(`Failed to parse S3 path: ${s3Path}`, error);
+      throw new Error(`Invalid URL: ${s3Path}`);
+    }
   }
 
   public getPublicUrl(key: string, bucket?: string): string {
-    const region = process.env.AWS_REGION || "us-east-2";
     const bucketName =
       bucket || process.env.AWS_BUCKET || "reelty-prod-storage";
-    if (!bucketName) {
-      throw new Error(
-        "AWS_BUCKET environment variable is not set and no bucket name provided"
-      );
-    }
-    return `https://${bucketName}.s3.${region}.amazonaws.com/${key}`;
+    const region = process.env.AWS_REGION || "us-east-2";
+
+    // Ensure the key doesn't start with a slash
+    const sanitizedKey = key.startsWith("/") ? key.substring(1) : key;
+
+    return `https://${bucketName}.s3.${region}.amazonaws.com/${sanitizedKey}`;
   }
 
-  public async uploadVideo(localPath: string, s3Path: string): Promise<string> {
+  public async uploadVideo(
+    localPath: string,
+    s3Path: string,
+    options?: { contentType?: string; metadata?: Record<string, string> }
+  ): Promise<string> {
     try {
+      const sanitizedPath = s3Path.startsWith("/")
+        ? s3Path.substring(1)
+        : s3Path;
+      const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
+
       const fileStream = fs.createReadStream(localPath);
-      const bucketName = process.env.AWS_BUCKET;
-
-      if (!bucketName) {
-        throw new Error("AWS_BUCKET environment variable is not set");
-      }
-
-      // Parse the S3 path to get the key
-      const { key } = this.parseS3Path(s3Path);
+      fileStream.on("error", (err) => {
+        logger.error("File stream error", { localPath, error: err.message });
+      });
 
       const upload = new Upload({
         client: this.s3Client,
         params: {
           Bucket: bucketName,
-          Key: key,
+          Key: sanitizedPath,
           Body: fileStream,
-          ContentType: "video/mp4",
+          ContentType: options?.contentType || "video/mp4",
+          Metadata: options?.metadata,
         },
       });
 
       await upload.done();
-      logger.info("Video uploaded successfully", { localPath, s3Path });
-
-      // Return public HTTPS URL instead of S3 protocol URL
-      return this.getPublicUrl(key, bucketName);
+      const url = this.getPublicUrl(sanitizedPath);
+      logger.info("Video uploaded successfully", { localPath, s3Path, url });
+      return url;
     } catch (error) {
-      logger.error("S3 video upload failed:", {
+      logger.error("S3 video upload failed", {
         error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
         localPath,
         s3Path,
       });
-      throw error;
+      throw error; // Don’t wrap as "Invalid URL"
     }
   }
 
