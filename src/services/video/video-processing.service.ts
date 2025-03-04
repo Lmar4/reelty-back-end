@@ -1384,25 +1384,104 @@ export class VideoProcessingService {
       if (isReelTemplate) {
         const reelTemplate = template as ReelTemplate;
         if (reelTemplate.sequence && Array.isArray(reelTemplate.sequence)) {
+          // For googlezoomintro template, we need special handling
+          const isGoogleZoomIntro = template.name
+            .toLowerCase()
+            .includes("google zoom");
+
+          // Create a map of available clips (excluding the map video for googlezoomintro)
+          const availableClips = new Map<number, VideoClip>();
+          processedClips.forEach((clip, idx) => {
+            // For googlezoomintro, the first clip (index 0) is the map video
+            if (!(isGoogleZoomIntro && idx === 0)) {
+              availableClips.set(idx, clip);
+            }
+          });
+
           sequenceClips = reelTemplate.sequence
             .map((seq, index) => {
-              const clipIndex =
-                typeof seq === "string"
-                  ? seq === "map"
-                    ? 0
-                    : parseInt(seq, 10)
-                  : seq;
-              const clip = processedClips[clipIndex];
-              if (!clip) {
-                logger.warn(`[${jobId}] Missing clip at sequence ${index}`, {
-                  sequence: seq,
-                });
-                return null;
+              // Handle the map video specially for googlezoomintro
+              if (
+                typeof seq === "string" &&
+                seq === "map" &&
+                isGoogleZoomIntro
+              ) {
+                const mapClip = processedClips[0]; // Map video should be at index 0
+                if (!mapClip) {
+                  logger.warn(
+                    `[${jobId}] Missing map video at sequence ${index}`,
+                    {
+                      sequence: seq,
+                    }
+                  );
+                  return null;
+                }
+                const duration =
+                  typeof reelTemplate.durations === "object"
+                    ? reelTemplate.durations[seq]
+                    : reelTemplate.durations[index];
+                return { ...mapClip, duration: duration || mapClip.duration };
               }
-              const duration = Array.isArray(reelTemplate.durations)
-                ? reelTemplate.durations[index]
-                : reelTemplate.durations[seq];
-              return { ...clip, duration: duration || clip.duration };
+
+              // For non-map sequences
+              const requestedIndex =
+                typeof seq === "string" ? parseInt(seq, 10) : seq;
+
+              // For googlezoomintro, we need to find an available clip
+              if (isGoogleZoomIntro && typeof requestedIndex === "number") {
+                // Try to get the exact requested index first
+                let clip = availableClips.get(requestedIndex);
+
+                // If not found, find the next available clip
+                if (!clip && availableClips.size > 0) {
+                  // Get all available indices and sort them
+                  const availableIndices = Array.from(
+                    availableClips.keys()
+                  ).sort((a, b) => a - b);
+
+                  // Find the closest available index
+                  const closestIndex = availableIndices.reduce((prev, curr) =>
+                    Math.abs(curr - requestedIndex) <
+                    Math.abs(prev - requestedIndex)
+                      ? curr
+                      : prev
+                  );
+
+                  clip = availableClips.get(closestIndex);
+
+                  // Remove this clip from available clips to avoid reusing it
+                  if (clip) availableClips.delete(closestIndex);
+                } else if (clip) {
+                  // Remove this clip from available clips to avoid reusing it
+                  availableClips.delete(requestedIndex);
+                }
+
+                if (!clip) {
+                  logger.warn(`[${jobId}] Missing clip at sequence ${index}`, {
+                    sequence: seq,
+                  });
+                  return null;
+                }
+
+                const duration = Array.isArray(reelTemplate.durations)
+                  ? reelTemplate.durations[index]
+                  : reelTemplate.durations[seq];
+                return { ...clip, duration: duration || clip.duration };
+              } else {
+                // For other templates, use the original logic
+                const clipIndex = requestedIndex;
+                const clip = processedClips[clipIndex];
+                if (!clip) {
+                  logger.warn(`[${jobId}] Missing clip at sequence ${index}`, {
+                    sequence: seq,
+                  });
+                  return null;
+                }
+                const duration = Array.isArray(reelTemplate.durations)
+                  ? reelTemplate.durations[index]
+                  : reelTemplate.durations[seq];
+                return { ...clip, duration: duration || clip.duration };
+              }
             })
             .filter(Boolean) as VideoClip[];
         }
