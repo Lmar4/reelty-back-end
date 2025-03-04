@@ -37,7 +37,7 @@ ENV PATH="/usr/bin:$PATH" \
     FFMPEG_PATH="/usr/bin/ffmpeg" \
     FFPROBE_PATH="/usr/bin/ffprobe" \
     # Explicitly set NODE_OPTIONS for max heap size
-    NODE_OPTIONS="--max-old-space-size=8192" \
+    NODE_OPTIONS="--max-old-space-size=7680" \
     TEMP_DIR="/app/temp" \
     TEMP_OUTPUT_DIR="/app/temp/output" \
     TEMP_PROCESSING_DIR="/app/temp/processing" \
@@ -72,4 +72,4 @@ RUN pnpm run build
 EXPOSE 8080
 
 # Start the app with explicit Node.js command to ensure NODE_OPTIONS is applied
-CMD ["node", "--max-old-space-size=8192", "build/server.js"]
+CMD ["node", "--max-old-space-size=7680", "build/server.js"]
