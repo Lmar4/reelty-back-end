@@ -326,10 +326,19 @@ export class VideoProcessingService {
   ): Promise<string> {
     logger.debug(`Resolving ${type} asset path`, { assetPath });
 
-    // Handle S3/HTTPS URLs
-    if (assetPath.startsWith("https://") || assetPath.startsWith("s3://")) {
+    // Handle S3/HTTPS URLs and paths that start with "assets/" (S3 relative paths)
+    if (
+      assetPath.startsWith("https://") ||
+      assetPath.startsWith("s3://") ||
+      assetPath.startsWith("assets/")
+    ) {
+      // Convert relative S3 paths to full S3 URLs
       const normalizedPath = assetPath.startsWith("s3://")
         ? assetPath.replace("s3://", "https://")
+        : assetPath.startsWith("assets/")
+        ? `https://${process.env.AWS_BUCKET || "reelty-prod-storage"}.s3.${
+            process.env.AWS_REGION || "us-east-2"
+          }.amazonaws.com/${assetPath}`
         : assetPath;
 
       // Check if we already have this asset cached

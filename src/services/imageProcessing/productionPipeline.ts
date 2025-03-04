@@ -912,6 +912,12 @@ export class ProductionPipeline {
   }
 
   private getS3KeyFromUrl(url: string): string {
+    // Check if this is a local file path
+    if (url.startsWith("/") && !url.startsWith("//")) {
+      // For local paths, return the path as is
+      return url;
+    }
+
     if (url.startsWith("s3://")) {
       const parts = url.slice(5).split("/");
       return parts.slice(1).join("/"); // Remove bucket name
@@ -960,6 +966,32 @@ export class ProductionPipeline {
     jobId: string,
     retries = 3
   ): Promise<string | null> {
+    // First check if this is a local file path
+    if (path.startsWith("/") && !path.startsWith("//")) {
+      try {
+        // Check if the file exists locally
+        const exists = existsSync(path);
+        if (exists) {
+          logger.info(`[${jobId}] Video verified accessible as local file`, {
+            path,
+            verificationTime: 0,
+          });
+          return path;
+        } else {
+          logger.warn(`[${jobId}] Local file not accessible`, {
+            path,
+          });
+          return null;
+        }
+      } catch (error) {
+        logger.warn(`[${jobId}] Error checking local file accessibility`, {
+          path,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
+        return null;
+      }
+    }
+
     const bucketName = process.env.AWS_BUCKET || "reelty-prod-storage";
     const s3Key = this.getS3KeyFromUrl(path);
     const MAX_TIMEOUT = 60000; // Increased from 30s to 60s total timeout
@@ -2732,6 +2764,37 @@ export class ProductionPipeline {
     jobId?: string,
     maxRetries = 5
   ): Promise<boolean> {
+    // First check if this is a local file path
+    if (s3Key.startsWith("/") && !s3Key.startsWith("//")) {
+      try {
+        // Check if the file exists locally
+        const exists = existsSync(s3Key);
+        if (exists) {
+          if (jobId) {
+            logger.info(`[${jobId}] Local file verified available`, {
+              path: s3Key,
+            });
+          }
+          return true;
+        } else {
+          if (jobId) {
+            logger.warn(`[${jobId}] Local file not accessible`, {
+              path: s3Key,
+            });
+          }
+          return false;
+        }
+      } catch (error) {
+        if (jobId) {
+          logger.warn(`[${jobId}] Error checking local file accessibility`, {
+            path: s3Key,
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+        }
+        return false;
+      }
+    }
+
     const bucket = process.env.AWS_BUCKET || "reelty-prod-storage";
     const startTime = Date.now();
 
