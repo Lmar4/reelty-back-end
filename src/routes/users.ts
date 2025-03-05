@@ -1,10 +1,10 @@
+import { SubscriptionTierId } from "@prisma/client";
 import express from "express";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { isAuthenticated } from "../middleware/auth.js";
-import { logger } from "../utils/logger.js";
-import { PrismaClient, SubscriptionTierId } from "@prisma/client";
 import { createApiResponse } from "../types/api.js";
+import { logger } from "../utils/logger.js";
 const router = express.Router();
 
 // Middleware to verify webhook requests
