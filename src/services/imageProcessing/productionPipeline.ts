@@ -46,6 +46,7 @@ import { existsSync } from "fs";
 import { VideoTemplateService } from "../video/video-template.service.js";
 import { ReelTemplate } from "./templates/types.js";
 import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
+import { subscriptionService } from "../subscription/subscription.service.js";
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",
@@ -1322,12 +1323,62 @@ export class ProductionPipeline {
         });
       }
 
+      // Get the user's subscription tier to determine if watermark should be applied
+      const job = await this.prisma.videoJob.findUnique({
+        where: { id: jobId },
+        include: { user: { include: { currentTier: true } } },
+      });
+
+      // Configure watermark based on user's subscription tier
+      let watermarkConfig: WatermarkConfig | undefined;
+      if (job?.user?.currentTier?.hasWatermark) {
+        try {
+          // Get watermark asset path
+          const watermarkPath = await this.assetManager.getAssetPath(
+            AssetType.WATERMARK,
+            "watermark_transparent_v1.png"
+          );
+
+          // Configure watermark
+          watermarkConfig = {
+            path: watermarkPath,
+            position: { x: "(main_w-overlay_w)/2", y: "main_h-overlay_h-300" },
+          };
+
+          logger.info(
+            `[${jobId}] Watermark will be applied based on subscription tier`,
+            {
+              userId: job.userId,
+              tierName: job.user.currentTier.name,
+              hasWatermark: job.user.currentTier.hasWatermark,
+            }
+          );
+        } catch (watermarkError) {
+          logger.error(`[${jobId}] Error configuring watermark`, {
+            error:
+              watermarkError instanceof Error
+                ? watermarkError.message
+                : String(watermarkError),
+          });
+          // Continue without watermark if there's an error
+        }
+      } else {
+        logger.info(
+          `[${jobId}] No watermark will be applied based on subscription tier`,
+          {
+            userId: job?.userId,
+            tierName: job?.user?.currentTier?.name,
+            hasWatermark: job?.user?.currentTier?.hasWatermark,
+          }
+        );
+      }
+
       // Replace stitchVideos with stitchVideoClips and pass the template configuration
       await videoProcessingService.stitchVideoClips(
         clips,
         outputPath,
         templateConfig,
-        undefined // No watermark config
+        watermarkConfig // Pass watermark config based on subscription tier
       );
 
       try {
