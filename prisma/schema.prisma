@@ -51,6 +51,7 @@ model User {
   agencyVideoJobs            VideoGenerationJob[]  @relation("AgencyUsers")
   videoGenerationJobs        VideoGenerationJob[]  @relation("UserVideoJobs")
   videoJobs                  VideoJob[]
+  videoDownloads             VideoDownload[]
 
   @@index([currentTierId])
   @@index([agencyId])
@@ -216,9 +217,24 @@ model VideoJob {
   thumbnailUrl String?               @map("thumbnail_url")
   listing      Listing               @relation(fields: [listingId], references: [id], onDelete: Cascade)
   user         User                  @relation(fields: [userId], references: [id])
+  downloads    VideoDownload[]
 
   @@index([status, position])
   @@map("video_jobs")
+}
+
+model VideoDownload {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id")
+  jobId       String   @map("job_id") @db.Uuid
+  templateKey String   @map("template_key")
+  createdAt   DateTime @default(now()) @map("created_at")
+  user        User     @relation(fields: [userId], references: [id])
+  job         VideoJob @relation(fields: [jobId], references: [id])
+
+  @@index([userId])
+  @@index([jobId])
+  @@map("video_downloads")
 }
 
 model SearchHistory {

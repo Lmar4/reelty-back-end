@@ -1,4 +1,8 @@
-import { PrismaClient, SubscriptionStatus } from "@prisma/client";
+import {
+  PrismaClient,
+  SubscriptionStatus,
+  SubscriptionTierId,
+} from "@prisma/client";
 import Stripe from "stripe";
 import { logger } from "../../utils/logger.js";
 
@@ -23,6 +27,159 @@ function mapStripeStatus(status: string): SubscriptionStatus {
   return statusMap[status] || "INACTIVE";
 }
 
+// Helper function to handle subscription updates
+async function handleSubscriptionUpdated(subscription: Stripe.Subscription) {
+  try {
+    // Find user by Stripe customer ID
+    const user = await prisma.user.findFirst({
+      where: { stripeCustomerId: subscription.customer as string },
+      include: { currentTier: true },
+    });
+
+    if (!user) {
+      logger.error("No user found with Stripe customer ID", {
+        customerId: subscription.customer,
+      });
+      return;
+    }
+
+    // Map Stripe status to our status
+    const subscriptionStatus = mapStripeStatus(subscription.status);
+
+    // Get the price ID from the subscription
+    const priceId = subscription.items.data[0]?.price.id;
+
+    // Find the corresponding tier for this price
+    const tier = priceId
+      ? await prisma.subscriptionTier.findUnique({
+          where: { stripePriceId: priceId },
+        })
+      : null;
+
+    // If no tier found, log error but continue with status update
+    if (!tier && priceId) {
+      logger.error("No tier found for price ID", { priceId });
+    }
+
+    // Prepare update data
+    const updateData: any = {
+      subscriptionStatus,
+      stripeSubscriptionId: subscription.id,
+      stripePriceId: priceId || null,
+      subscriptionPeriodEnd: new Date(subscription.current_period_end * 1000),
+    };
+
+    // Only update tier if we found one
+    if (tier) {
+      updateData.currentTierId = tier.tierId;
+    }
+
+    // Update user with new status and tier if available
+    await prisma.user.update({
+      where: { id: user.id },
+      data: updateData,
+    });
+
+    // Log the subscription change
+    await prisma.subscriptionLog.create({
+      data: {
+        userId: user.id,
+        action: "SUBSCRIPTION_UPDATED",
+        stripeSubscriptionId: subscription.id,
+        stripePriceId: priceId || null,
+        status: subscriptionStatus,
+        periodEnd: new Date(subscription.current_period_end * 1000),
+      },
+    });
+
+    // If tier changed, log it
+    if (tier && user.currentTierId !== tier.tierId) {
+      await prisma.tierChange.create({
+        data: {
+          userId: user.id,
+          oldTier: user.currentTierId || SubscriptionTierId.FREE,
+          newTier: tier.tierId,
+          reason: "Stripe subscription update",
+        },
+      });
+    }
+
+    // If subscription is canceled, schedule a job to downgrade to FREE tier when period ends
+    if (subscriptionStatus === "CANCELED") {
+      logger.info(
+        "Subscription canceled, will downgrade to FREE tier after period end",
+        {
+          userId: user.id,
+          periodEnd: new Date(subscription.current_period_end * 1000),
+        }
+      );
+    }
+  } catch (error) {
+    logger.error("Error handling subscription update", { error });
+    throw error;
+  }
+}
+
+// Helper function to check and update subscription status
+async function checkSubscriptionStatus(userId: string) {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        subscriptionStatus: true,
+        subscriptionPeriodEnd: true,
+        currentTierId: true,
+      },
+    });
+
+    if (!user) return;
+
+    // If subscription is canceled and period has ended, downgrade to FREE tier
+    if (
+      user.subscriptionStatus === "CANCELED" &&
+      user.subscriptionPeriodEnd &&
+      user.subscriptionPeriodEnd < new Date() &&
+      user.currentTierId !== SubscriptionTierId.FREE
+    ) {
+      await prisma.user.update({
+        where: { id: userId },
+        data: {
+          currentTierId: SubscriptionTierId.FREE,
+          subscriptionStatus: "INACTIVE",
+        },
+      });
+
+      await prisma.tierChange.create({
+        data: {
+          userId,
+          oldTier: user.currentTierId || SubscriptionTierId.FREE,
+          newTier: SubscriptionTierId.FREE,
+          reason: "Subscription period ended",
+        },
+      });
+
+      await prisma.subscriptionLog.create({
+        data: {
+          userId,
+          action: "DOWNGRADED_TO_FREE",
+          stripeSubscriptionId: "period_ended",
+          status: "INACTIVE",
+        },
+      });
+
+      logger.info(
+        "User downgraded to FREE tier after subscription period ended",
+        {
+          userId,
+        }
+      );
+    }
+  } catch (error) {
+    logger.error("Error checking subscription status", { error, userId });
+  }
+}
+
 interface WebhookRequest {
   body: string | Buffer;
   headers: Record<string, string | string[] | undefined>;
@@ -38,10 +195,10 @@ export async function handleStripeWebhook(
   request: WebhookRequest
 ): Promise<WebhookResponse> {
   try {
-    console.log("[STRIPE_WEBHOOK] Received webhook request");
+    logger.info("[STRIPE_WEBHOOK] Received webhook request");
 
     if (!request.body) {
-      console.log("[STRIPE_WEBHOOK] No request body");
+      logger.error("[STRIPE_WEBHOOK] No request body");
       return {
         statusCode: 400,
         body: JSON.stringify({ error: "Request body is required" }),
@@ -50,7 +207,10 @@ export async function handleStripeWebhook(
 
     const sig = request.headers["stripe-signature"];
     if (!sig || !webhookSecret || Array.isArray(sig)) {
-      console.log("[STRIPE_WEBHOOK] Invalid signature", { sig, webhookSecret });
+      logger.error("[STRIPE_WEBHOOK] Invalid signature", {
+        sig,
+        webhookSecret,
+      });
       return {
         statusCode: 400,
         body: JSON.stringify({ error: "Invalid stripe signature" }),
@@ -65,11 +225,11 @@ export async function handleStripeWebhook(
         sig,
         webhookSecret
       );
-      console.log("[STRIPE_WEBHOOK] Event verified", {
+      logger.info("[STRIPE_WEBHOOK] Event verified", {
         type: stripeEvent.type,
       });
     } catch (err) {
-      console.error("[STRIPE_WEBHOOK] Signature verification failed:", err);
+      logger.error("[STRIPE_WEBHOOK] Signature verification failed:", err);
       return {
         statusCode: 400,
         body: JSON.stringify({ error: "Invalid signature" }),
@@ -81,96 +241,46 @@ export async function handleStripeWebhook(
       case "customer.subscription.created":
       case "customer.subscription.updated": {
         const subscription = stripeEvent.data.object as Stripe.Subscription;
-        const priceId = subscription.items.data[0].price.id;
-        const customerId = subscription.customer as string;
 
-        // Find tier by Stripe price ID
-        const tier = await prisma.subscriptionTier.findFirst({
-          where: { stripePriceId: priceId },
-        });
+        // Use the new helper function
+        await handleSubscriptionUpdated(subscription);
 
-        if (!tier) {
-          console.error("Tier not found for price ID:", priceId);
-          return {
-            statusCode: 400,
-            body: JSON.stringify({ error: "Subscription tier not found" }),
-          };
-        }
+        // If this is a new subscription, add initial credits
+        if (stripeEvent.type === "customer.subscription.created") {
+          const priceId = subscription.items.data[0]?.price.id;
+          const tier = priceId
+            ? await prisma.subscriptionTier.findUnique({
+                where: { stripePriceId: priceId },
+              })
+            : null;
 
-        // Find user by Stripe customer ID
-        const user = await prisma.user.findFirst({
-          where: { stripeCustomerId: customerId },
-        });
-
-        if (!user) {
-          console.error("User not found for customer ID:", customerId);
-          return {
-            statusCode: 400,
-            body: JSON.stringify({ error: "User not found" }),
-          };
-        }
-
-        const subscriptionStatus = mapStripeStatus(subscription.status);
-
-        // Update user subscription details
-        await prisma.user.update({
-          where: { id: user.id },
-          data: {
-            currentTierId: tier.tierId,
-            stripeSubscriptionId: subscription.id,
-            stripePriceId: priceId,
-            subscriptionStatus,
-            subscriptionPeriodEnd: new Date(
-              subscription.current_period_end * 1000
-            ),
-          },
-        });
-
-        // Create subscription history entry
-        await prisma.subscriptionHistory.create({
-          data: {
-            userId: user.id,
-            tierId: tier.tierId,
-            status: subscriptionStatus,
-            startDate: new Date(subscription.current_period_start * 1000),
-            endDate: new Date(subscription.current_period_end * 1000),
-          },
-        });
-
-        // Log the subscription change
-        await prisma.subscriptionLog.create({
-          data: {
-            userId: user.id,
-            action: stripeEvent.type,
-            stripeSubscriptionId: subscription.id,
-            stripePriceId: priceId,
-            stripeProductId: tier.stripeProductId,
-            status: subscriptionStatus,
-            periodEnd: new Date(subscription.current_period_end * 1000),
-          },
-        });
-
-        // Add initial credits for new subscriptions
-        if (
-          stripeEvent.type === "customer.subscription.created" &&
-          tier.planType === "MONTHLY" &&
-          tier.creditsPerInterval > 0
-        ) {
-          await prisma.$transaction(async (tx) => {
-            await tx.listingCredit.create({
-              data: {
-                userId: user.id,
-                creditsRemaining: tier.creditsPerInterval,
-              },
+          if (
+            tier &&
+            tier.planType === "MONTHLY" &&
+            tier.creditsPerInterval > 0
+          ) {
+            const user = await prisma.user.findFirst({
+              where: { stripeCustomerId: subscription.customer as string },
             });
-            await tx.creditLog.create({
-              data: {
-                userId: user.id,
-                amount: tier.creditsPerInterval,
-                reason: `Initial credits from ${tier.name} subscription`,
-              },
-            });
-          });
+
+            if (user) {
+              await prisma.$transaction(async (tx) => {
+                await tx.listingCredit.create({
+                  data: {
+                    userId: user.id,
+                    creditsRemaining: tier.creditsPerInterval,
+                  },
+                });
+                await tx.creditLog.create({
+                  data: {
+                    userId: user.id,
+                    amount: tier.creditsPerInterval,
+                    reason: `Initial credits from ${tier.name} subscription`,
+                  },
+                });
+              });
+            }
+          }
         }
 
         break;
@@ -185,19 +295,18 @@ export async function handleStripeWebhook(
         });
 
         if (!user) {
-          console.error("User not found for customer ID:", customerId);
+          logger.error("User not found for customer ID:", customerId);
           return {
             statusCode: 400,
             body: JSON.stringify({ error: "User not found" }),
           };
         }
 
-        // Update user's subscription status
+        // Update user's subscription status but keep the tier until period ends
         await prisma.user.update({
           where: { id: user.id },
           data: {
             subscriptionStatus: "CANCELED",
-            currentTierId: null,
             stripeSubscriptionId: null,
             stripePriceId: null,
           },
@@ -210,7 +319,7 @@ export async function handleStripeWebhook(
             tierId: user.currentTierId!,
             status: "CANCELED",
             startDate: new Date(),
-            endDate: new Date(),
+            endDate: new Date(subscription.current_period_end * 1000),
           },
         });
 
@@ -221,7 +330,7 @@ export async function handleStripeWebhook(
             action: "subscription.canceled",
             stripeSubscriptionId: subscription.id,
             status: "CANCELED",
-            periodEnd: new Date(),
+            periodEnd: new Date(subscription.current_period_end * 1000),
           },
         });
 
@@ -378,7 +487,7 @@ export async function handleStripeWebhook(
       }
 
       default:
-        console.log(`Unhandled event type: ${stripeEvent.type}`);
+        logger.info(`Unhandled event type: ${stripeEvent.type}`);
     }
 
     return {
@@ -389,7 +498,7 @@ export async function handleStripeWebhook(
       },
     };
   } catch (error) {
-    console.error("Webhook error:", error);
+    logger.error("Webhook error:", error);
     return {
       statusCode: 500,
       body: JSON.stringify({ error: "Webhook handler failed" }),
@@ -399,3 +508,6 @@ export async function handleStripeWebhook(
     };
   }
 }
+
+// Export the helper function for use in other parts of the application
+export { checkSubscriptionStatus };
