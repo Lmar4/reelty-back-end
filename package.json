@@ -16,12 +16,12 @@
     "db:migrate": "pnpm prisma migrate dev",
     "db:seed": "pnpm prisma db seed",
     "db:seed:plans": "tsx prisma/seed.ts",
+    "sync-stripe": "node src/scripts/sync-stripe-plans.js",
     "lint": "eslint \"src/**/*.ts\" --fix",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
     "test:templates": "tsx src/scripts/test-template-generation.ts",
-    "sync-stripe": "ts-node src/scripts/sync-stripe-plans.ts",
     "rerun-job": "ts-node src/scripts/rerunJob.ts"
   },
   "dependencies": {

@@ -201,6 +201,32 @@ async function main() {
       maxActiveListings: -1,
       premiumTemplatesEnabled: true,
     },
+    // Lifetime Access Plan
+    {
+      tierId: SubscriptionTierId.REELTY_PRO,
+      name: "Reelty Lifetime",
+      description: "Lifetime access. Available to the first 100 users.",
+      stripePriceId: "price_reelty_lifetime",
+      stripeProductId: "prod_reelty_lifetime",
+      features: [
+        "No Watermark",
+        "Pro Templates",
+        "2 Listings / Month",
+        "Up to 20 Photos per Listing",
+        "6 Reels per Listing",
+        "New Templates Monthly",
+        "Exclusive Early Access to New Features",
+        "Early Access to the Reelty Referral Program",
+      ],
+      monthlyPrice: 249,
+      planType: PlanType.PAY_AS_YOU_GO,
+      creditsPerInterval: 24,
+      hasWatermark: false,
+      maxPhotosPerListing: 20,
+      maxReelDownloads: 6,
+      maxActiveListings: 2,
+      premiumTemplatesEnabled: true,
+    },
   ];
 
   console.log("Seeding subscription tiers...");
@@ -211,74 +237,6 @@ async function main() {
       create: tier,
     });
     console.log(`Created/updated subscription tier: ${tier.name}`);
-  }
-
-  // Create test users for each subscription tier
-  const testUsers = [
-    {
-      id: "user_2siThAOP4AfhLAITRyB9lsy9hw5",
-      email: "admin@reelty.app",
-      password: "admin", // In production, this should be properly hashed
-      firstName: "Admin",
-      lastName: "User",
-      currentTierId: SubscriptionTierId.REELTY_PRO_PLUS,
-      subscriptionStatus: SubscriptionStatus.ACTIVE,
-      role: UserRole.ADMIN,
-    },
-    {
-      id: "user_free_test",
-      email: "free@reelty.app",
-      password: "test123",
-      firstName: "Free",
-      lastName: "User",
-      currentTierId: SubscriptionTierId.FREE,
-      subscriptionStatus: SubscriptionStatus.ACTIVE,
-      role: UserRole.USER,
-    },
-    {
-      id: "user_reelty_test",
-      email: "reelty@reelty.app",
-      password: "test123",
-      firstName: "Reelty",
-      lastName: "User",
-      currentTierId: SubscriptionTierId.REELTY,
-      subscriptionStatus: SubscriptionStatus.ACTIVE,
-      role: UserRole.USER,
-    },
-    {
-      id: "user_pro_test",
-      email: "pro@reelty.app",
-      password: "test123",
-      firstName: "Pro",
-      lastName: "User",
-      currentTierId: SubscriptionTierId.REELTY_PRO,
-      subscriptionStatus: SubscriptionStatus.ACTIVE,
-      role: UserRole.USER,
-    },
-    {
-      id: "user_proplus_test",
-      email: "proplus@reelty.app",
-      password: "test123",
-      firstName: "Pro Plus",
-      lastName: "User",
-      currentTierId: SubscriptionTierId.REELTY_PRO_PLUS,
-      subscriptionStatus: SubscriptionStatus.ACTIVE,
-      role: UserRole.USER,
-    },
-  ];
-
-  console.log("Creating test users...");
-  for (const user of testUsers) {
-    await prisma.user.upsert({
-      where: { email: user.email },
-      update: {
-        currentTierId: user.currentTierId,
-        subscriptionStatus: user.subscriptionStatus,
-        role: user.role,
-      },
-      create: user,
-    });
-    console.log(`Created/updated user: ${user.email}`);
   }
 
   // Create templates

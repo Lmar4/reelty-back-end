@@ -315,6 +315,24 @@ export class PlansService {
           savePercentage: 34,
         },
       },
+      // Lifetime Access Plan
+      {
+        name: "Reelty Lifetime",
+        type: "PAY_AS_YOU_GO" as PlanType,
+        price: 249,
+        credits: 24, // 2 listings per month for 12 months
+        tierId: SubscriptionTierId.REELTY_PRO,
+        features: {
+          maxPhotosPerListing: 20,
+          unlimitedDownloads: true,
+          noWatermark: true,
+          premiumTemplates: true,
+          prioritySupport: true,
+          maxReelsPerListing: 6,
+          earlyAccess: true,
+          referralProgram: true,
+        },
+      },
     ];
 
     for (const plan of plans) {
