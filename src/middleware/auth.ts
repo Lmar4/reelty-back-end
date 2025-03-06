@@ -31,11 +31,18 @@ export async function validateRequest(req: Request) {
     const auth = getAuth(req);
     const { userId, sessionId } = auth;
 
+    // Enhanced logging with token details
+    const authHeader = req.headers.authorization;
+    const tokenPrefix =
+      authHeader && authHeader.startsWith("Bearer ")
+        ? authHeader.substring(7, 17) + "..."
+        : "missing";
+
     logger.info(`[Auth] Validating request`, {
       userId,
       sessionId: sessionId ? "present" : "missing",
       headers: {
-        authorization: req.headers.authorization ? "present" : "missing",
+        authorization: tokenPrefix,
         host: req.headers.host,
         origin: req.headers.origin,
       },
@@ -44,9 +51,15 @@ export async function validateRequest(req: Request) {
     });
 
     if (!userId || !sessionId) {
+      // More detailed logging for auth failures
       logger.warn(`[Auth] Invalid or missing session`, {
         userId,
         sessionId,
+        authHeaderPresent: !!req.headers.authorization,
+        authHeaderPrefix: tokenPrefix,
+        // Log additional request details that might help diagnose the issue
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
       });
       throw new AuthError(401, "Invalid or missing session");
     }
@@ -56,12 +69,18 @@ export async function validateRequest(req: Request) {
       sessionId,
     };
   } catch (error) {
+    // Enhanced error logging
     logger.error(`[Auth] Authentication error`, {
       error: error instanceof Error ? error.message : "Unknown error",
       stack: error instanceof Error ? error.stack : undefined,
       headers: {
         authorization: req.headers.authorization ? "present" : "missing",
+        host: req.headers.host,
+        origin: req.headers.origin,
       },
+      url: req.url,
+      method: req.method,
+      ip: req.ip,
     });
 
     if (error instanceof AuthError) {
