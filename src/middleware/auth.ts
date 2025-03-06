@@ -1,6 +1,8 @@
 import { getAuth } from "@clerk/express";
 import type { NextFunction, Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
+import { logger } from "../utils/logger.js";
+import { SubscriptionTierId } from "@prisma/client";
 
 // Extend Request type to include user property
 declare global {
@@ -30,7 +32,23 @@ export async function validateRequest(req: Request) {
     const auth = getAuth(req);
     const { userId, sessionId } = auth;
 
+    logger.info(`[Auth] Validating request`, {
+      userId,
+      sessionId: sessionId ? "present" : "missing",
+      headers: {
+        authorization: req.headers.authorization ? "present" : "missing",
+        host: req.headers.host,
+        origin: req.headers.origin,
+      },
+      url: req.url,
+      method: req.method,
+    });
+
     if (!userId || !sessionId) {
+      logger.warn(`[Auth] Invalid or missing session`, {
+        userId,
+        sessionId,
+      });
       throw new AuthError(401, "Invalid or missing session");
     }
 
@@ -39,6 +57,14 @@ export async function validateRequest(req: Request) {
       sessionId,
     };
   } catch (error) {
+    logger.error(`[Auth] Authentication error`, {
+      error: error instanceof Error ? error.message : "Unknown error",
+      stack: error instanceof Error ? error.stack : undefined,
+      headers: {
+        authorization: req.headers.authorization ? "present" : "missing",
+      },
+    });
+
     if (error instanceof AuthError) {
       throw error;
     }
@@ -55,13 +81,52 @@ export async function isAuthenticated(
     const { userId } = await validateRequest(req);
 
     // Verify the user exists in our database
-    const user = await prisma.user.findUnique({
+    let user = await prisma.user.findUnique({
       where: { id: userId },
       select: { id: true },
     });
 
+    // If user doesn't exist but has valid Clerk token, create the user
     if (!user) {
-      throw new AuthError(401, "User not found");
+      logger.info(
+        `User ${userId} not found in database but has valid Clerk token. Creating user.`
+      );
+
+      try {
+        // Get user details from Clerk if possible
+        const auth = getAuth(req);
+        const email = (auth.sessionClaims?.email as string) || "";
+
+        // Create the user with minimal information
+        user = await prisma.user.create({
+          data: {
+            id: userId,
+            email: email,
+            firstName: null,
+            lastName: null,
+            password: "", // Empty password since we're using Clerk for auth
+            role: "USER", // Default role
+            subscriptionStatus: "TRIALING", // Default status
+            currentTierId: SubscriptionTierId.FREE, // Set initial tier
+          },
+        });
+
+        // Create initial listing credit for new user
+        await prisma.listingCredit.create({
+          data: {
+            userId: user.id,
+            creditsRemaining: 1,
+          },
+        });
+
+        logger.info(`Successfully created user ${userId} in database`);
+      } catch (createError) {
+        logger.error(
+          `Failed to create user ${userId} in database`,
+          createError
+        );
+        throw new AuthError(401, "User not found and could not be created");
+      }
     }
 
     req.user = { id: userId };

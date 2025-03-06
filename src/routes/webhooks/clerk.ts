@@ -24,7 +24,6 @@ const validateClerkWebhook = async (
   next: express.NextFunction
 ) => {
   // Log complete request details
-
   logger.info("[Clerk Webhook] Received webhook request", {
     headers: {
       ...req.headers,
@@ -38,6 +37,9 @@ const validateClerkWebhook = async (
     method: req.method,
     body: req.body, // Parsed JSON body
     rawBody: (req as any).rawBody, // Raw body string
+    url: req.url,
+    origin: req.headers.origin,
+    host: req.headers.host,
   });
 
   const CLERK_WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
