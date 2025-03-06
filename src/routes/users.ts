@@ -5,6 +5,7 @@ import { prisma } from "../lib/prisma.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { createApiResponse } from "../types/api.js";
 import { logger } from "../utils/logger.js";
+import { checkSubscriptionStatus } from "../controllers/api/stripeWebhook.js";
 const router = express.Router();
 
 // Middleware to verify webhook requests
@@ -221,6 +222,9 @@ const getUserData = async (
         );
       return;
     }
+
+    // Check subscription status before returning user data
+    await checkSubscriptionStatus(userId);
 
     const user = await prisma.user.findUnique({
       where: { id: userId },

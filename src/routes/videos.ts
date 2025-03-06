@@ -3,11 +3,12 @@ import express from "express";
 import { logger } from "../utils/logger.js";
 import { prisma } from "../lib/prisma.js";
 import { isAuthenticated } from "../middleware/auth.js";
+import { Prisma } from "@prisma/client";
 
 const router = express.Router();
 
 // POST /api/videos/track-download
-// Track a video download
+// Track a video download and enforce download limits
 router.post(
   "/track-download",
   isAuthenticated,
@@ -42,10 +43,17 @@ router.post(
 
       const userIdToUse = userId || req.user!.id;
 
-      // Check if the user exists
+      // Check if the user exists and get their subscription tier
       const user = await prisma.user.findUnique({
         where: { id: userIdToUse },
-        include: { currentTier: true },
+        include: {
+          currentTier: true,
+          videoDownloads: {
+            where: {
+              jobId,
+            },
+          },
+        },
       });
 
       if (!user) {
@@ -56,7 +64,7 @@ router.post(
         return;
       }
 
-      // Check if the job exists
+      // Check if the job exists and belongs to the user
       const job = await prisma.videoJob.findUnique({
         where: { id: jobId },
       });
@@ -69,26 +77,82 @@ router.post(
         return;
       }
 
-      // For now, we'll just log the download attempt
-      // The VideoDownload model is not yet available in the database
-      // TODO: Once the migration is properly applied, implement download tracking and limits
-      logger.info("Video download tracking requested", {
+      if (job.userId !== userIdToUse) {
+        res.status(403).json({
+          success: false,
+          error: "You don't have permission to download this video",
+        });
+        return;
+      }
+
+      // Check if the user has already downloaded this video
+      const existingDownloads = user.videoDownloads;
+      if (existingDownloads.length > 0) {
+        res.status(200).json({
+          success: true,
+          message: "Video download already tracked",
+          data: {
+            userId: userIdToUse,
+            jobId,
+            templateKey,
+            timestamp: existingDownloads[0].createdAt.toISOString(),
+          },
+        });
+        return;
+      }
+
+      // Check download limits based on subscription tier
+      const maxDownloads = user.currentTier?.maxReelDownloads;
+
+      if (maxDownloads !== undefined && maxDownloads !== null) {
+        const downloadCount = await prisma.videoDownload.count({
+          where: {
+            userId: userIdToUse,
+          },
+        });
+
+        if (downloadCount >= maxDownloads) {
+          res.status(403).json({
+            success: false,
+            error:
+              "You have reached your download limit for this subscription tier",
+            data: {
+              currentDownloads: downloadCount,
+              maxDownloads,
+              tier: user.currentTier?.name,
+            },
+          });
+          return;
+        }
+      }
+
+      // Track the download
+      const download = await prisma.videoDownload.create({
+        data: {
+          userId: userIdToUse,
+          jobId,
+          templateKey,
+        },
+      });
+
+      logger.info("Video download tracked successfully", {
         userId: userIdToUse,
         jobId,
         templateKey,
         tier: user.currentTier?.name || "unknown",
-        maxDownloads: user.currentTier?.maxReelDownloads,
+        maxDownloads,
+        downloadId: download.id,
       });
 
       // Return success response
       res.status(200).json({
         success: true,
-        message: "Video download request processed",
+        message: "Video download tracked successfully",
         data: {
           userId: userIdToUse,
           jobId,
           templateKey,
-          timestamp: new Date().toISOString(),
+          timestamp: download.createdAt.toISOString(),
         },
       });
       return;
