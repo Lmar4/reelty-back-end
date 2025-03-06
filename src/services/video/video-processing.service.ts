@@ -1456,10 +1456,16 @@ export class VideoProcessingService {
           // For object-based durations (like googlezoomintro)
           if (clip.isMapVideo && "map" in durations) {
             duration = durations.map;
-          } else if (index in durations) {
-            duration = durations[index as keyof typeof durations];
           } else {
-            duration = clip.duration;
+            // For numeric indices in the durations object
+            const sequenceValue = isReelTemplate
+              ? (reelTemplate.sequence[index] as string | number)
+              : index;
+            // Try to get duration using the sequence value first, then fall back to index
+            duration =
+              durations[sequenceValue as keyof typeof durations] ||
+              durations[index as keyof typeof durations] ||
+              clip.duration;
           }
         } else {
           duration = clip.duration;
@@ -1470,6 +1476,9 @@ export class VideoProcessingService {
           `[${jobId}] Assigning duration for clip at position ${index}`,
           {
             clipIndex: index,
+            sequenceValue: isReelTemplate
+              ? reelTemplate.sequence[index]
+              : undefined,
             assignedDuration: duration,
             originalDuration: clip.duration,
             isMapVideo: clip.isMapVideo,
@@ -1865,19 +1874,19 @@ export class VideoProcessingService {
               {
                 filter: "eq",
                 options:
-                  "brightness=0.05:contrast=1.15:saturation=1.3:gamma=0.95",
+                  "brightness=0.03:contrast=1.09:saturation=1.18:gamma=0.97",
                 inputs: ["pts"],
                 outputs: ["eq"],
               },
               {
                 filter: "hue",
-                options: "h=5:s=1.2",
+                options: "h=3:s=1.12",
                 inputs: ["eq"],
                 outputs: ["hue"],
               },
               {
                 filter: "colorbalance",
-                options: "rm=0.1:gm=-0.05:bm=-0.1",
+                options: "rm=0.06:gm=-0.03:bm=-0.06",
                 inputs: ["hue"],
                 outputs: ["cb"],
               },
