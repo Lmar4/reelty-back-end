@@ -2,7 +2,6 @@ import { getAuth } from "@clerk/express";
 import type { NextFunction, Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { logger } from "../utils/logger.js";
-import { SubscriptionTierId } from "@prisma/client";
 
 // Extend Request type to include user property
 declare global {
@@ -97,6 +96,78 @@ export async function isAuthenticated(
         const auth = getAuth(req);
         const email = (auth.sessionClaims?.email as string) || "";
 
+        // Log the attempt with detailed information
+        logger.info(`Attempting to create user ${userId}`, {
+          userId,
+          email: email || "No email found in session claims",
+          sessionClaims: auth.sessionClaims,
+        });
+
+        if (!email) {
+          logger.error(`No email found for user ${userId} in session claims`);
+          throw new Error("No email found in session claims");
+        }
+
+        // First check if the FREE tier exists
+        const freeTier = await prisma.subscriptionTier.findUnique({
+          where: { tierId: "FREE" },
+        });
+
+        if (!freeTier) {
+          logger.error(
+            `Free tier not found in database, attempting to create user without tier reference`
+          );
+
+          // Create the user without tier reference as a fallback
+          try {
+            user = await prisma.user.create({
+              data: {
+                id: userId,
+                email: email,
+                firstName: null,
+                lastName: null,
+                password: "", // Empty password since we're using Clerk for auth
+                role: "USER", // Default role
+                subscriptionStatus: "TRIALING", // Default status
+                // Skip currentTierId since the tier doesn't exist
+              },
+            });
+
+            logger.info(
+              `Successfully created user ${userId} in database without tier reference`
+            );
+
+            // Create initial listing credit for new user
+            await prisma.listingCredit.create({
+              data: {
+                userId: user.id,
+                creditsRemaining: 1, // Default to 1 since we don't have tier info
+              },
+            });
+
+            logger.info(
+              `Successfully created listing credit for user ${userId}`
+            );
+
+            // Continue with the request
+            req.user = { id: userId };
+            next();
+            return; // Exit early since we've already called next()
+          } catch (fallbackError) {
+            logger.error(`Fallback user creation failed for ${userId}`, {
+              error:
+                fallbackError instanceof Error
+                  ? fallbackError.message
+                  : "Unknown error",
+              stack:
+                fallbackError instanceof Error
+                  ? fallbackError.stack
+                  : undefined,
+            });
+            throw new Error("Free tier not found and fallback creation failed");
+          }
+        }
+
         // Create the user with minimal information
         user = await prisma.user.create({
           data: {
@@ -107,31 +178,49 @@ export async function isAuthenticated(
             password: "", // Empty password since we're using Clerk for auth
             role: "USER", // Default role
             subscriptionStatus: "TRIALING", // Default status
-            currentTierId: SubscriptionTierId.FREE, // Set initial tier
+            currentTierId: "FREE", // Use the string enum value directly
           },
         });
+
+        logger.info(`Successfully created user ${userId} in database`);
 
         // Create initial listing credit for new user
         await prisma.listingCredit.create({
           data: {
             userId: user.id,
-            creditsRemaining: 1,
+            creditsRemaining: freeTier.creditsPerInterval || 1,
           },
         });
 
-        logger.info(`Successfully created user ${userId} in database`);
+        logger.info(`Successfully created listing credit for user ${userId}`);
       } catch (createError) {
-        logger.error(
-          `Failed to create user ${userId} in database`,
-          createError
+        logger.error(`Failed to create user ${userId} in database`, {
+          error:
+            createError instanceof Error
+              ? createError.message
+              : "Unknown error",
+          stack: createError instanceof Error ? createError.stack : undefined,
+        });
+
+        // EMERGENCY FALLBACK: Allow the request to proceed even if user creation fails
+        // This is a temporary measure to prevent blocking users in production
+        logger.warn(
+          `EMERGENCY FALLBACK: Allowing request to proceed for user ${userId} despite creation failure`
         );
-        throw new AuthError(401, "User not found and could not be created");
+        req.user = { id: userId };
+        next();
+        return; // Exit early since we've already called next()
       }
     }
 
     req.user = { id: userId };
     next();
   } catch (error) {
+    logger.error(`Authentication error in isAuthenticated middleware`, {
+      error: error instanceof Error ? error.message : "Unknown error",
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+
     if (error instanceof AuthError) {
       res.status(error.statusCode).json({ error: error.message });
     } else {
