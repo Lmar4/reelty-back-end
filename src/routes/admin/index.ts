@@ -7,6 +7,7 @@ import bulkDiscountRoutes from "./bulk-discount.js";
 import agencyRoutes from "./agency.js";
 import subscriptionTiersRoutes from "./subscription-tiers.js";
 import templatesRoutes from "./templates.js";
+import creditsRoutes from "./credits.js";
 
 const router = express.Router();
 
@@ -18,5 +19,6 @@ router.use("/bulk-discounts", bulkDiscountRoutes);
 router.use("/agencies", agencyRoutes);
 router.use("/subscription-tiers", subscriptionTiersRoutes);
 router.use("/templates", templatesRoutes);
+router.use("/credits", creditsRoutes);
 
 export default router;

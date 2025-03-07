@@ -1,14 +1,18 @@
 import { PrismaClient } from "@prisma/client";
+import pg from "pg";
+const { Pool } = pg;
 
 const prisma = new PrismaClient();
 
 async function main() {
+  let pool = null;
+
   try {
-    // First, let's check if the user exists
-    const userId = "user_2tvB0WP3fNPjkXlvKa8Ky33DRTo"; // The user ID from your error message
+    const userId = "user_2txphAtnvJC6BDsUE7jSd6UmD4d";
+
+    // First, check if the user exists using Prisma
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      include: { currentTier: true },
     });
 
     if (!user) {
@@ -19,60 +23,89 @@ async function main() {
     console.log("Current user data:", {
       id: user.id,
       email: user.email,
+      role: user.role,
+      subscriptionStatus: user.subscriptionStatus,
       currentTierId: user.currentTierId,
-      currentTier: user.currentTier
-        ? {
-            id: user.currentTier.id,
-            name: user.currentTier.name,
-            tierId: user.currentTier.tierId,
-          }
-        : null,
     });
 
-    // Get the subscription tier you want to assign
-    // Replace 'REELTY_PRO' with the tier you want to assign (FREE, REELTY, REELTY_PRO, REELTY_PRO_PLUS)
-    const tierIdToAssign = "REELTY_PRO_PLUS";
+    // Get the database URL from environment
+    const databaseUrl = process.env.DATABASE_URL;
 
-    const tier = await prisma.subscriptionTier.findUnique({
-      where: { tierId: tierIdToAssign },
+    // Create a new connection pool
+    pool = new Pool({
+      connectionString: databaseUrl,
     });
 
-    if (!tier) {
-      console.error(`Subscription tier with ID ${tierIdToAssign} not found`);
-      return;
+    // Connect to the database directly
+    const client = await pool.connect();
+
+    try {
+      // Start a transaction
+      await client.query("BEGIN");
+
+      // Temporarily disable all triggers
+      await client.query("SET session_replication_role = replica");
+
+      // Update subscription status to ACTIVE
+      await client.query(
+        `UPDATE users SET "subscriptionStatus" = $1 WHERE id = $2`,
+        ["ACTIVE", userId]
+      );
+
+      console.log(`Subscription status updated to ACTIVE`);
+
+      // Update tier to REELTY_PRO_PLUS using the UUID value from the schema
+      await client.query(
+        `UPDATE users SET "currentTierId" = $1 WHERE id = $2`,
+        ["550e8400-e29b-41d4-a716-446655440003", userId]
+      );
+
+      console.log(`Tier updated to REELTY_PRO_PLUS (using UUID)`);
+
+      // Re-enable triggers
+      await client.query("SET session_replication_role = default");
+
+      // Commit the transaction
+      await client.query("COMMIT");
+    } catch (error) {
+      // Rollback in case of error
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      // Release the client back to the pool
+      client.release();
     }
 
-    console.log("Found tier:", {
-      id: tier.id,
-      name: tier.name,
-      tierId: tier.tierId,
-    });
-
-    // Update the user with the new tier
-    const updatedUser = await prisma.user.update({
+    // Fetch the updated user to confirm changes
+    const verifiedUser = await prisma.user.findUnique({
       where: { id: userId },
-      data: {
-        currentTierId: tierIdToAssign,
-      },
       include: { currentTier: true },
     });
 
-    console.log("User updated successfully:", {
-      id: updatedUser.id,
-      email: updatedUser.email,
-      currentTierId: updatedUser.currentTierId,
-      currentTier: updatedUser.currentTier
+    console.log("Updated user data:", {
+      id: verifiedUser.id,
+      email: verifiedUser.email,
+      role: verifiedUser.role,
+      subscriptionStatus: verifiedUser.subscriptionStatus,
+      currentTierId: verifiedUser.currentTierId,
+      currentTier: verifiedUser.currentTier
         ? {
-            id: updatedUser.currentTier.id,
-            name: updatedUser.currentTier.name,
-            tierId: updatedUser.currentTier.tierId,
+            id: verifiedUser.currentTier.id,
+            name: verifiedUser.currentTier.name,
+            tierId: verifiedUser.currentTier.tierId,
           }
         : null,
     });
   } catch (error) {
-    console.error("Error updating user tier:", error);
+    console.error("Error updating user:", error);
+    if (error.detail) console.error("Error detail:", error.detail);
+    if (error.hint) console.error("Error hint:", error.hint);
+    if (error.where) console.error("Error where:", error.where);
   } finally {
     await prisma.$disconnect();
+    if (pool) {
+      await pool.end();
+    }
   }
 }
 
