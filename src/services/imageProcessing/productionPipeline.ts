@@ -1,5 +1,4 @@
 import {
-  DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
   S3Client,
@@ -13,9 +12,9 @@ import {
   VideoGenerationStatus,
 } from "@prisma/client";
 import crypto from "crypto";
-import { createReadStream } from "fs";
-import fs from "fs/promises";
 import ffmpeg, { FfprobeData, FfprobeStream } from "fluent-ffmpeg"; // Include the types
+import { existsSync } from "fs";
+import fs from "fs/promises";
 import pLimit from "p-limit";
 import path from "path";
 import sharp from "sharp";
@@ -24,29 +23,21 @@ import { logger } from "../../utils/logger.js";
 import { streamToBuffer } from "../../utils/streamToBuffer.js";
 import { AssetManager } from "../assets/asset-manager.js";
 import { AssetCacheService } from "../cache/assetCache.js";
+import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
 import { mapCaptureService } from "../map-capture/map-capture.service.js";
-import { resourceManager, ResourceState } from "../storage/resource-manager.js";
 import { S3Service } from "../storage/s3.service.js";
 import { runwayService } from "../video/runway.service.js";
 import { S3VideoService } from "../video/s3-video.service.js";
 import {
-  videoProcessingService,
   VideoClip,
+  videoProcessingService,
 } from "../video/video-processing.service.js";
+import { WatermarkConfig } from "../video/video-template.service.js";
 import { reelTemplates, TemplateKey } from "./templates/types.js";
 import {
   ImageOptimizationOptions,
   VisionProcessor,
 } from "./visionProcessor.js";
-import {
-  VideoTemplate,
-  WatermarkConfig,
-} from "../video/video-template.service.js";
-import { existsSync } from "fs";
-import { VideoTemplateService } from "../video/video-template.service.js";
-import { ReelTemplate } from "./templates/types.js";
-import { ffmpegQueueManager } from "../ffmpegQueueManager.js";
-import { subscriptionService } from "../subscription/subscription.service.js";
 
 const ALL_TEMPLATES: TemplateKey[] = [
   "crescendo",
@@ -70,6 +61,7 @@ interface ProductionPipelineInput {
   allTemplates?: boolean;
   skipLock?: boolean;
   forceRegeneration?: boolean;
+  runwayPromptText?: string; // Add optional prompt text field
   metadata?: {
     processedTemplates?: {
       key: string;
@@ -95,6 +87,7 @@ interface RegenerationContext {
   }>;
   regeneratedPhotoIds: string[];
   totalPhotos: number;
+  runwayPromptText?: string; // Add optional prompt text field, default will be "Stable camera"
 }
 
 interface JobProgress {
@@ -560,14 +553,16 @@ export class ProductionPipeline {
     index: number,
     listingId: string,
     jobId: string,
-    attempt = 1
+    attempt: number = 1,
+    promptText?: string // Add optional promptText parameter
   ): Promise<RunwayGenerationResult | null> {
     try {
       const result = await runwayService.generateVideo(
         inputUrl,
         index,
         listingId,
-        jobId
+        jobId,
+        promptText // Pass the promptText
       );
       return {
         s3Url: result,
@@ -580,6 +575,7 @@ export class ProductionPipeline {
         error,
         inputUrl,
         index,
+        promptText: promptText || "default", // Log which prompt was used
       });
 
       if (attempt < this.MAX_RUNWAY_RETRIES) {
@@ -590,7 +586,8 @@ export class ProductionPipeline {
           index,
           listingId,
           jobId,
-          attempt + 1
+          attempt + 1,
+          promptText // Pass the promptText during retries
         );
       }
 
@@ -605,6 +602,7 @@ export class ProductionPipeline {
       isRegeneration?: boolean;
       forceRegeneration?: boolean;
       regenerationContext?: RegenerationContext;
+      runwayPromptText?: string; // Add optional prompt text
     }
   ): Promise<string[]> {
     const job = await this.prisma.videoJob.findUnique({
@@ -613,10 +611,19 @@ export class ProductionPipeline {
     });
     if (!job?.listingId) throw new Error("Job or listingId not found");
 
+    // Extract the prompt text from options
+    // Use "Stable camera" as the default for regenerations, otherwise use the provided prompt or let the RunwayService use its default
+    const promptText = options?.isRegeneration
+      ? options?.regenerationContext?.runwayPromptText ||
+        options?.runwayPromptText ||
+        "Stable camera"
+      : options?.runwayPromptText;
+
     logger.info(`[${jobId}] Processing ${inputFiles.length} runway videos`, {
       indices: inputFiles.map((_, i) => i),
       isRegeneration: options?.isRegeneration,
       forceRegeneration: options?.forceRegeneration,
+      runwayPromptText: promptText || "default", // Log which prompt is being used
       activeFFmpegJobs: ffmpegQueueManager.getActiveCount(),
     });
 
@@ -647,7 +654,15 @@ export class ProductionPipeline {
       const maxRetries = 3; // 3 retries for Runway generation
 
       const result = await ffmpegQueueManager.enqueueJob(
-        () => this.retryRunwayGeneration(inputUrl, index, job.listingId, jobId),
+        () =>
+          this.retryRunwayGeneration(
+            inputUrl,
+            index,
+            job.listingId,
+            jobId,
+            1, // Initial attempt
+            promptText // Pass the promptText
+          ),
         timeout,
         maxRetries
       );
@@ -761,7 +776,8 @@ export class ProductionPipeline {
         allPhotos
           .filter((p) => p.runwayVideoPath)
           .map((p) => [p.order, p.runwayVideoPath!])
-      )
+      ),
+      options?.isRegeneration || false // Pass isRegeneration parameter
     );
   }
 
@@ -2198,8 +2214,12 @@ export class ProductionPipeline {
       regenerationContext,
       coordinates,
       listingId: inputListingId,
+      runwayPromptText, // Extract runwayPromptText from input
     } = input;
-    logger.info(`[${jobId}] Pipeline execution started`, { input });
+    logger.info(`[${jobId}] Pipeline execution started`, {
+      input,
+      runwayPromptText: runwayPromptText || "default", // Log which prompt is being used
+    });
 
     if (isRegeneration && regenerationContext) {
       const updatedJob = await this.prisma.videoJob.update({
@@ -2273,6 +2293,7 @@ export class ProductionPipeline {
         isRegeneration,
         forceRegeneration,
         regenerationContext,
+        runwayPromptText, // Pass runwayPromptText to options
       };
 
       if (!input.skipRunwayIfCached) {
@@ -3303,12 +3324,18 @@ export class ProductionPipeline {
       order: number;
       runwayVideoPath: string | null;
     }>,
-    verifiedVideos: Map<number, string>
+    verifiedVideos: Map<number, string>,
+    isRegeneration: boolean = false // Add isRegeneration parameter
   ): Promise<string[]> {
+    // Use "Stable camera" as the default for regenerations, otherwise use the provided prompt
+    const promptText = isRegeneration ? "Stable camera" : "Move forward slowly";
+
     logger.info(`[${jobId}] Starting normal processing flow`, {
       inputFilesCount: inputFiles.length,
       existingPhotosCount: existingPhotos.length,
       verifiedVideosCount: verifiedVideos.size,
+      isRegeneration,
+      runwayPromptText: promptText,
     });
 
     // Initialize array to hold runway videos with the same length as inputFiles
@@ -3340,7 +3367,9 @@ export class ProductionPipeline {
           input,
           index,
           listingId,
-          jobId
+          jobId,
+          1, // Initial attempt (number)
+          promptText // Pass the promptText (string)
         );
 
         if (!result?.s3Url) {

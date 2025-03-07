@@ -133,15 +133,21 @@ export class RunwayService {
     imageUrl: string,
     index: number,
     listingId: string,
-    jobId: string
+    jobId: string,
+    promptText?: string
   ): Promise<string> {
     try {
-      // Create task with retry
+      // Create task with retry, passing the promptText
       const taskId = await this.retryWithBackoff(
-        () => this.createTask(imageUrl, index),
+        () => this.createTask(imageUrl, index, promptText),
         "Task creation"
       );
-      logger.info("Task created on Runway:", { taskId, listingId, jobId });
+      logger.info("Task created on Runway:", {
+        taskId,
+        listingId,
+        jobId,
+        promptText,
+      });
 
       // Poll for completion
       const status = await this.pollTaskStatus(taskId);
@@ -175,8 +181,46 @@ export class RunwayService {
     }
   }
 
-  private async createTask(imageUrl: string, index: number): Promise<string> {
-    logger.info("Starting video generation:", { imageUrl, index });
+  private validatePromptText(promptText?: string): string {
+    if (!promptText) {
+      return "Move forward slowly"; // Default prompt for normal processing
+    }
+
+    // Trim and limit length (Runway might have specific limits)
+    let sanitizedPrompt = promptText.trim();
+
+    // Enforce maximum length (adjust as needed based on Runway's limits)
+    const MAX_PROMPT_LENGTH = 500;
+    if (sanitizedPrompt.length > MAX_PROMPT_LENGTH) {
+      logger.warn(`Prompt text exceeds maximum length, truncating`, {
+        originalLength: sanitizedPrompt.length,
+        maxLength: MAX_PROMPT_LENGTH,
+      });
+      sanitizedPrompt = sanitizedPrompt.substring(0, MAX_PROMPT_LENGTH);
+    }
+
+    // Ensure prompt is not empty after trimming
+    if (sanitizedPrompt.length === 0) {
+      return "Move forward slowly"; // Default prompt for normal processing
+    }
+
+    return sanitizedPrompt;
+  }
+
+  private async createTask(
+    imageUrl: string,
+    index: number,
+    promptText?: string
+  ): Promise<string> {
+    // Validate the prompt text
+    const validatedPrompt = this.validatePromptText(promptText);
+
+    logger.info("Starting video generation:", {
+      imageUrl,
+      index,
+      promptText: validatedPrompt,
+      originalPrompt: promptText || "default",
+    });
 
     try {
       let imageBuffer: Buffer;
@@ -200,7 +244,7 @@ export class RunwayService {
       const imageToVideo = await this.client.imageToVideo.create({
         model: "gen3a_turbo",
         promptImage: dataUrl,
-        promptText: "Move forward slowly",
+        promptText: validatedPrompt,
         duration: 5,
         ratio: "768:1280",
       });
