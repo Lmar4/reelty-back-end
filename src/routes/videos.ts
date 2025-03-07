@@ -171,4 +171,53 @@ router.post(
   }
 );
 
+// Add a new endpoint to get the user's download count
+router.get("/download-count", isAuthenticated, async (req, res) => {
+  try {
+    const userId = req.user?.id;
+
+    if (!userId) {
+      res.status(401).json({
+        success: false,
+        error: "Unauthorized",
+      });
+      return;
+    }
+
+    // Get the user's download count
+    const downloadCount = await prisma.videoDownload.count({
+      where: {
+        userId,
+      },
+    });
+
+    // Get the user's subscription tier
+    const user = await prisma.user.findUnique({
+      where: {
+        id: userId,
+      },
+      include: {
+        currentTier: true,
+      },
+    });
+
+    const maxDownloads = user?.currentTier?.maxReelDownloads || 1;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        downloadCount,
+        maxDownloads,
+        remainingDownloads: Math.max(0, maxDownloads - downloadCount),
+      },
+    });
+  } catch (error) {
+    logger.error("Error getting download count", { error });
+    res.status(500).json({
+      success: false,
+      error: "Failed to get download count",
+    });
+  }
+});
+
 export { router as videosRouter };
