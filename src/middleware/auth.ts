@@ -2,6 +2,7 @@ import { getAuth } from "@clerk/express";
 import type { NextFunction, Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { logger } from "../utils/logger.js";
+import { SubscriptionTierId } from "@prisma/client";
 
 // Extend Request type to include user property
 declare global {
@@ -197,7 +198,7 @@ export async function isAuthenticated(
             password: "", // Empty password since we're using Clerk for auth
             role: "USER", // Default role
             subscriptionStatus: "TRIALING", // Default status
-            currentTierId: "FREE", // Use the string enum value directly
+            currentTierId: SubscriptionTierId.FREE, // Use the enum value instead of string
           },
         });
 

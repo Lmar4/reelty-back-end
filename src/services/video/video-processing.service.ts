@@ -506,121 +506,55 @@ export class VideoProcessingService {
     if (!clips.length) return null;
 
     const filterCommands: ffmpeg.FilterSpecification[] = [];
-    let lastOutput = "";
 
-    // Check if we're processing a complex template like googlezoomintro
-    const isComplexTemplate = clips.some((clip) => clip.isMapVideo);
-
-    // For complex templates, use a more optimized filter graph
-    if (isComplexTemplate) {
-      logger.info(
-        `Using optimized filter graph for complex template with ${clips.length} clips`
-      );
-
-      // Process each clip with minimal operations
-      clips.forEach((clip, i) => {
-        // Simple trim operation
-        filterCommands.push({
-          filter: "trim",
-          options: `duration=${clip.duration}`,
-          inputs: [`${i}:v`],
-          outputs: [`v${i}`],
-        });
-
-        // Set PTS
-        filterCommands.push({
-          filter: "setpts",
-          options: "PTS-STARTPTS",
-          inputs: [`v${i}`],
-          outputs: [`pts${i}`],
-        });
-
-        // Apply minimal color correction based on clip type
-        // Map videos get no color correction to preserve quality
-        const colorOptions = clip.isMapVideo
-          ? "contrast=1.0:brightness=0.0:saturation=1.0" // Neutral for map videos
-          : "contrast=1.05:brightness=0.02:saturation=1.1"; // Minimal for regular clips
-
-        filterCommands.push({
-          filter: "eq",
-          options: colorOptions,
-          inputs: [`pts${i}`],
-          outputs: [`color${i}`],
-        });
-      });
-
-      // Simple concatenation
-      const concatInputs = clips.map((_, i) => `color${i}`);
+    // Process each clip
+    clips.forEach((clip, i) => {
+      // Trim operation
       filterCommands.push({
-        filter: "concat",
-        options: `n=${clips.length}:v=1:a=0`,
-        inputs: concatInputs,
-        outputs: ["vconcat"],
+        filter: "trim",
+        options: `duration=${clip.duration}`,
+        inputs: [`${i}:v`],
+        outputs: [`v${i}`],
       });
 
-      lastOutput = "vconcat";
-    } else {
-      // Original more complex filter graph for non-complex templates
-      clips.forEach((clip, i) => {
-        const baseInput = `${i}:v`;
-        let currentOutput = "";
-
-        // Trim
-        filterCommands.push({
-          filter: "trim",
-          options: `duration=${clip.duration}`,
-          inputs: [baseInput],
-          outputs: [`v${i}`],
-        });
-
-        // Set PTS
-        filterCommands.push({
-          filter: "setpts",
-          options: "PTS-STARTPTS",
-          inputs: [`v${i}`],
-          outputs: [`pts${i}`],
-        });
-
-        // Apply color correction if specified
-        currentOutput = `color${i}`;
-        if (clip.colorCorrection?.ffmpegFilter) {
-          filterCommands.push({
-            filter: "eq",
-            options: clip.colorCorrection.ffmpegFilter,
-            inputs: [`pts${i}`],
-            outputs: [currentOutput],
-          });
-        } else {
-          // Default color correction
-          filterCommands.push({
-            filter: "eq",
-            options: "contrast=1.05:brightness=0.02:saturation=1.1",
-            inputs: [`pts${i}`],
-            outputs: [currentOutput],
-          });
-        }
-      });
-
-      // Concatenation for standard templates
-      const concatInputs = clips.map((_, i) => `color${i}`);
+      // Set PTS
       filterCommands.push({
-        filter: "concat",
-        options: `n=${clips.length}:v=1:a=0`,
-        inputs: concatInputs,
-        outputs: ["vconcat"],
+        filter: "setpts",
+        options: "PTS-STARTPTS",
+        inputs: [`v${i}`],
+        outputs: [`pts${i}`],
       });
 
-      lastOutput = "vconcat";
-    }
+      // Apply color correction based on clip type
+      const colorOptions = clip.isMapVideo
+        ? "contrast=1.0:brightness=0.0:saturation=1.0" // Neutral for map videos
+        : "contrast=1.05:brightness=0.02:saturation=1.1"; // Standard for regular clips
+
+      filterCommands.push({
+        filter: "eq",
+        options: colorOptions,
+        inputs: [`pts${i}`],
+        outputs: [`color${i}`],
+      });
+    });
+
+    // Concatenation
+    const concatInputs = clips.map((_, i) => `color${i}`);
+    filterCommands.push({
+      filter: "concat",
+      options: `n=${clips.length}:v=1:a=0`,
+      inputs: concatInputs,
+      outputs: ["vconcat"],
+    });
+
+    let lastOutput = "vconcat";
 
     // Add audio if available
     if (musicIndex !== undefined && musicIndex >= 0) {
+      const totalDuration = clips.reduce((sum, clip) => sum + clip.duration, 0);
       filterCommands.push({
         filter: "atrim",
-        options: `duration=${clips.reduce(
-          (sum, clip) => sum + clip.duration,
-          0
-        )}`,
+        options: `duration=${totalDuration}`,
         inputs: [`${musicIndex}:a`],
         outputs: ["atrimmed"],
       });
@@ -654,7 +588,13 @@ export class VideoProcessingService {
         inputs: [lastOutput, `${watermarkIndex}:v`],
         outputs: ["vout"],
       });
-      lastOutput = "vout";
+    } else {
+      // If no watermark, rename the last output to "vout" for consistency
+      filterCommands.push({
+        filter: "null",
+        inputs: [lastOutput],
+        outputs: ["vout"],
+      });
     }
 
     return filterCommands;
@@ -1461,27 +1401,57 @@ export class VideoProcessingService {
             const sequenceValue = isReelTemplate
               ? (reelTemplate.sequence[index] as string | number)
               : index;
+
             // Try to get duration using the sequence value first, then fall back to index
-            duration =
-              durations[sequenceValue as keyof typeof durations] ||
-              durations[index as keyof typeof durations] ||
-              clip.duration;
+            // Handle both string and number keys properly
+            if (
+              sequenceValue !== undefined &&
+              typeof durations === "object" &&
+              !Array.isArray(durations) &&
+              sequenceValue in durations
+            ) {
+              // Direct lookup when sequenceValue is a valid key
+              duration = durations[sequenceValue as keyof typeof durations];
+            } else if (
+              typeof index === "number" &&
+              typeof durations === "object" &&
+              !Array.isArray(durations) &&
+              String(index) in durations
+            ) {
+              // Try index as string key (for objects with string number keys like "0", "1")
+              duration = durations[String(index) as keyof typeof durations];
+            } else if (
+              typeof index === "number" &&
+              typeof durations === "object" &&
+              !Array.isArray(durations) &&
+              index in durations
+            ) {
+              // Try index as numeric key
+              duration = durations[index as keyof typeof durations];
+            } else {
+              // Fall back to clip's original duration
+              duration = clip.duration;
+            }
           }
         } else {
           duration = clip.duration;
         }
 
-        // Log the duration assignment for debugging
+        // Add detailed logging
         logger.debug(
           `[${jobId}] Assigning duration for clip at position ${index}`,
           {
             clipIndex: index,
             sequenceValue: isReelTemplate
               ? reelTemplate.sequence[index]
-              : undefined,
+              : index,
             assignedDuration: duration,
             originalDuration: clip.duration,
             isMapVideo: clip.isMapVideo,
+            durationType: typeof durations,
+            isArray: Array.isArray(durations),
+            availableKeys:
+              typeof durations === "object" ? Object.keys(durations) : [],
           }
         );
 
@@ -1550,7 +1520,7 @@ export class VideoProcessingService {
       ) || [];
     command
       .complexFilter(filterCommands)
-      .outputOptions(["-map", "[vconcat]"])
+      .outputOptions(["-map", "[vout]"])
       .outputOptions(musicIndex !== -1 ? ["-map", "[aout]"] : [])
       .outputOptions([
         "-c:v",
