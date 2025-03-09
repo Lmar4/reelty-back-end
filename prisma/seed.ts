@@ -203,7 +203,7 @@ async function main() {
     },
     // Lifetime Access Plan
     {
-      tierId: SubscriptionTierId.REELTY_PRO,
+      tierId: "LIFETIME" as SubscriptionTierId,
       name: "Reelty Lifetime",
       description: "Lifetime access. Available to the first 100 users.",
       stripePriceId: "price_reelty_lifetime",

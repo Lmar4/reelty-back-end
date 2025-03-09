@@ -3,6 +3,7 @@ import {
   SubscriptionTier,
   PlanType,
   SubscriptionStatus,
+  SubscriptionTierId,
 } from "@prisma/client";
 import Stripe from "stripe";
 
@@ -14,13 +15,6 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", {
 });
 
 const prisma = new PrismaClient();
-
-export enum SubscriptionTierId {
-  FREE = "FREE",
-  REELTY = "REELTY",
-  REELTY_PRO = "REELTY_PRO",
-  REELTY_PRO_PLUS = "REELTY_PRO_PLUS",
-}
 
 export interface PlanMetadata {
   features: string[];
@@ -216,7 +210,7 @@ export class PlansService {
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 0,
         credits: 1,
-        tierId: SubscriptionTierId.FREE,
+        tierId: "FREE" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: false,
@@ -232,7 +226,7 @@ export class PlansService {
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 59,
         credits: 1,
-        tierId: SubscriptionTierId.REELTY,
+        tierId: "REELTY" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -246,7 +240,7 @@ export class PlansService {
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 236,
         credits: 4,
-        tierId: SubscriptionTierId.REELTY,
+        tierId: "REELTY" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -260,7 +254,7 @@ export class PlansService {
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 590,
         credits: 10,
-        tierId: SubscriptionTierId.REELTY_PRO,
+        tierId: "REELTY_PRO" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -275,7 +269,7 @@ export class PlansService {
         type: "MONTHLY" as PlanType,
         price: 39,
         creditsPerInterval: 1,
-        tierId: SubscriptionTierId.REELTY,
+        tierId: "REELTY" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -290,7 +284,7 @@ export class PlansService {
         type: "MONTHLY" as PlanType,
         price: 129,
         creditsPerInterval: 4,
-        tierId: SubscriptionTierId.REELTY_PRO,
+        tierId: "REELTY_PRO" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -305,7 +299,7 @@ export class PlansService {
         type: "MONTHLY" as PlanType,
         price: 249,
         creditsPerInterval: 10,
-        tierId: SubscriptionTierId.REELTY_PRO_PLUS,
+        tierId: "REELTY_PRO_PLUS" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -315,13 +309,13 @@ export class PlansService {
           savePercentage: 34,
         },
       },
-      // Lifetime Access Plan
+      // Lifetime Access Plan for Beta Testers
       {
         name: "Reelty Lifetime",
         type: "PAY_AS_YOU_GO" as PlanType,
         price: 249,
         credits: 24, // 2 listings per month for 12 months
-        tierId: SubscriptionTierId.REELTY_PRO,
+        tierId: "LIFETIME" as SubscriptionTierId,
         features: {
           maxPhotosPerListing: 20,
           unlimitedDownloads: true,
@@ -331,6 +325,7 @@ export class PlansService {
           maxReelsPerListing: 6,
           earlyAccess: true,
           referralProgram: true,
+          betaTester: true,
         },
       },
     ];
@@ -420,6 +415,41 @@ export class PlansService {
         userId,
         oldStatus,
         newStatus,
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      throw error;
+    }
+  }
+
+  // Track and limit lifetime plan signups
+  async getLifetimePlanAvailability(): Promise<{
+    available: boolean;
+    count: number;
+    limit: number;
+  }> {
+    const LIFETIME_PLAN_LIMIT = 100; // Limit to first 100 beta testers
+
+    try {
+      // Count users with lifetime plan
+      const lifetimeSubscriptionsCount = await prisma.subscription.count({
+        where: {
+          tier: {
+            tierId: "LIFETIME" as SubscriptionTierId,
+          },
+          status: {
+            in: ["ACTIVE", "TRIALING"],
+          },
+          deletedAt: null,
+        },
+      });
+
+      return {
+        available: lifetimeSubscriptionsCount < LIFETIME_PLAN_LIMIT,
+        count: lifetimeSubscriptionsCount,
+        limit: LIFETIME_PLAN_LIMIT,
+      };
+    } catch (error) {
+      logger.error("Error checking lifetime plan availability", {
         error: error instanceof Error ? error.message : "Unknown error",
       });
       throw error;

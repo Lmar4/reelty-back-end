@@ -108,8 +108,7 @@ export class SubscriptionService {
       if (input.name || input.description || input.monthlyPriceCents) {
         await plansService.syncPlan(
           {
-            tierId:
-              input.tierId as import("../stripe/plans.service.js").SubscriptionTierId,
+            tierId: input.tierId as SubscriptionTierId,
             name: input.name,
             description: input.description,
             monthlyPriceCents: input.monthlyPriceCents,

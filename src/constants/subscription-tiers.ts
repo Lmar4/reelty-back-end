@@ -3,6 +3,7 @@ export const SUBSCRIPTION_TIERS = {
   REELTY: "550e8400-e29b-41d4-a716-446655440001", // Basic/Reelty tier
   REELTY_PRO: "550e8400-e29b-41d4-a716-446655440002", // Pro tier
   REELTY_PRO_PLUS: "550e8400-e29b-41d4-a716-446655440003", // Pro+ tier
+  LIFETIME: "550e8400-e29b-41d4-a716-446655440004", // Lifetime tier for beta testers
 } as const;
 
 export type SubscriptionTierId =
@@ -32,6 +33,8 @@ export const getMaxUsersForTier = (id: SubscriptionTierId): number => {
       return 1;
     case SUBSCRIPTION_TIERS.FREE:
       return 1;
+    case SUBSCRIPTION_TIERS.LIFETIME:
+      return 1;
     default:
       return 1;
   }
@@ -48,6 +51,8 @@ export const getCreditsForTier = (id: SubscriptionTierId): number => {
       return 1; // 1 credit per month
     case SUBSCRIPTION_TIERS.FREE:
       return 0; // No credits
+    case SUBSCRIPTION_TIERS.LIFETIME:
+      return 24; // 24 credits (2 per month for a year)
     default:
       return 0;
   }

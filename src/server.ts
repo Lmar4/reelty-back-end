@@ -16,6 +16,7 @@ import clerkWebhookRouter from "./routes/webhooks/clerk.js";
 import { videosRouter } from "./routes/videos.js";
 import { logger } from "./utils/logger.js";
 import v8 from "v8";
+import { initializeJobs } from "./jobs/index.js";
 
 logger.info("V8 Heap Space Statistics", v8.getHeapSpaceStatistics());
 const app = express();
@@ -102,4 +103,7 @@ app.use((err: Error, _req: Request, res: Response, _next: Function) => {
 // Start server
 app.listen(port, "0.0.0.0", () => {
   logger.info(`Server started on port ${port}`);
+
+  // Initialize scheduled jobs
+  initializeJobs();
 });

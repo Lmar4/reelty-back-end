@@ -803,6 +803,31 @@ const ensureTier = async (req: Request, res: Response) => {
   }
 };
 
+// Get lifetime plan availability
+const getLifetimePlanAvailability = async (_req: Request, res: Response) => {
+  try {
+    const { plansService } = await import(
+      "../services/stripe/plans.service.js"
+    );
+    const availability = await plansService.getLifetimePlanAvailability();
+    res.json(createApiResponse(true, availability));
+  } catch (error) {
+    console.error("Error checking lifetime plan availability:", error);
+    res
+      .status(500)
+      .json(
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          error instanceof Error
+            ? error.message
+            : "Failed to check lifetime plan availability"
+        )
+      );
+  }
+};
+
 // Route handlers
 router.get("/tiers", getTiers);
 router.patch(
@@ -843,5 +868,10 @@ router.get("/current", isAuthenticated, getCurrentSubscription);
 router.get("/invoices", isAuthenticated, getInvoices);
 router.get("/usage", isAuthenticated, getUsageStats);
 router.post("/ensure-tier", isAuthenticated, ensureTier);
+router.get(
+  "/lifetime-availability",
+  isAuthenticated,
+  getLifetimePlanAvailability
+);
 
 export default router;
