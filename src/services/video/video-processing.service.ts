@@ -696,8 +696,9 @@ export class VideoProcessingService {
     };
 
     // Extract FFmpeg specific error messages for better diagnostics
+    let errorLines: string[] = [];
     if (errorDetails.stderr) {
-      const errorLines = errorDetails.stderr
+      errorLines = errorDetails.stderr
         .split("\n")
         .filter(
           (line) =>
@@ -740,6 +741,34 @@ export class VideoProcessingService {
         ? ffmpegQueueManager.getQueueLength()
         : "unknown",
       timestamp: new Date().toISOString(),
+      // Add system metrics for better debugging
+      systemInfo: {
+        platform: process.platform,
+        arch: process.arch,
+        nodeVersion: process.version,
+        cpuCount: os.cpus().length,
+        totalMemory: `${Math.round(os.totalmem() / 1024 / 1024)} MB`,
+        freeMemory: `${Math.round(os.freemem() / 1024 / 1024)} MB`,
+        uptime: process.uptime(),
+      },
+    });
+
+    // Create a structured error object for logging elsewhere
+    const structuredError = {
+      message: error.message,
+      type: (errorDetails as any).errorType || "FFMPEG_ERROR",
+      details: errorLines?.length ? errorLines.join("\n") : error.message,
+      context,
+      systemState: {
+        memory: this.getMemoryUsageInfo(),
+        activeJobs: ffmpegQueueManager?.getActiveCount() || 0,
+        queuedJobs: ffmpegQueueManager?.getQueueLength() || 0,
+      },
+    };
+
+    // Log the structured error for easier consumption by other services
+    logger.error(`[video-processing] Structured error for ${context}`, {
+      structuredError,
     });
   }
 

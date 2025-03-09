@@ -81,38 +81,53 @@ const manageUserCredits = async (
 // Get users handler
 const getUsers = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Extract query parameters for filtering/pagination if needed
-    const { page = 1, limit = 20, search } = req.query;
+    const { page = "1", limit = "10", search = "" } = req.query;
 
-    // Build the query
-    const where: Prisma.UserWhereInput = {};
-
-    if (search && typeof search === "string") {
-      where.OR = [
-        {
-          email: { contains: search, mode: "insensitive" as Prisma.QueryMode },
-        },
-        {
-          firstName: {
-            contains: search,
-            mode: "insensitive" as Prisma.QueryMode,
+    // Build where clause for search
+    let where: Prisma.UserWhereInput = {};
+    if (search) {
+      where = {
+        OR: [
+          {
+            email: {
+              contains: search as string,
+              mode: "insensitive" as Prisma.QueryMode,
+            },
           },
-        },
-        {
-          lastName: {
-            contains: search,
-            mode: "insensitive" as Prisma.QueryMode,
+          {
+            firstName: {
+              contains: search as string,
+              mode: "insensitive" as Prisma.QueryMode,
+            },
           },
-        },
-      ];
+          {
+            lastName: {
+              contains: search as string,
+              mode: "insensitive" as Prisma.QueryMode,
+            },
+          },
+        ],
+      };
     }
 
     // Get users with pagination
     const users = await prisma.user.findMany({
       where,
       include: {
-        currentTier: true,
-        listingCredits: true,
+        subscriptions: {
+          where: {
+            status: {
+              not: "INACTIVE",
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            tier: true,
+          },
+        },
       },
       skip: (Number(page) - 1) * Number(limit),
       take: Number(limit),
@@ -122,18 +137,33 @@ const getUsers = async (req: Request, res: Response, next: NextFunction) => {
     });
 
     // Transform the data to match the AdminUser type expected by the frontend
-    const transformedUsers = users.map((user) => ({
-      ...user,
-      credits: user.listingCredits?.[0]?.creditsRemaining || 0,
-    }));
+    const transformedUsers = users.map(async (user) => {
+      const activeSubscription = user.subscriptions[0];
+
+      // Get credits separately
+      const credits = await prisma.listingCredit.findFirst({
+        where: { userId: user.id },
+        orderBy: { createdAt: "desc" },
+      });
+
+      return {
+        ...user,
+        credits: credits?.creditsRemaining || 0,
+        currentTier: activeSubscription?.tier || null,
+      };
+    });
+
+    // Resolve all promises
+    const resolvedUsers = await Promise.all(transformedUsers);
 
     res.json({
       success: true,
       data: {
-        data: transformedUsers,
+        data: resolvedUsers,
         pagination: {
           page: Number(page),
           limit: Number(limit),
+          total: await prisma.user.count({ where }),
         },
       },
     });
@@ -155,7 +185,15 @@ const getUserById = async (req: Request, res: Response, next: NextFunction) => {
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
-        currentTier: true,
+        subscriptions: {
+          include: {
+            tier: true,
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+        },
         listingCredits: true,
         subscriptionHistory: {
           include: {
@@ -165,13 +203,18 @@ const getUserById = async (req: Request, res: Response, next: NextFunction) => {
             startDate: "desc",
           },
         },
-        creditLogs: {
-          orderBy: {
-            createdAt: "desc",
-          },
-          take: 10,
-        },
       },
+    });
+
+    // Get credit logs separately
+    const creditLogs = await prisma.creditLog.findMany({
+      where: {
+        userId: userId,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+      take: 10,
     });
 
     if (!user) {
@@ -182,11 +225,12 @@ const getUserById = async (req: Request, res: Response, next: NextFunction) => {
       return;
     }
 
-    res.json({
+    res.status(200).json({
       success: true,
       data: {
         ...user,
         credits: user.listingCredits?.[0]?.creditsRemaining || 0,
+        creditLogs: creditLogs,
       },
     });
   } catch (error) {

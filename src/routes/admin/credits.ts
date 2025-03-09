@@ -92,12 +92,21 @@ const getUserCreditDetails: RequestHandler = async (req, res) => {
     const [user, creditLogs, listingCredits] = await Promise.all([
       prisma.user.findUnique({
         where: { id: userId },
-        select: {
-          id: true,
-          email: true,
-          firstName: true,
-          lastName: true,
-          currentTier: true,
+        include: {
+          subscriptions: {
+            where: {
+              status: {
+                not: "INACTIVE",
+              },
+            },
+            orderBy: {
+              createdAt: "desc",
+            },
+            take: 1,
+            include: {
+              tier: true,
+            },
+          },
         },
       }),
       prisma.creditLog.findMany({
@@ -121,21 +130,27 @@ const getUserCreditDetails: RequestHandler = async (req, res) => {
     ]);
 
     if (!user) {
-      res.status(404).json({ error: `User with ID ${userId} not found` });
+      res.status(404).json({ error: "User not found" });
       return;
     }
 
-    // Calculate total available credits
-    const totalCredits = listingCredits.reduce(
-      (sum, credit) => sum + credit.creditsRemaining,
-      0
-    );
+    // Get the active subscription and tier
+    const activeSubscription = user.subscriptions[0];
+    const currentTier = activeSubscription?.tier || null;
 
     res.json({
-      user,
-      creditLogs,
-      listingCredits,
-      totalCredits,
+      success: true,
+      data: {
+        user: {
+          id: user.id,
+          email: user.email,
+          firstName: user.firstName,
+          lastName: user.lastName,
+          currentTier,
+        },
+        creditLogs,
+        listingCredits,
+      },
     });
   } catch (error) {
     logger.error("Error fetching user credit details:", error);

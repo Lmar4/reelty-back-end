@@ -1,4 +1,8 @@
-import { PrismaClient, VideoGenerationStatus, SubscriptionStatus } from "@prisma/client";
+import {
+  PrismaClient,
+  VideoGenerationStatus,
+  SubscriptionStatus,
+} from "@prisma/client";
 import express from "express";
 import { format, subDays } from "date-fns";
 import { isAdmin as requireAdmin } from "../../middleware/auth.js";
@@ -19,9 +23,14 @@ async function getVideoAnalytics(_req: express.Request, res: express.Response) {
 
     const processingStats = {
       total: jobs.length,
-      success: jobs.filter((job) => job.status === VideoGenerationStatus.COMPLETED).length,
-      failed: jobs.filter((job) => job.status === VideoGenerationStatus.FAILED).length,
-      inProgress: jobs.filter((job) => job.status === VideoGenerationStatus.PROCESSING).length,
+      success: jobs.filter(
+        (job) => job.status === VideoGenerationStatus.COMPLETED
+      ).length,
+      failed: jobs.filter((job) => job.status === VideoGenerationStatus.FAILED)
+        .length,
+      inProgress: jobs.filter(
+        (job) => job.status === VideoGenerationStatus.PROCESSING
+      ).length,
     };
 
     // Calculate daily jobs
@@ -84,57 +93,77 @@ async function getRevenueAnalytics(
   try {
     const users = await prisma.user.findMany({
       include: {
-        currentTier: true,
+        activeSubscription: {
+          include: {
+            tier: true,
+          },
+        },
       },
-      where: {
-        subscriptionStatus: SubscriptionStatus.ACTIVE
-      }
     });
 
-    const totalRevenue = users.reduce(
-      (sum: number, user) => sum + (user.currentTier?.monthlyPrice || 0),
+    // Filter users with active subscriptions
+    const activeUsers = users.filter(
+      (user) =>
+        user.activeSubscription && user.activeSubscription.status === "ACTIVE"
+    );
+
+    const totalRevenue = activeUsers.reduce(
+      (sum: number, user) =>
+        sum + (user.activeSubscription?.tier?.monthlyPriceCents || 0) / 100,
       0
     );
 
     const subscriptionStats = {
-      active: users.filter((user) => user.subscriptionStatus === SubscriptionStatus.ACTIVE).length,
-      cancelled: users.filter((user) => user.subscriptionStatus === SubscriptionStatus.CANCELED).length,
+      active: activeUsers.length,
+      cancelled: users.filter(
+        (user) => user.activeSubscription?.status === "CANCELED"
+      ).length,
       total: users.length,
     };
 
-    const revenueByTier = users.reduce((acc: Array<{tier: string, count: number, revenue: number}>, user) => {
-      if (!user.currentTier) return acc;
+    const revenueByTier = activeUsers.reduce(
+      (acc: Array<{ tier: string; count: number; revenue: number }>, user) => {
+        if (!user.activeSubscription?.tier) return acc;
 
-      const existing = acc.find((t) => t.tier === user.currentTier?.name);
-      if (existing) {
-        existing.count++;
-        existing.revenue += user.currentTier.monthlyPrice;
-      } else {
-        acc.push({
-          tier: user.currentTier.name,
-          count: 1,
-          revenue: user.currentTier.monthlyPrice,
-        });
-      }
+        const existing = acc.find(
+          (t) => t.tier === user.activeSubscription?.tier?.name
+        );
+        if (existing) {
+          existing.count++;
+          existing.revenue +=
+            user.activeSubscription.tier.monthlyPriceCents / 100;
+        } else {
+          acc.push({
+            tier: user.activeSubscription.tier.name,
+            count: 1,
+            revenue: user.activeSubscription.tier.monthlyPriceCents / 100,
+          });
+        }
+        return acc;
+      },
+      []
+    );
 
-      return acc;
-    }, []);
+    // Calculate revenue by date (last 30 days)
+    const revenueByDate = activeUsers.reduce(
+      (acc: Array<{ date: string; revenue: number }>, user) => {
+        const date = new Date().toISOString().split("T")[0]; // Today's date
+        const existing = acc.find((d) => d.date === date);
 
-    const dailyRevenue = users.reduce((acc: Array<{date: string, revenue: number}>, user) => {
-      const date = format(user.createdAt, "yyyy-MM-dd");
-      const existing = acc.find((d) => d.date === date);
-
-      if (existing) {
-        existing.revenue += user.currentTier?.monthlyPrice || 0;
-      } else {
-        acc.push({
-          date,
-          revenue: user.currentTier?.monthlyPrice || 0,
-        });
-      }
-
-      return acc;
-    }, []);
+        if (existing) {
+          existing.revenue +=
+            (user.activeSubscription?.tier?.monthlyPriceCents || 0) / 100;
+        } else {
+          acc.push({
+            date,
+            revenue:
+              (user.activeSubscription?.tier?.monthlyPriceCents || 0) / 100,
+          });
+        }
+        return acc;
+      },
+      []
+    );
 
     res.json({
       success: true,
@@ -142,7 +171,7 @@ async function getRevenueAnalytics(
         totalRevenue,
         subscriptionStats,
         revenueByTier,
-        dailyRevenue,
+        revenueByDate,
       },
     });
   } catch (error) {
@@ -186,7 +215,7 @@ async function getCreditAnalytics(
         acc.push({
           type: credit.reason,
           total: credit.amount,
-          count: 1
+          count: 1,
         });
       }
       return acc;
@@ -299,7 +328,7 @@ async function getRecentActivity(_req: express.Request, res: express.Response) {
 
     interface Activity {
       id: string;
-      type: 'video' | 'subscription' | 'credit';
+      type: "video" | "subscription" | "credit";
       description: string;
       user: { email: string };
       createdAt: string;

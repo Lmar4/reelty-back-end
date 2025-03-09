@@ -15,91 +15,80 @@ async function checkExpiredSubscriptions() {
   try {
     logger.info("Starting expired subscription check");
 
-    // Find users with CANCELED status and expired period end date
-    const expiredUsers = await prisma.user.findMany({
+    // Find subscriptions with CANCELED status and expired period end date
+    const expiredSubscriptions = await prisma.subscription.findMany({
       where: {
-        subscriptionStatus: "CANCELED",
-        subscriptionPeriodEnd: {
+        status: SubscriptionStatus.CANCELED,
+        currentPeriodEnd: {
           lt: new Date(), // Less than current date
         },
-        currentTierId: {
+        tierId: {
           not: SubscriptionTierId.FREE,
         },
-        // Ensure currentTierId is not null
-        NOT: {
-          currentTierId: null,
-        },
       },
-      select: {
-        id: true,
-        email: true,
-        currentTierId: true,
-        subscriptionPeriodEnd: true,
+      include: {
+        user: true,
       },
     });
 
     logger.info(
-      `Found ${expiredUsers.length} users with expired subscriptions`
+      `Found ${expiredSubscriptions.length} subscriptions with expired period end`
     );
 
-    // Process each expired user
-    for (const user of expiredUsers) {
-      logger.info(`Downgrading user ${user.email} to FREE tier`, {
-        userId: user.id,
-        oldTier: user.currentTierId,
-        periodEnd: user.subscriptionPeriodEnd,
+    // Get the FREE tier
+    const freeTier = await prisma.subscriptionTier.findUnique({
+      where: { tierId: SubscriptionTierId.FREE },
+    });
+
+    if (!freeTier) {
+      throw new Error("FREE tier not found in database");
+    }
+
+    // Process each expired subscription
+    for (const subscription of expiredSubscriptions) {
+      logger.info(`Downgrading user ${subscription.user.email} to FREE tier`, {
+        userId: subscription.userId,
+        oldTier: subscription.tierId,
+        periodEnd: subscription.currentPeriodEnd,
       });
 
-      // Update user to FREE tier and INACTIVE status
-      await prisma.user.update({
-        where: { id: user.id },
+      // Update the subscription to FREE tier
+      await prisma.subscription.update({
+        where: { id: subscription.id },
         data: {
-          currentTierId: SubscriptionTierId.FREE,
-          subscriptionStatus: "INACTIVE",
+          tierId: freeTier.id,
+          status: SubscriptionStatus.INACTIVE,
         },
       });
 
       // Log the tier change
       await prisma.tierChange.create({
         data: {
-          userId: user.id,
-          oldTier: user.currentTierId as string,
+          userId: subscription.userId,
+          oldTier: subscription.tierId,
           newTier: SubscriptionTierId.FREE,
-          reason: "Subscription period ended (scheduled job)",
+          reason: "Subscription expired",
         },
       });
 
       // Log the subscription change
       await prisma.subscriptionLog.create({
         data: {
-          userId: user.id,
-          action: "DOWNGRADED_TO_FREE_SCHEDULED",
-          stripeSubscriptionId: "scheduled_job",
-          status: "INACTIVE",
+          userId: subscription.userId,
+          action: "SUBSCRIPTION_EXPIRED",
+          stripeSubscriptionId: subscription.stripeSubscriptionId || "expired",
+          status: SubscriptionStatus.INACTIVE,
         },
       });
     }
 
-    logger.info("Completed expired subscription check");
-    return expiredUsers.length;
+    logger.info("Expired subscription check completed");
   } catch (error) {
-    logger.error("Error checking expired subscriptions", { error });
-    throw error;
+    logger.error("Error checking expired subscriptions:", error);
   } finally {
     await prisma.$disconnect();
   }
 }
 
-// Run the check
-checkExpiredSubscriptions()
-  .then((count) => {
-    logger.info(`Processed ${count} expired subscriptions`);
-    process.exit(0);
-  })
-  .catch((error) => {
-    logger.error("Error checking expired subscriptions", { error });
-    process.exit(1);
-  });
-
-// For manual testing or one-time runs
-export { checkExpiredSubscriptions };
+// Run the script
+checkExpiredSubscriptions();

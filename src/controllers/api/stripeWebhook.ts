@@ -30,93 +30,96 @@ function mapStripeStatus(status: string): SubscriptionStatus {
 // Helper function to handle subscription updates
 async function handleSubscriptionUpdated(subscription: Stripe.Subscription) {
   try {
+    const status = mapStripeStatus(subscription.status);
+    const customerId = subscription.customer as string;
+    const subscriptionId = subscription.id;
+    const priceId = subscription.items.data[0]?.price.id;
+    const productId = subscription.items.data[0]?.price.product as string;
+
     // Find user by Stripe customer ID
     const user = await prisma.user.findFirst({
-      where: { stripeCustomerId: subscription.customer as string },
-      include: { currentTier: true },
+      where: {
+        subscriptions: {
+          some: {
+            stripeCustomerId: customerId,
+          },
+        },
+      },
+      include: {
+        subscriptions: {
+          where: {
+            stripeSubscriptionId: subscriptionId,
+          },
+          include: {
+            tier: true,
+          },
+        },
+      },
     });
 
     if (!user) {
-      logger.error("No user found with Stripe customer ID", {
-        customerId: subscription.customer,
-      });
+      logger.error(`No user found with Stripe customer ID ${customerId}`);
       return;
     }
 
-    // Map Stripe status to our status
-    const subscriptionStatus = mapStripeStatus(subscription.status);
+    const existingSubscription = user.subscriptions[0];
 
-    // Get the price ID from the subscription
-    const priceId = subscription.items.data[0]?.price.id;
-
-    // Find the corresponding tier for this price
-    const tier = priceId
-      ? await prisma.subscriptionTier.findUnique({
-          where: { stripePriceId: priceId },
-        })
-      : null;
-
-    // If no tier found, log error but continue with status update
-    if (!tier && priceId) {
-      logger.error("No tier found for price ID", { priceId });
+    if (!existingSubscription) {
+      logger.error(
+        `No subscription found for user ${user.id} with Stripe subscription ID ${subscriptionId}`
+      );
+      return;
     }
 
-    // Prepare update data
-    const updateData: any = {
-      subscriptionStatus,
-      stripeSubscriptionId: subscription.id,
-      stripePriceId: priceId || null,
-      subscriptionPeriodEnd: new Date(subscription.current_period_end * 1000),
-    };
-
-    // Only update tier if we found one
-    if (tier) {
-      updateData.currentTierId = tier.tierId;
-    }
-
-    // Update user with new status and tier if available
-    await prisma.user.update({
-      where: { id: user.id },
-      data: updateData,
+    // Find the subscription tier by Stripe price ID
+    const tier = await prisma.subscriptionTier.findFirst({
+      where: { stripePriceId: priceId },
     });
 
-    // Log the subscription change
-    await prisma.subscriptionLog.create({
+    // Update the subscription
+    await prisma.subscription.update({
+      where: { id: existingSubscription.id },
       data: {
-        userId: user.id,
-        action: "SUBSCRIPTION_UPDATED",
-        stripeSubscriptionId: subscription.id,
-        stripePriceId: priceId || null,
-        status: subscriptionStatus,
-        periodEnd: new Date(subscription.current_period_end * 1000),
+        status,
+        stripeSubscriptionId: subscriptionId,
+        stripePriceId: priceId,
+        tierId: tier?.id || existingSubscription.tierId,
+        currentPeriodEnd: subscription.current_period_end
+          ? new Date(subscription.current_period_end * 1000)
+          : undefined,
+        canceledAt: subscription.canceled_at
+          ? new Date(subscription.canceled_at * 1000)
+          : null,
       },
     });
 
     // If tier changed, log it
-    if (tier && user.currentTierId !== tier.tierId) {
+    if (tier && existingSubscription.tierId !== tier.id) {
       await prisma.tierChange.create({
         data: {
           userId: user.id,
-          oldTier: user.currentTierId || SubscriptionTierId.FREE,
+          oldTier: existingSubscription.tierId,
           newTier: tier.tierId,
           reason: "Stripe subscription update",
         },
       });
     }
 
-    // If subscription is canceled, schedule a job to downgrade to FREE tier when period ends
-    if (subscriptionStatus === "CANCELED") {
-      logger.info(
-        "Subscription canceled, will downgrade to FREE tier after period end",
-        {
-          userId: user.id,
-          periodEnd: new Date(subscription.current_period_end * 1000),
-        }
-      );
-    }
+    // Log the subscription update
+    await prisma.subscriptionLog.create({
+      data: {
+        userId: user.id,
+        action: "UPDATED_FROM_STRIPE",
+        stripeSubscriptionId: subscriptionId,
+        stripePriceId: priceId,
+        stripeProductId: productId,
+        status,
+      },
+    });
+
+    logger.info(`Updated subscription for user ${user.id}`);
   } catch (error) {
-    logger.error("Error handling subscription update", { error });
-    throw error;
+    logger.error("Error handling subscription update:", error);
   }
 }
 
@@ -125,36 +128,56 @@ async function checkSubscriptionStatus(userId: string) {
   try {
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        id: true,
-        subscriptionStatus: true,
-        subscriptionPeriodEnd: true,
-        currentTierId: true,
+      include: {
+        activeSubscription: {
+          include: {
+            tier: true,
+          },
+        },
       },
     });
 
-    if (!user) return;
+    if (!user || !user.activeSubscription) return;
 
     // If subscription is canceled and period has ended, downgrade to FREE tier
     if (
-      user.subscriptionStatus === "CANCELED" &&
-      user.subscriptionPeriodEnd &&
-      user.subscriptionPeriodEnd < new Date() &&
-      user.currentTierId !== SubscriptionTierId.FREE
+      user.activeSubscription.status === "CANCELED" &&
+      user.activeSubscription.currentPeriodEnd &&
+      user.activeSubscription.currentPeriodEnd < new Date() &&
+      user.activeSubscription.tier.tierId !== SubscriptionTierId.FREE
     ) {
+      // Find the FREE tier
+      const freeTier = await prisma.subscriptionTier.findFirst({
+        where: { tierId: SubscriptionTierId.FREE },
+      });
+
+      if (!freeTier) {
+        logger.error("FREE tier not found in database");
+        return;
+      }
+
+      // Create a new subscription with FREE tier
+      const newSubscription = await prisma.subscription.create({
+        data: {
+          userId,
+          tierId: freeTier.id,
+          status: "INACTIVE",
+        },
+      });
+
+      // Update user's active subscription
       await prisma.user.update({
         where: { id: userId },
         data: {
-          currentTierId: SubscriptionTierId.FREE,
-          subscriptionStatus: "INACTIVE",
+          activeSubscriptionId: newSubscription.id,
         },
       });
 
       await prisma.tierChange.create({
         data: {
           userId,
-          oldTier: user.currentTierId || SubscriptionTierId.FREE,
-          newTier: SubscriptionTierId.FREE,
+          oldTier: user.activeSubscription.tierId,
+          newTier: freeTier.id,
           reason: "Subscription period ended",
         },
       });
@@ -259,21 +282,23 @@ export async function handleStripeWebhook(
             tier.planType === "MONTHLY" &&
             tier.creditsPerInterval > 0
           ) {
-            const user = await prisma.user.findFirst({
-              where: { stripeCustomerId: subscription.customer as string },
+            // Find the user by looking up the subscription with this Stripe subscription ID
+            const existingSubscription = await prisma.subscription.findFirst({
+              where: { stripeSubscriptionId: subscription.id },
+              include: { user: true },
             });
 
-            if (user) {
+            if (existingSubscription && existingSubscription.user) {
               await prisma.$transaction(async (tx) => {
                 await tx.listingCredit.create({
                   data: {
-                    userId: user.id,
+                    userId: existingSubscription.user.id,
                     creditsRemaining: tier.creditsPerInterval,
                   },
                 });
                 await tx.creditLog.create({
                   data: {
-                    userId: user.id,
+                    userId: existingSubscription.user.id,
                     amount: tier.creditsPerInterval,
                     reason: `Initial credits from ${tier.name} subscription`,
                   },
@@ -288,35 +313,31 @@ export async function handleStripeWebhook(
 
       case "customer.subscription.deleted": {
         const subscription = stripeEvent.data.object as Stripe.Subscription;
-        const customerId = subscription.customer as string;
 
-        const user = await prisma.user.findFirst({
-          where: { stripeCustomerId: customerId },
+        // Find the subscription and associated user
+        const existingSubscription = await prisma.subscription.findFirst({
+          where: { stripeSubscriptionId: subscription.id },
+          include: { user: true },
         });
 
-        if (!user) {
-          logger.error("User not found for customer ID:", customerId);
-          return {
-            statusCode: 400,
-            body: JSON.stringify({ error: "User not found" }),
-          };
-        }
+        if (!existingSubscription || !existingSubscription.user) break;
 
-        // Update user's subscription status but keep the tier until period ends
-        await prisma.user.update({
-          where: { id: user.id },
+        const user = existingSubscription.user;
+
+        // Update the subscription status
+        await prisma.subscription.update({
+          where: { id: existingSubscription.id },
           data: {
-            subscriptionStatus: "CANCELED",
-            stripeSubscriptionId: null,
-            stripePriceId: null,
+            status: "CANCELED",
+            canceledAt: new Date(),
           },
         });
 
-        // Create subscription history entry for cancellation
+        // Create a subscription history record
         await prisma.subscriptionHistory.create({
           data: {
             userId: user.id,
-            tierId: user.currentTierId!,
+            tierId: existingSubscription.tierId,
             status: "CANCELED",
             startDate: new Date(),
             endDate: new Date(subscription.current_period_end * 1000),
@@ -345,29 +366,33 @@ export async function handleStripeWebhook(
           invoice.subscription as string
         );
 
-        const user = await prisma.user.findFirst({
-          where: { stripeCustomerId: invoice.customer as string },
-          include: { currentTier: true },
+        // Find the subscription and associated user
+        const existingSubscription = await prisma.subscription.findFirst({
+          where: { stripeSubscriptionId: subscription.id },
+          include: {
+            user: true,
+            tier: true,
+          },
         });
 
-        if (!user || !user.currentTier) break;
+        if (
+          !existingSubscription ||
+          !existingSubscription.user ||
+          !existingSubscription.tier
+        )
+          break;
 
-        const currentTier = user.currentTier; // Store tier reference to avoid null checks
+        const user = existingSubscription.user;
+        const tier = existingSubscription.tier;
 
         // Only add credits for monthly subscriptions
-        if (
-          currentTier.planType === "MONTHLY" &&
-          currentTier.creditsPerInterval > 0
-        ) {
+        if (tier.planType === "MONTHLY" && tier.creditsPerInterval > 0) {
           await prisma.$transaction(async (tx) => {
-            const creditsToAdd = currentTier.creditsPerInterval;
-            const tierName = currentTier.name;
-
-            // Add new credits
+            // Add credits to the user
             await tx.listingCredit.create({
               data: {
                 userId: user.id,
-                creditsRemaining: creditsToAdd,
+                creditsRemaining: tier.creditsPerInterval,
               },
             });
 
@@ -375,23 +400,12 @@ export async function handleStripeWebhook(
             await tx.creditLog.create({
               data: {
                 userId: user.id,
-                amount: creditsToAdd,
-                reason: `Monthly credits from ${tierName} subscription`,
+                amount: tier.creditsPerInterval,
+                reason: `Monthly credits from ${tier.name} subscription`,
               },
             });
           });
         }
-
-        // Log the successful payment
-        await prisma.subscriptionLog.create({
-          data: {
-            userId: user.id,
-            action: "payment.succeeded",
-            stripeSubscriptionId: subscription.id,
-            status: "ACTIVE",
-            periodEnd: user.subscriptionPeriodEnd,
-          },
-        });
 
         break;
       }
@@ -400,28 +414,30 @@ export async function handleStripeWebhook(
         const invoice = stripeEvent.data.object as Stripe.Invoice;
         if (!invoice.subscription) break;
 
-        const user = await prisma.user.findFirst({
-          where: { stripeCustomerId: invoice.customer as string },
+        // Find the subscription and associated user
+        const existingSubscription = await prisma.subscription.findFirst({
+          where: { stripeSubscriptionId: invoice.subscription as string },
+          include: { user: true },
         });
 
-        if (!user) break;
+        if (!existingSubscription || !existingSubscription.user) break;
 
-        // Update user's subscription status
-        await prisma.user.update({
-          where: { id: user.id },
+        // Update subscription status
+        await prisma.subscription.update({
+          where: { id: existingSubscription.id },
           data: {
-            subscriptionStatus: "PAST_DUE",
+            status: "PAST_DUE",
           },
         });
 
         // Log the payment failure
         await prisma.subscriptionLog.create({
           data: {
-            userId: user.id,
+            userId: existingSubscription.user.id,
             action: "payment.failed",
             stripeSubscriptionId: invoice.subscription as string,
             status: "PAST_DUE",
-            periodEnd: user.subscriptionPeriodEnd,
+            periodEnd: existingSubscription.currentPeriodEnd,
           },
         });
 
@@ -435,11 +451,16 @@ export async function handleStripeWebhook(
         if (session.mode !== "payment") break;
 
         const customerId = session.customer as string;
-        const user = await prisma.user.findFirst({
+
+        // Find subscriptions with this customer ID
+        const existingSubscription = await prisma.subscription.findFirst({
           where: { stripeCustomerId: customerId },
+          include: { user: true },
         });
 
-        if (!user) break;
+        if (!existingSubscription || !existingSubscription.user) break;
+
+        const user = existingSubscription.user;
 
         // Get the price ID from the session
         const lineItems = await stripe.checkout.sessions.listLineItems(
@@ -454,34 +475,29 @@ export async function handleStripeWebhook(
           where: { stripePriceId: priceId },
         });
 
-        if (!tier || tier.planType !== "PAY_AS_YOU_GO") break;
+        if (!tier) break;
 
-        const creditAmount = tier.creditsPerInterval; // Pay-as-you-go plans store credits in creditsPerInterval
+        // Process the purchase based on the tier
+        if (tier.planType === "PAY_AS_YOU_GO" && tier.creditsPerInterval > 0) {
+          await prisma.$transaction(async (tx) => {
+            // Add credits to the user
+            await tx.listingCredit.create({
+              data: {
+                userId: user.id,
+                creditsRemaining: tier.creditsPerInterval,
+              },
+            });
 
-        await prisma.$transaction(async (tx) => {
-          // Add credits based on the plan
-          await tx.listingCredit.create({
-            data: {
-              userId: user.id,
-              creditsRemaining: creditAmount,
-            },
+            // Log the credit addition
+            await tx.creditLog.create({
+              data: {
+                userId: user.id,
+                amount: tier.creditsPerInterval,
+                reason: `Credit pack purchase: ${tier.name}`,
+              },
+            });
           });
-
-          // Log the credit addition
-          await tx.creditLog.create({
-            data: {
-              userId: user.id,
-              amount: creditAmount,
-              reason: `Credits purchased from ${tier.name} plan`,
-            },
-          });
-
-          logger.info("[Stripe Webhook] Added pay-as-you-go credits", {
-            userId: user.id,
-            tierName: tier.name,
-            credits: creditAmount,
-          });
-        });
+        }
 
         break;
       }

@@ -108,7 +108,7 @@ export class PlansService {
       // Create new price (Stripe best practice is to create new price and archive old)
       const price = await stripe.prices.create({
         product: product.id,
-        unit_amount: Math.round(tier.monthlyPrice! * 100),
+        unit_amount: Math.round(tier.monthlyPriceCents || 0),
         currency: "usd",
         recurring:
           tier.planType === "MONTHLY" ? { interval: "month" } : undefined,
@@ -129,18 +129,18 @@ export class PlansService {
 
       // Prepare subscription tier data
       const subscriptionTierData = {
-        tierId: tier.tierId,
+        tierId: tier.tierId!,
         name: tier.name,
         description: tier.description,
-        monthlyPrice: tier.monthlyPrice!,
+        monthlyPriceCents: tier.monthlyPriceCents || 0,
         planType: tier.planType || "PAY_AS_YOU_GO",
         creditsPerInterval: tier.creditsPerInterval || 0,
         features: metadata.features,
-        maxPhotosPerListing: tier.maxPhotosPerListing || 20,
-        hasWatermark: tier.hasWatermark ?? true,
-        maxReelDownloads: tier.maxReelDownloads,
-        maxActiveListings: tier.maxActiveListings || 15,
-        premiumTemplatesEnabled: tier.premiumTemplatesEnabled ?? false,
+        maxActiveListings: metadata.maxListings,
+        maxPhotosPerListing: metadata.maxPhotosPerListing,
+        maxReelDownloads: metadata.maxVideosPerMonth,
+        hasWatermark: !metadata.customBranding,
+        premiumTemplatesEnabled: metadata.premiumTemplatesEnabled,
         stripeProductId: product.id,
         stripePriceId: price.id,
       };
@@ -356,7 +356,7 @@ export class PlansService {
         description: `${
           plan.type === "MONTHLY" ? "Monthly subscription with " : ""
         }${credits} credit${credits > 1 ? "s" : ""}`,
-        monthlyPrice: plan.price,
+        monthlyPriceCents: plan.price,
         planType: plan.type,
         creditsPerInterval: credits,
         features: metadata.features,

@@ -1342,12 +1342,34 @@ export class ProductionPipeline {
       // Get the user's subscription tier to determine if watermark should be applied
       const job = await this.prisma.videoJob.findUnique({
         where: { id: jobId },
-        include: { user: { include: { currentTier: true } } },
+        include: {
+          user: {
+            include: {
+              subscriptions: {
+                where: {
+                  status: {
+                    not: "INACTIVE",
+                  },
+                },
+                orderBy: {
+                  createdAt: "desc",
+                },
+                take: 1,
+                include: {
+                  tier: true,
+                },
+              },
+            },
+          },
+        },
       });
 
       // Configure watermark based on user's subscription tier
       let watermarkConfig: WatermarkConfig | undefined;
-      if (job?.user?.currentTier?.hasWatermark) {
+      const activeSubscription = job?.user?.subscriptions?.[0];
+      const currentTier = activeSubscription?.tier;
+
+      if (currentTier?.hasWatermark && job) {
         try {
           // Get watermark asset path
           const watermarkPath = await this.assetManager.getAssetPath(
@@ -1365,8 +1387,8 @@ export class ProductionPipeline {
             `[${jobId}] Watermark will be applied based on subscription tier`,
             {
               userId: job.userId,
-              tierName: job.user.currentTier.name,
-              hasWatermark: job.user.currentTier.hasWatermark,
+              tierName: currentTier.name,
+              hasWatermark: currentTier.hasWatermark,
             }
           );
         } catch (watermarkError) {
@@ -1383,8 +1405,8 @@ export class ProductionPipeline {
           `[${jobId}] No watermark will be applied based on subscription tier`,
           {
             userId: job?.userId,
-            tierName: job?.user?.currentTier?.name,
-            hasWatermark: job?.user?.currentTier?.hasWatermark,
+            tierName: job?.user?.subscriptions?.[0]?.tier?.name,
+            hasWatermark: job?.user?.subscriptions?.[0]?.tier?.hasWatermark,
           }
         );
       }
@@ -1517,31 +1539,29 @@ export class ProductionPipeline {
         throw verificationError;
       }
     } catch (error) {
-      logger.error(`[${jobId}] Error processing template ${template}`, {
-        error: error instanceof Error ? error.message : String(error),
-        stack: error instanceof Error ? error.stack : undefined,
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      logger.error(`[${jobId}] Template processing failed for ${template}`, {
+        error: errorMessage,
+        listingId,
+        template,
       });
 
-      // Clean up local file in case of error
-      try {
-        if (await this.fileExists(outputPath)) {
-          await fs.unlink(outputPath);
-          logger.info(`[${jobId}] Cleaned up local template file after error`, {
-            template,
-            localPath: outputPath,
-          });
-        }
-      } catch (cleanupError) {
-        logger.warn(
-          `[${jobId}] Failed to clean up local template file after error`,
-          {
-            template,
-            localPath: outputPath,
-            error:
-              cleanupError instanceof Error
-                ? cleanupError.message
-                : String(cleanupError),
-          }
+      // Get the user ID from the job
+      const job = await this.prisma.videoGenerationJob.findUnique({
+        where: { id: jobId },
+        select: { userId: true },
+      });
+
+      if (job) {
+        // Log detailed activity with error information
+        await this.logDetailedActivity(
+          jobId,
+          listingId,
+          job.userId,
+          "video",
+          "failed",
+          error
         );
       }
 
@@ -1549,8 +1569,7 @@ export class ProductionPipeline {
         template,
         status: "FAILED",
         outputPath: null,
-        error: error instanceof Error ? error.message : String(error),
-        processingTime: Date.now() - startTime,
+        error: errorMessage,
       };
     }
   }
@@ -2465,37 +2484,36 @@ export class ProductionPipeline {
 
       return templateResults[0];
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      const errorStack = error instanceof Error ? error.stack : undefined;
-      logger.error(`[${jobId}] Pipeline execution failed`, {
-        error: errorMessage,
-        stack: errorStack,
-        input,
-        timestamp: new Date().toISOString(),
+      // Get the job to access userId
+      const job = await this.prisma.videoGenerationJob.findUnique({
+        where: { id: input.jobId },
+        select: { userId: true },
       });
 
-      await this.prisma.videoJob.update({
-        where: { id: jobId },
+      // Update job status to FAILED
+      await this.prisma.videoGenerationJob.update({
+        where: { id: input.jobId },
         data: {
-          status: VideoGenerationStatus.FAILED,
-          error: errorMessage,
-          metadata: {
-            errorDetails: {
-              message: errorMessage,
-              stack: errorStack,
-              timestamp: new Date().toISOString(),
-            },
-            isRegeneration,
-            forceRegeneration,
-            regenerationContext: regenerationContext
-              ? JSON.parse(JSON.stringify(regenerationContext))
-              : null,
-            skipRunwayIfCached: input.skipRunwayIfCached,
-            skipLock: input.skipLock,
-          } satisfies Prisma.InputJsonValue,
+          status: "FAILED",
+          error: error instanceof Error ? error.message : String(error),
+          completedAt: new Date(),
         },
       });
+
+      if (job) {
+        // Log detailed activity with error information
+        await this.logDetailedActivity(
+          input.jobId,
+          input.listingId,
+          job.userId, // Now job is defined
+          "video",
+          "failed",
+          error
+        );
+      }
+
+      // ... existing error handling ...
+
       throw error;
     } finally {
       logger.info(`[${jobId}] Starting cleanup sequence`);
@@ -3328,7 +3346,7 @@ export class ProductionPipeline {
     isRegeneration: boolean = false // Add isRegeneration parameter
   ): Promise<string[]> {
     // Use "Stable camera" as the default for regenerations, otherwise use the provided prompt
-    const promptText = isRegeneration ? "Stable camera" : "Move forward slowly";
+    const promptText = isRegeneration ? "Static camera" : "Move forward slowly";
 
     logger.info(`[${jobId}] Starting normal processing flow`, {
       inputFilesCount: inputFiles.length,
@@ -3623,5 +3641,93 @@ export class ProductionPipeline {
       select: { metadata: true },
     });
     return (job?.metadata as any)?.isRegeneration === true;
+  }
+
+  // Add a new method to log detailed activity with error information
+  private async logDetailedActivity(
+    jobId: string,
+    listingId: string | undefined,
+    userId: string,
+    type: "video" | "template",
+    status: "completed" | "failed",
+    error?: any
+  ): Promise<void> {
+    try {
+      // Create a descriptive message
+      let description = `${
+        type.charAt(0).toUpperCase() + type.slice(1)
+      } ${status}`;
+
+      // Create metadata object with detailed error information if available
+      let metadata: Record<string, any> = {};
+
+      if (status === "failed" && error) {
+        // Extract the most useful information from the error
+        metadata = {
+          error:
+            typeof error === "string"
+              ? error
+              : error.message || "Unknown error",
+          jobId,
+          listingId,
+          timestamp: new Date().toISOString(),
+        };
+
+        // Add additional error details if available
+        if (error.type) metadata.errorType = error.type;
+        if (error.details) metadata.details = error.details;
+        if (error.context) metadata.context = error.context;
+        if (error.systemState) metadata.systemState = error.systemState;
+
+        // Add stack trace for non-FFmpeg errors
+        if (error.stack && !error.type) metadata.stack = error.stack;
+      }
+
+      // Log to error logs table
+      await this.prisma.errorLog.create({
+        data: {
+          userId,
+          error: `${description}: ${
+            typeof error === "string" ? error : error.message || "Unknown error"
+          }`,
+          stack: JSON.stringify(metadata),
+        },
+      });
+
+      // Also update the video job with error details
+      if (listingId) {
+        await this.prisma.videoJob.updateMany({
+          where: {
+            userId,
+            listingId,
+            status: { in: ["PENDING", "PROCESSING"] },
+          },
+          data: {
+            error:
+              typeof error === "string"
+                ? error
+                : error.message || "Unknown error",
+            status: "FAILED",
+            metadata: metadata as any,
+          },
+        });
+      }
+
+      logger.info(`Logged ${type} activity`, {
+        jobId,
+        listingId,
+        userId,
+        status,
+        hasErrorDetails: Object.keys(metadata).length > 0,
+      });
+    } catch (logError) {
+      // Don't let logging errors disrupt the main process
+      logger.error(`Failed to log activity`, {
+        error: logError instanceof Error ? logError.message : String(logError),
+        jobId,
+        type,
+        status,
+      });
+    }
   }
 }

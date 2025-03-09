@@ -100,7 +100,11 @@ async function checkUserListingLimit(userId: string): Promise<{
   const user = await prisma.user.findUnique({
     where: { id: userId },
     include: {
-      currentTier: true,
+      activeSubscription: {
+        include: {
+          tier: true,
+        },
+      },
       listings: {
         where: {
           status: "ACTIVE",
@@ -109,13 +113,13 @@ async function checkUserListingLimit(userId: string): Promise<{
     },
   });
 
-  if (!user || !user.currentTier) {
+  if (!user || !user.activeSubscription?.tier) {
     throw new Error("User or subscription tier not found");
   }
 
   const currentCount = user.listings.length;
-  const maxAllowed = user.currentTier.maxActiveListings;
-  const currentTier = user.currentTier.name;
+  const maxAllowed = user.activeSubscription.tier.maxActiveListings;
+  const currentTier = user.activeSubscription.tier.name;
 
   return {
     canCreate: currentCount < maxAllowed,

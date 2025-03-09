@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, SubscriptionStatus } from "@prisma/client";
 import express, { RequestHandler } from "express";
 import { z } from "zod";
 import { isAdmin as requireAdmin } from "../../middleware/auth.js";
@@ -35,7 +35,20 @@ const listUsers: RequestHandler = async (req, res) => {
   try {
     const users = await prisma.user.findMany({
       include: {
-        currentTier: true,
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            tier: true,
+          },
+        },
         subscriptionLogs: true,
       },
     });
@@ -49,7 +62,12 @@ const listUsers: RequestHandler = async (req, res) => {
             creditsRemaining: { gt: 0 },
           },
         });
-        return { ...user, credits: availableCredits };
+        const activeSubscription = user.subscriptions[0];
+        return {
+          ...user,
+          credits: availableCredits,
+          currentTier: activeSubscription?.tier || null,
+        };
       })
     );
 
@@ -58,11 +76,8 @@ const listUsers: RequestHandler = async (req, res) => {
       data: userCredits,
     });
   } catch (error) {
-    console.error("List users error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    console.error("Error fetching users:", error);
+    res.status(500).json({ error: "Failed to fetch users" });
   }
 };
 
@@ -144,37 +159,60 @@ const updateUserStatus: RequestHandler = async (req, res) => {
     const { userId } = req.params;
     const { status } = req.body;
 
-    const user = await prisma.user.update({
+    // Find the user's active subscription
+    const user = await prisma.user.findUnique({
       where: { id: userId },
-      data: {
-        subscriptionStatus: status,
-      },
       include: {
-        currentTier: true,
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+        },
         subscriptionLogs: true,
+      },
+    });
+
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    const activeSubscription = user.subscriptions[0];
+
+    if (activeSubscription) {
+      // Update the subscription status
+      await prisma.subscription.update({
+        where: { id: activeSubscription.id },
+        data: {
+          status: status as SubscriptionStatus,
+        },
+      });
+    }
+
+    // Log the status change
+    await prisma.subscriptionLog.create({
+      data: {
+        userId,
+        action: "STATUS_UPDATED_BY_ADMIN",
+        status,
+        stripeSubscriptionId:
+          activeSubscription?.stripeSubscriptionId || "admin_update",
       },
     });
 
     res.json({
       success: true,
-      data: user,
+      message: "User status updated successfully",
     });
   } catch (error) {
-    console.error("Update status error:", error);
-    if (
-      error instanceof Error &&
-      error.message.includes("Record to update not found")
-    ) {
-      res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
-      return;
-    }
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    console.error("Error updating user status:", error);
+    res.status(500).json({ error: "Failed to update user status" });
   }
 };
 

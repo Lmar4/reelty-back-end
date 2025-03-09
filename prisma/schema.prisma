@@ -7,81 +7,239 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ======== Core User Models ========
+
 model User {
-  id                         String                @id
+  id                         String                @id // Clerk user ID
   email                      String                @unique
   firstName                  String?
   lastName                   String?
-  password                   String
-  stripeCustomerId           String?               @unique
-  stripeSubscriptionId       String?
-  stripePriceId              String?
-  stripeProductId            String?
-  subscriptionPeriodEnd      DateTime?
+  password                   String                // Hashed or empty for Clerk auth
+  role                       UserRole              @default(USER)
   lastLoginAt                DateTime?
   createdAt                  DateTime              @default(now())
   updatedAt                  DateTime              @updatedAt
-  agencyId                   String?
-  role                       UserRole              @default(USER)
-  agencyCurrentUsers         Int?                  @default(0)
-  agencyMaxUsers             Int?
-  agencyName                 String?
-  agencyOwnerId              String?
-  bulkDiscountId             String?               @db.Uuid
-  subscriptionStatus         SubscriptionStatus    @default(INACTIVE)
-  currentTierId              SubscriptionTierId?
+  deletedAt                  DateTime?             @map("deleted_at")
+
+  // Notification preferences
   notificationProductUpdates Boolean               @default(true) @map("notification_product_updates")
   notificationReelsReady     Boolean               @default(true) @map("notification_reels_ready")
-  adminCreditLogs            CreditLog[]           @relation("AdminCreditLogs")
-  creditLogs                 CreditLog[]           @relation("UserCreditLogs")
-  errorLogs                  ErrorLog[]
-  listingCredits             ListingCredit[]
-  listings                   Listing[]
-  photos                     Photo[]
-  searchHistory              SearchHistory[]
-  subscriptionHistory        SubscriptionHistory[]
-  subscriptionLogs           SubscriptionLog[]
-  tempUploads                TempUpload[]
-  adminTierChanges           TierChange[]          @relation("AdminTierChanges")
-  tierChanges                TierChange[]          @relation("UserTierChanges")
+
+  // Subscription management
+  activeSubscriptionId       String?               @unique @map("active_subscription_id") @db.Uuid
+  activeSubscription         Subscription?         @relation("UserActiveSubscription", fields: [activeSubscriptionId], references: [id])
+  subscriptions              Subscription[]        @relation("UserSubscriptions")
+
+  // Agency relationships
+  agencyId                   String?               @map("agency_id")
   agency                     User?                 @relation("AgencyUsers", fields: [agencyId], references: [id])
   agencyUsers                User[]                @relation("AgencyUsers")
-  bulkDiscount               BulkDiscount?         @relation(fields: [bulkDiscountId], references: [id])
-  currentTier                SubscriptionTier?     @relation(fields: [currentTierId], references: [tierId])
-  agencyVideoJobs            VideoGenerationJob[]  @relation("AgencyUsers")
-  videoGenerationJobs        VideoGenerationJob[]  @relation("UserVideoJobs")
+  agencyName                 String?               @map("agency_name")
+  agencyMemberships          AgencyMembership[]    @relation("AgencyMember")
+  ownedAgencies              AgencyMembership[]    @relation("AgencyOwner")
+  agencyInvitations          AgencyInvitation[]
+
+  // Time zone preference
+  timeZone                   String?               @map("time_zone")
+
+  // Content relationships
+  listings                   Listing[]
+  photos                     Photo[]
   videoJobs                  VideoJob[]
+  videoGenerationJobs        VideoGenerationJob[]  @relation("UserVideoJobs")
+  agencyVideoJobs            VideoGenerationJob[]  @relation("AgencyUsers")
   videoDownloads             VideoDownload[]
 
-  @@index([currentTierId])
+  // System logs
+  errorLogs                  ErrorLog[]
+  adminActions               AdminAction[]         @relation("AdminActions")
+  targetedAdminActions       AdminAction[]         @relation("TargetUserActions")
+  searchHistory              SearchHistory[]
+  tempUploads                TempUpload[]
+  consentHistory             UserConsent[]
+
+  // Additional relationships
+  subscriptionTiers          SubscriptionTier[]
+  adminCreditLogs            CreditLog[]           @relation("AdminCreditLogs")
+  userCreditLogs             CreditLog[]           @relation("UserCreditLogs")
+  adminTierChanges           TierChange[]          @relation("AdminTierChanges")
+  userTierChanges            TierChange[]          @relation("UserTierChanges")
+  listingCredits             ListingCredit[]
+  subscriptionLogs           SubscriptionLog[]
+  bulkDiscounts             BulkDiscount[]
+  subscriptionHistory        SubscriptionHistory[]
+
   @@index([agencyId])
-  @@index([bulkDiscountId])
+  @@index([email])
+  @@index([role])
+  @@index([deletedAt])
   @@map("users")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+  AGENCY
+  AGENCY_USER
+}
+
+// ======== Subscription Models ========
+
+model Subscription {
+  id String @id @default(uuid()) @db.Uuid
+
+  // User relationship
+  userId String @map("user_id")
+  user User @relation("UserSubscriptions", fields: [userId], references: [id])
+  activeForUser User? @relation("UserActiveSubscription")
+
+  // Subscription details
+  tierId String @map("tier_id") @db.Uuid
+  tier SubscriptionTier @relation(fields: [tierId], references: [id])
+  status SubscriptionStatus @default(ACTIVE)
+
+  // Billing details
+  stripeCustomerId String? @map("stripe_customer_id")
+  stripeSubscriptionId String? @map("stripe_subscription_id")
+  stripePriceId String? @map("stripe_price_id")
+  customPriceCents Int? @map("custom_price_cents") // Price in cents
+  isGrandfathered Boolean @default(false) @map("is_grandfathered")
+  customFeatures Json? @default("{}") @map("custom_features")
+
+  // EXTRACTED JSON FIELDS for better query performance
+  customMaxListings Int? @map("custom_max_listings")
+  customMaxDownloads Int? @map("custom_max_downloads")
+  customWatermarkUrl String? @map("custom_watermark_url")
+
+  // Time periods
+  startDate DateTime @default(now()) @map("start_date")
+  startDateUtc DateTime @default(now()) @map("start_date_utc")
+  currentPeriodEnd DateTime? @map("current_period_end")
+  currentPeriodEndUtc DateTime? @map("current_period_end_utc")
+  canceledAt DateTime? @map("canceled_at")
+  pausedAt DateTime? @map("paused_at")
+  scheduledResumeAt DateTime? @map("scheduled_resume_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  // Trial information
+  isTrialPeriod Boolean @default(false) @map("is_trial_period")
+  trialStartDate DateTime? @map("trial_start_date")
+  trialEndDate DateTime? @map("trial_end_date")
+  convertedFromTrial Boolean @default(false) @map("converted_from_trial")
+
+  // Credits
+  creditsBalance Int @default(0) @map("credits_balance")
+  creditsPerPeriod Int @default(0) @map("credits_per_period")
+
+  // Agency/team features
+  isAgencySubscription Boolean @default(false) @map("is_agency_subscription")
+  seatsAllocated Int @default(1) @map("seats_allocated")
+  seatsUsed Int @default(0) @map("seats_used")
+
+  // Beta testing
+  isBetaTester Boolean @default(false) @map("is_beta_tester")
+
+  // Subscription change tracking
+  replacedBySubscriptionId String? @map("replaced_by_subscription_id") @db.Uuid
+  replacedSubscriptionId String? @map("replaced_subscription_id") @db.Uuid
+  changeReason String? @map("change_reason")
+
+  // Feature flags (can override tier defaults)
+  hasWatermark Boolean? @map("has_watermark")
+  premiumTemplatesEnabled Boolean? @map("premium_templates_enabled")
+
+  // Enhanced concurrency control
+  version Int @default(0) @map("version")
+  lastModifiedBy String? @map("last_modified_by")
+  lastModifiedReason String? @map("last_modified_reason")
+
+  // Add optimistic locking for credit operations
+  creditOperationLock String? @map("credit_operation_lock")
+  creditLockExpiresAt DateTime? @map("credit_lock_expires_at")
+
+  // Concurrency control & webhook tracking
+  lastWebhookId String? @map("last_webhook_id")
+  lastWebhookType String? @map("last_webhook_type")
+  lastWebhookTimestamp DateTime? @map("last_webhook_timestamp")
+
+  // Resource transfer during tier changes
+  resourceTransferDetails Json? @default("{}") @map("resource_transfer_details")
+  isCorrective Boolean @default(false) @map("is_corrective")
+  priority Int @default(0) @map("priority")
+  timeZone String? @map("time_zone")
+
+  // Related records
+  creditTransactions CreditTransaction[]
+  resourceAllocations ResourceAllocation[]
+  usageRecords UsageRecord[]
+  billingRecords BillingRecord[]
+  overrides SubscriptionOverride[]
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@index([tierId])
+  @@index([status])
+  @@index([deletedAt])
+  @@index([stripeSubscriptionId])
+  @@index([status, currentPeriodEnd]) // For finding subscriptions about to expire
+  @@index([userId, status]) // For finding active subscriptions for a user
+  @@index([customFeatures], type: Gin) // For PostgreSQL GIN index on JSON
+  @@map("subscriptions")
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  CANCELED
+  PAST_DUE
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  TRIALING
+  UNPAID
+  INACTIVE
 }
 
 model SubscriptionTier {
   id                      String                @id @default(uuid()) @db.Uuid
   name                    String                @unique
   description             String
-  stripePriceId           String                @unique
-  stripeProductId         String                @unique
-  features                String[]
-  monthlyPrice            Float
-  createdAt               DateTime              @default(now())
-  updatedAt               DateTime              @updatedAt
-  hasWatermark            Boolean               @default(true) @map("has_watermark")
+  tierId                  SubscriptionTierId    @unique
+
+  // Pricing
+  stripePriceId           String                @unique @map("stripe_price_id")
+  stripeProductId         String                @unique @map("stripe_product_id")
+  monthlyPriceCents       Int                   @map("monthly_price_cents") // Price in cents
+
+  // Plan type
+  planType                PlanType              @default(PAY_AS_YOU_GO) @map("plan_type")
+
+  // Default resource allocations
+  creditsPerInterval      Int                   @default(0) @map("credits_per_interval")
   maxActiveListings       Int                   @default(1) @map("max_active_listings")
   maxPhotosPerListing     Int                   @default(20) @map("max_photos_per_listing")
   maxReelDownloads        Int?                  @map("max_reel_downloads")
-  creditsPerInterval      Int                   @default(0) @map("credits_per_interval")
-  metadata                Json?                 @default("{}")
-  planType                PlanType              @default(PAY_AS_YOU_GO) @map("plan_type")
+
+  // Feature flags
+  hasWatermark            Boolean               @default(true) @map("has_watermark")
   premiumTemplatesEnabled Boolean               @default(false) @map("premium_templates_enabled")
-  tierId                  SubscriptionTierId    @unique
+
+  // Structured features list
+  features                Json                  @default("[]")
+  metadata                Json?                 @default("{}")
+
+  // Relationships
+  subscriptions           Subscription[]
+  templates               Template[]            @relation("TemplateToSubscriptionTier")
   assets                  Asset[]
   subscriptionHistory     SubscriptionHistory[]
   users                   User[]
-  templates               Template[]            @relation("TemplateToSubscriptionTier")
+
+  // Timestamps
+  createdAt               DateTime              @default(now()) @map("created_at")
+  updatedAt               DateTime              @updatedAt @map("updated_at")
 
   @@map("subscription_tiers")
 }
@@ -398,29 +556,492 @@ enum AssetType {
   LOTTIE
 }
 
-enum UserRole {
-  USER
-  ADMIN
-  AGENCY
-  AGENCY_USER
-}
-
-enum SubscriptionStatus {
-  ACTIVE
-  CANCELED
-  INCOMPLETE
-  INCOMPLETE_EXPIRED
-  PAST_DUE
-  TRIALING
-  UNPAID
-  INACTIVE
-}
+// UserRole and SubscriptionStatus enums are defined at the top of the file
 
 enum VideoGenerationStatus {
   PENDING
   PROCESSING
   COMPLETED
   FAILED
+}
+
+// ======== Agency & Team Management ========
+
+model AgencyMembership {
+  id String @id @default(uuid()) @db.Uuid
+  agencyId String @map("agency_id")
+  agency User @relation("AgencyOwner", fields: [agencyId], references: [id])
+  userId String @map("user_id")
+  user User @relation("AgencyMember", fields: [userId], references: [id])
+
+  // Membership details
+  role AgencyRole @default(MEMBER)
+  status MembershipStatus @default(ACTIVE)
+
+  // Enhanced role management
+  isLastOwner Boolean @default(false) @map("is_last_owner")
+  canManageCredits Boolean @default(false) @map("can_manage_credits")
+  canInviteMembers Boolean @default(false) @map("can_invite_members")
+
+  // Resource access fields
+  accessibleResourceTypes String[] @default([]) @map("accessible_resource_types")
+
+  // Member departure handling
+  departureHandled Boolean @default(false) @map("departure_handled")
+  departureNotes String? @map("departure_notes")
+
+  // Resource allocation
+  creditAllocation Int @default(0) @map("credit_allocation")
+  resourceAllocations Json? @default("{}") @map("resource_allocations")
+
+  // History tracking
+  creditTransfers AgencyCreditTransfer[] @relation("SourceMembership")
+  creditReceived AgencyCreditTransfer[] @relation("TargetMembership")
+  roleHistory AgencyRoleHistory[]
+
+  // Timestamps
+  joinedAt DateTime @default(now()) @map("joined_at")
+  leftAt DateTime? @map("left_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([agencyId, userId])
+  @@index([agencyId])
+  @@index([userId])
+  @@index([status])
+  @@map("agency_memberships")
+}
+
+model AgencyInvitation {
+  id String @id @default(uuid()) @db.Uuid
+  agencyId String @map("agency_id")
+  agency User @relation(fields: [agencyId], references: [id])
+
+  // Invitation details
+  email String
+  token String @unique
+  role AgencyRole @default(MEMBER)
+  status InvitationStatus @default(PENDING)
+
+  // Timestamps
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([agencyId])
+  @@index([token])
+  @@index([email])
+  @@index([status])
+  @@map("agency_invitations")
+}
+
+model AgencyCreditTransfer {
+  id String @id @default(uuid()) @db.Uuid
+
+  // Source and target
+  sourceMembershipId String @map("source_membership_id") @db.Uuid
+  sourceMembership AgencyMembership @relation("SourceMembership", fields: [sourceMembershipId], references: [id])
+  targetMembershipId String @map("target_membership_id") @db.Uuid
+  targetMembership AgencyMembership @relation("TargetMembership", fields: [targetMembershipId], references: [id])
+
+  // Transfer details
+  amount Int
+  reason String
+
+  // Admin who initiated transfer
+  initiatedById String @map("initiated_by_id")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([sourceMembershipId])
+  @@index([targetMembershipId])
+  @@map("agency_credit_transfers")
+}
+
+// Add role history tracking
+model AgencyRoleHistory {
+  id String @id @default(uuid()) @db.Uuid
+  membershipId String @map("membership_id") @db.Uuid
+  membership AgencyMembership @relation(fields: [membershipId], references: [id])
+
+  // Role details
+  previousRole AgencyRole @map("previous_role")
+  newRole AgencyRole @map("new_role")
+
+  // Change details
+  changedById String @map("changed_by_id")
+  reason String?
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([membershipId])
+  @@map("agency_role_history")
+}
+
+// Add agency activity log
+model AgencyActivityLog {
+  id String @id @default(uuid()) @db.Uuid
+  agencyId String @map("agency_id")
+
+  // Activity details
+  activityType String @map("activity_type")
+  performedById String @map("performed_by_id")
+  targetId String? @map("target_id")
+  details Json @default("{}")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([agencyId, activityType])
+  @@index([performedById])
+  @@map("agency_activity_logs")
+}
+
+enum AgencyRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum MembershipStatus {
+  ACTIVE
+  SUSPENDED
+  INACTIVE
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+}
+
+// ======== System & Utility Models ========
+
+model AdminAction {
+  id String @id @default(uuid()) @db.Uuid
+  adminId String @map("admin_id")
+  admin User @relation("AdminActions", fields: [adminId], references: [id])
+  targetUserId String? @map("target_user_id")
+  targetUser User? @relation("TargetUserActions", fields: [targetUserId], references: [id])
+
+  // Action details
+  actionType AdminActionType @map("action_type")
+  details Json
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([adminId])
+  @@index([targetUserId])
+  @@index([actionType])
+  @@map("admin_actions")
+}
+
+enum AdminActionType {
+  CREDIT_ADJUSTMENT
+  SUBSCRIPTION_CHANGE
+  USER_ROLE_CHANGE
+  FEATURE_TOGGLE
+  ACCOUNT_SUSPENSION
+  MANUAL_OVERRIDE
+}
+
+model UserConsent {
+  id String @id @default(uuid()) @db.Uuid
+  userId String @map("user_id")
+  user User @relation(fields: [userId], references: [id])
+
+  // Consent details
+  consentType String @map("consent_type")
+  consentVersion String @map("consent_version")
+  consentGiven Boolean
+
+  // IP and user agent for audit
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("user_consents")
+}
+
+// ======== Credit & Resource Management ========
+
+model CreditTransaction {
+  id String @id @default(uuid()) @db.Uuid
+  subscriptionId String @map("subscription_id") @db.Uuid
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+
+  // Transaction details
+  amount Int // Positive for additions, negative for usage
+  balanceAfter Int @map("balance_after")
+  source CreditSource @default(REGULAR)
+  reason String
+  transactionReference String? @unique @map("transaction_reference")
+
+  // Expiration
+  expiresAt DateTime? @map("expires_at")
+  expiredAmount Int? @map("expired_amount")
+
+  // Admin actions
+  adminId String? @map("admin_id")
+
+  // Related resource
+  resourceType ResourceType? @map("resource_type")
+  resourceId String? @map("resource_id")
+
+  // Adjustments and reversals
+  isAdjustment Boolean @default(false) @map("is_adjustment")
+  adjustmentType AdjustmentType? @map("adjustment_type")
+  originalTransactionId String? @map("original_transaction_id") @db.Uuid
+  originalTransaction CreditTransaction? @relation("AdjustmentHistory", fields: [originalTransactionId], references: [id])
+  adjustments CreditTransaction[] @relation("AdjustmentHistory")
+  isFinalized Boolean @default(true) @map("is_finalized")
+
+  // Version for concurrency control
+  version Int @default(0)
+
+  // Additional data
+  metadata Json? @default("{}")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([subscriptionId])
+  @@index([source])
+  @@index([expiresAt])
+  @@index([isAdjustment])
+  @@index([originalTransactionId])
+  @@index([expiresAt, isFinalized]) // For finding credits about to expire
+  @@map("credit_transactions")
+}
+
+enum CreditSource {
+  REGULAR
+  PROMOTIONAL
+  BETA_TESTING
+  COMPENSATION
+  ADMIN_GRANT
+  REFERRAL
+  SUBSCRIPTION_CHANGE
+}
+
+enum AdjustmentType {
+  REFUND
+  CORRECTION
+  REVERSAL
+  COMPENSATION
+}
+
+model ResourceAllocation {
+  id String @id @default(uuid()) @db.Uuid
+  subscriptionId String @map("subscription_id") @db.Uuid
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+
+  // Allocation details
+  allocationType AllocationType @map("allocation_type")
+  resourceType ResourceType @map("resource_type")
+
+  // Allocation amounts
+  totalAllocated Int @map("total_allocated")
+  remaining Int @map("remaining")
+
+  // Time period
+  periodStart DateTime @map("period_start")
+  periodEnd DateTime @map("period_end")
+  periodStartUtc DateTime @map("period_start_utc")
+  periodEndUtc DateTime @map("period_end_utc")
+
+  // Rollover settings
+  allowRollover Boolean @default(false) @map("allow_rollover")
+  rolledOverAmount Int @default(0) @map("rolled_over_amount")
+  maxRolloverAmount Int? @map("max_rollover_amount")
+
+  // Concurrency control
+  processingLock String? @map("processing_lock")
+  processingLockExpiry DateTime? @map("processing_lock_expiry")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([subscriptionId, resourceType, periodStart, periodEnd])
+  @@index([subscriptionId])
+  @@index([resourceType])
+  @@index([periodEnd])
+  @@index([subscriptionId, resourceType, remaining]) // For finding available allocations
+  @@index([periodEnd, allowRollover]) // For finding allocations about to expire that can roll over
+  @@map("resource_allocations")
+}
+
+enum AllocationType {
+  MONTHLY
+  QUARTERLY
+  ANNUAL
+  ONE_TIME
+}
+
+enum ResourceType {
+  LISTING
+  DOWNLOAD
+  PHOTO
+  VIDEO
+  STORAGE
+  API_CALL
+}
+
+// ======== Billing & Payment ========
+
+model UsageRecord {
+  id String @id @default(uuid()) @db.Uuid
+  subscriptionId String @map("subscription_id") @db.Uuid
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+  billingCycleId String @map("billing_cycle_id") @db.Uuid
+  billingCycle BillingCycle @relation(fields: [billingCycleId], references: [id])
+
+  // Usage details
+  resourceType ResourceType @map("resource_type")
+  quantity Int
+
+  // Billing information
+  isBilled Boolean @default(false) @map("is_billed")
+  thresholdCategory String? @map("threshold_category")
+  thresholdValue Int? @map("threshold_value")
+
+  // Partial billing
+  partiallyBilled Boolean @default(false) @map("partially_billed")
+  billedAmount Int @default(0) @map("billed_amount")
+
+  // Related resource
+  resourceId String? @map("resource_id")
+
+  // Timestamps
+  recordedAt DateTime @default(now()) @map("recorded_at")
+
+  @@index([subscriptionId])
+  @@index([billingCycleId])
+  @@index([resourceType])
+  @@index([isBilled])
+  @@map("usage_records")
+}
+
+model BillingCycle {
+  id String @id @default(uuid()) @db.Uuid
+
+  // Cycle details
+  name String @unique
+  startDate DateTime @map("start_date")
+  endDate DateTime @map("end_date")
+  status CycleStatus @default(ACTIVE)
+
+  // Related records
+  usageRecords UsageRecord[]
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([startDate, endDate])
+  @@index([status])
+  @@map("billing_cycles")
+}
+
+enum CycleStatus {
+  ACTIVE
+  CLOSED
+  PROCESSING
+}
+
+model BillingRecord {
+  id String @id @default(uuid()) @db.Uuid
+  subscriptionId String @map("subscription_id") @db.Uuid
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+
+  // Billing details
+  amountCents Int @map("amount_cents") // Amount in cents
+  currency String @default("USD")
+  status BillingStatus @default(PENDING)
+
+  // Related records
+  invoiceId String? @map("invoice_id")
+  paymentIntentId String? @map("payment_intent_id")
+
+  // Adjustments
+  adjustments BillingAdjustment[]
+
+  // Timestamps
+  billingDate DateTime @map("billing_date")
+  paidAt DateTime? @map("paid_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([subscriptionId])
+  @@index([status])
+  @@index([billingDate])
+  @@map("billing_records")
+}
+
+model BillingAdjustment {
+  id String @id @default(uuid()) @db.Uuid
+  billingRecordId String @map("billing_record_id") @db.Uuid
+  billingRecord BillingRecord @relation(fields: [billingRecordId], references: [id])
+
+  // Adjustment details
+  amountCents Int @map("amount_cents") // Amount in cents
+  reason String
+  status AdjustmentStatus @default(PENDING)
+
+  // Admin who created adjustment
+  adminId String @map("admin_id")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([billingRecordId])
+  @@map("billing_adjustments")
+}
+
+enum BillingStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum AdjustmentStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+model SubscriptionOverride {
+  id String @id @default(uuid()) @db.Uuid
+  subscriptionId String @map("subscription_id") @db.Uuid
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+
+  // Override details
+  overrideType String @map("override_type")
+  resourceType String? @map("resource_type")
+  value Json
+  reason String
+  expiresAt DateTime? @map("expires_at")
+
+  // Admin who created override
+  adminId String @map("admin_id")
+
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([subscriptionId])
+  @@index([expiresAt])
+  @@map("subscription_overrides")
 }
 
 enum PlanType {

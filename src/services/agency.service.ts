@@ -26,8 +26,6 @@ export class AgencyService {
       data: {
         role: UserRole.AGENCY,
         agencyName: data.name,
-        agencyMaxUsers: data.maxUsers,
-        agencyCurrentUsers: 0,
       },
     });
 
@@ -47,37 +45,35 @@ export class AgencyService {
       throw new Error("Agency not found");
     }
 
-    if (agency.role !== UserRole.AGENCY) {
-      throw new Error("Specified user is not an agency");
-    }
-
-    if ((agency.agencyCurrentUsers || 0) >= (agency.agencyMaxUsers || 0)) {
+    // Check if agency has reached max users
+    // Use a constant or configuration value for max users
+    const MAX_AGENCY_USERS = 10;
+    if (agency.agencyUsers.length >= MAX_AGENCY_USERS) {
       throw new Error("Agency has reached maximum number of users");
     }
 
-    // Update user to be part of agency
-    const updatedUser = await this.prisma.user.update({
+    // Check if user is already in agency
+    const isUserInAgency = agency.agencyUsers.some(
+      (user) => user.id === userId
+    );
+
+    if (isUserInAgency) {
+      throw new Error("User is already in agency");
+    }
+
+    // Add user to agency
+    const user = await this.prisma.user.update({
       where: { id: userId },
       data: {
-        role: UserRole.AGENCY_USER,
-        agencyId: agencyId,
+        agencyId,
       },
     });
 
-    // Increment agency user count
-    await this.prisma.user.update({
-      where: { id: agencyId },
-      data: {
-        agencyCurrentUsers: {
-          increment: 1,
-        },
-      },
-    });
-
-    return updatedUser;
+    return user;
   }
 
   async removeUserFromAgency(userId: string): Promise<User> {
+    // Get user first
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
@@ -85,26 +81,19 @@ export class AgencyService {
       },
     });
 
-    if (!user || !user.agencyId) {
-      throw new Error("User not found or not part of an agency");
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    if (!user.agencyId) {
+      throw new Error("User is not part of an agency");
     }
 
     // Update user to remove from agency
     const updatedUser = await this.prisma.user.update({
       where: { id: userId },
       data: {
-        role: UserRole.USER,
         agencyId: null,
-      },
-    });
-
-    // Decrement agency user count
-    await this.prisma.user.update({
-      where: { id: user.agencyId },
-      data: {
-        agencyCurrentUsers: {
-          decrement: 1,
-        },
       },
     });
 

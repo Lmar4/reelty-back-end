@@ -47,7 +47,11 @@ router.post(
       const user = await prisma.user.findUnique({
         where: { id: userIdToUse },
         include: {
-          currentTier: true,
+          activeSubscription: {
+            include: {
+              tier: true,
+            },
+          },
           videoDownloads: {
             where: {
               jobId,
@@ -87,22 +91,17 @@ router.post(
 
       // Check if the user has already downloaded this video
       const existingDownloads = user.videoDownloads;
-      if (existingDownloads.length > 0) {
+      if (existingDownloads && existingDownloads.length > 0) {
+        // User has already downloaded this video, return the existing download
         res.status(200).json({
           success: true,
-          message: "Video download already tracked",
-          data: {
-            userId: userIdToUse,
-            jobId,
-            templateKey,
-            timestamp: existingDownloads[0].createdAt.toISOString(),
-          },
+          data: existingDownloads[0],
         });
         return;
       }
 
-      // Check download limits based on subscription tier
-      const maxDownloads = user.currentTier?.maxReelDownloads;
+      // Check if the user has reached their download limit
+      const maxDownloads = user.activeSubscription?.tier?.maxReelDownloads;
 
       if (maxDownloads !== undefined && maxDownloads !== null) {
         const downloadCount = await prisma.videoDownload.count({
@@ -119,7 +118,7 @@ router.post(
             data: {
               currentDownloads: downloadCount,
               maxDownloads,
-              tier: user.currentTier?.name,
+              tier: user.activeSubscription?.tier?.name,
             },
           });
           return;
@@ -139,7 +138,7 @@ router.post(
         userId: userIdToUse,
         jobId,
         templateKey,
-        tier: user.currentTier?.name || "unknown",
+        tier: user.activeSubscription?.tier?.name || "unknown",
         maxDownloads,
         downloadId: download.id,
       });
@@ -197,11 +196,15 @@ router.get("/download-count", isAuthenticated, async (req, res) => {
         id: userId,
       },
       include: {
-        currentTier: true,
+        activeSubscription: {
+          include: {
+            tier: true,
+          },
+        },
       },
     });
 
-    const maxDownloads = user?.currentTier?.maxReelDownloads || 1;
+    const maxDownloads = user?.activeSubscription?.tier?.maxReelDownloads || 1;
 
     res.status(200).json({
       success: true,

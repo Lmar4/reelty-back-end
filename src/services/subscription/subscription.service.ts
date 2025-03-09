@@ -5,6 +5,7 @@ import {
   SubscriptionStatus,
   Prisma,
   SubscriptionTierId,
+  PlanType,
 } from "@prisma/client";
 import { plansService } from "../stripe/plans.service.js";
 import { logger } from "../../utils/logger.js";
@@ -19,7 +20,7 @@ export interface CreateSubscriptionTierInput {
   tierId: SubscriptionTierId;
   name: string;
   description: string;
-  monthlyPrice: number;
+  monthlyPriceCents: number;
   planType: "PAY_AS_YOU_GO" | "MONTHLY";
   features: string[];
   creditsPerInterval: number;
@@ -51,11 +52,14 @@ export class SubscriptionService {
     input: CreateSubscriptionTierInput
   ): Promise<SubscriptionTier> {
     try {
-      // First create a Stripe product and price
+      // First create the Stripe product and price
       const { product, price } = await plansService.syncPlan(
         {
-          ...input,
-          tierId: undefined, // Remove tierId from the sync data
+          tierId: String(input.tierId) as any,
+          name: input.name,
+          description: input.description,
+          monthlyPriceCents: input.monthlyPriceCents,
+          planType: input.planType as PlanType,
         },
         {
           features: input.features,
@@ -75,7 +79,7 @@ export class SubscriptionService {
           tierId: input.tierId,
           name: input.name,
           description: input.description,
-          monthlyPrice: input.monthlyPrice,
+          monthlyPriceCents: input.monthlyPriceCents,
           planType: input.planType,
           features: input.features,
           creditsPerInterval: input.creditsPerInterval,
@@ -100,12 +104,37 @@ export class SubscriptionService {
     input: UpdateSubscriptionTierInput
   ): Promise<SubscriptionTier> {
     try {
+      // First update the Stripe product and price
+      if (input.name || input.description || input.monthlyPriceCents) {
+        await plansService.syncPlan(
+          {
+            tierId:
+              input.tierId as import("../stripe/plans.service.js").SubscriptionTierId,
+            name: input.name,
+            description: input.description,
+            monthlyPriceCents: input.monthlyPriceCents,
+            planType: input.planType as PlanType,
+          },
+          {
+            features: input.features || [],
+            maxListings: input.maxActiveListings || 0,
+            maxPhotosPerListing: input.maxPhotosPerListing || 0,
+            maxVideosPerMonth: input.maxReelDownloads || 0,
+            customBranding: !input.hasWatermark,
+            analytics: true,
+            priority: 1,
+            premiumTemplatesEnabled: input.premiumTemplatesEnabled || false,
+          }
+        );
+      }
+
+      // Then update the subscription tier
       const tier = await prisma.subscriptionTier.update({
         where: { id: input.id },
         data: {
           name: input.name,
           description: input.description,
-          monthlyPrice: input.monthlyPrice,
+          monthlyPriceCents: input.monthlyPriceCents,
           planType: input.planType,
           features: input.features,
           creditsPerInterval: input.creditsPerInterval,
@@ -116,21 +145,6 @@ export class SubscriptionService {
           premiumTemplatesEnabled: input.premiumTemplatesEnabled,
         },
       });
-
-      if (tier) {
-        // Sync updated tier with Stripe
-        const { tierId, ...tierData } = tier;
-        await plansService.syncPlan(tierData, {
-          features: tier.features,
-          maxListings: tier.maxActiveListings,
-          maxPhotosPerListing: tier.maxPhotosPerListing,
-          maxVideosPerMonth: tier.maxReelDownloads || 0,
-          customBranding: !tier.hasWatermark,
-          analytics: true,
-          priority: 1,
-          premiumTemplatesEnabled: tier.premiumTemplatesEnabled,
-        });
-      }
 
       return tier;
     } catch (error) {
@@ -197,7 +211,7 @@ export class SubscriptionService {
   async listSubscriptionTiers(): Promise<SubscriptionTier[]> {
     try {
       return await prisma.subscriptionTier.findMany({
-        orderBy: { monthlyPrice: "asc" },
+        orderBy: { monthlyPriceCents: "asc" },
       });
     } catch (error) {
       logger.error("Error listing subscription tiers:", error);
@@ -207,33 +221,98 @@ export class SubscriptionService {
 
   async assignTierToUser(userId: string, tierId: string): Promise<User> {
     try {
-      const [user, tier] = await Promise.all([
-        prisma.user.findUnique({ where: { id: userId } }),
-        prisma.subscriptionTier.findUnique({ where: { id: tierId } }),
-      ]);
+      // Get the tier
+      const tier = await prisma.subscriptionTier.findUnique({
+        where: { id: tierId },
+      });
 
-      if (!user || !tier) {
-        throw new Error("User or tier not found");
+      if (!tier) {
+        throw new Error(`Subscription tier with ID ${tierId} not found`);
       }
 
-      // Create subscription history record
-      await prisma.subscriptionHistory.create({
-        data: {
-          userId,
-          tierId,
-          status: SubscriptionStatus.ACTIVE,
-          startDate: new Date(),
+      // Get the user
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        include: {
+          subscriptions: {
+            where: {
+              status: {
+                not: SubscriptionStatus.INACTIVE,
+              },
+            },
+            orderBy: {
+              createdAt: "desc",
+            },
+            take: 1,
+          },
         },
       });
 
-      // Update user with new tier
-      return await prisma.user.update({
-        where: { id: userId },
+      if (!user) {
+        throw new Error(`User with ID ${userId} not found`);
+      }
+
+      // Check if user already has an active subscription
+      const activeSubscription = user.subscriptions[0];
+
+      if (activeSubscription) {
+        // Update existing subscription
+        await prisma.subscription.update({
+          where: { id: activeSubscription.id },
+          data: {
+            tierId: tier.id,
+            status: SubscriptionStatus.ACTIVE,
+          },
+        });
+      } else {
+        // Create new subscription
+        const newSubscription = await prisma.subscription.create({
+          data: {
+            userId,
+            tierId: tier.id,
+            status: SubscriptionStatus.ACTIVE,
+          },
+        });
+
+        // Set as active subscription
+        await prisma.user.update({
+          where: { id: userId },
+          data: {
+            activeSubscriptionId: newSubscription.id,
+          },
+        });
+      }
+
+      // Log the tier change
+      await prisma.tierChange.create({
         data: {
-          currentTierId: tier.tierId,
-          subscriptionStatus: SubscriptionStatus.ACTIVE,
+          userId,
+          oldTier: activeSubscription?.tierId || SubscriptionTierId.FREE,
+          newTier: tier.tierId,
+          reason: "Admin assigned tier",
         },
       });
+
+      // Return the updated user
+      return (await prisma.user.findUnique({
+        where: { id: userId },
+        include: {
+          subscriptions: {
+            where: {
+              status: {
+                not: SubscriptionStatus.INACTIVE,
+              },
+            },
+            orderBy: {
+              createdAt: "desc",
+            },
+            take: 1,
+            include: {
+              tier: true,
+            },
+          },
+        },
+      })) as User;
     } catch (error) {
       logger.error("Error assigning tier to user:", error);
       throw error;
@@ -248,17 +327,36 @@ export class SubscriptionService {
     try {
       const user = await prisma.user.findUnique({
         where: { id: userId },
-        include: { currentTier: true },
+        include: {
+          subscriptions: {
+            where: {
+              status: {
+                not: SubscriptionStatus.INACTIVE,
+              },
+            },
+            orderBy: {
+              createdAt: "desc",
+            },
+            take: 1,
+            include: {
+              tier: true,
+            },
+          },
+        },
       });
 
       if (!user) {
-        throw new Error("User not found");
+        throw new Error(`User with ID ${userId} not found`);
       }
 
+      const activeSubscription = user.subscriptions[0];
+      const tier = activeSubscription?.tier || null;
+      const status = activeSubscription?.status || SubscriptionStatus.INACTIVE;
+
       return {
-        isActive: user.subscriptionStatus === SubscriptionStatus.ACTIVE,
-        tier: user.currentTier,
-        status: user.subscriptionStatus,
+        isActive: status === SubscriptionStatus.ACTIVE,
+        tier,
+        status,
       };
     } catch (error) {
       logger.error("Error checking user subscription:", error);

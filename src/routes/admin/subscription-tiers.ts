@@ -18,8 +18,8 @@ async function getSubscriptionTiers(
       take: Number(limit),
       skip,
       orderBy: {
-        monthlyPrice: 'asc'
-      }
+        monthlyPriceCents: "asc",
+      },
     });
 
     const total = await prisma.subscriptionTier.count();
@@ -31,14 +31,14 @@ async function getSubscriptionTiers(
         total,
         page: Number(page),
         limit: Number(limit),
-        pages: Math.ceil(total / Number(limit))
-      }
+        pages: Math.ceil(total / Number(limit)),
+      },
     });
   } catch (error) {
     console.error("Error fetching subscription tiers:", error);
     res.status(500).json({
       success: false,
-      error: "Failed to fetch subscription tiers"
+      error: "Failed to fetch subscription tiers",
     });
   }
 }

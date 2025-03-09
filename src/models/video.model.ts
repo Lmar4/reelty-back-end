@@ -11,6 +11,27 @@ export interface VideoJobInput {
   template?: string;
   inputFiles: string[]; // S3 URLs from frontend
   metadata?: Record<string, any>;
+  priority?: number;
+}
+
+export interface VideoJobResponse {
+  id: string;
+  userId: string;
+  listingId: string;
+  status: VideoGenerationStatus;
+  template: string | null;
+  inputFiles: string[];
+  outputFile: string | null;
+  thumbnailUrl: string | null;
+  metadata: Record<string, any> | null;
+  error: string | null;
+  position: number;
+  priority: number;
+  progress: number;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export class VideoService {
@@ -27,7 +48,7 @@ export class VideoService {
           inputFiles: input.inputFiles,
           metadata: input.metadata || {},
           position: 0,
-          priority: 1,
+          priority: input.priority || 1,
         },
       });
 

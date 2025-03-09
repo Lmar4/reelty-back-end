@@ -5,8 +5,10 @@ import { validateRequest } from "../middleware/validate.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { isAgencyOwner } from "../middleware/roles.js";
 import { createApiResponse } from "../types/api.js";
+import { PrismaClient } from "@prisma/client";
 const router = express.Router();
 const agencyService = new AgencyService();
+const prisma = new PrismaClient();
 
 // Validation schemas
 const createAgencySchema = z.object({
@@ -108,11 +110,27 @@ router.delete(
 // Get agency stats
 router.get("/stats", isAuthenticated, isAgencyOwner, async (req, res) => {
   try {
-    const agency = await agencyService.getAgencies();
+    const agencies = await agencyService.getAgencies();
+    const agency = agencies[0];
+
+    if (!agency) {
+      res.status(404).json(createApiResponse(false, null, "Agency not found"));
+      return;
+    }
+
+    // Get agency users count from agencyMemberships
+    const agencyMemberships = await prisma.agencyMembership.count({
+      where: {
+        agencyId: agency.id,
+        status: "ACTIVE",
+      },
+    });
+
     const stats = {
-      totalUsers: agency[0]?.agencyCurrentUsers || 0,
-      maxUsers: agency[0]?.agencyMaxUsers || 0,
+      totalUsers: agencyMemberships,
+      maxUsers: 10, // Default max users or fetch from a settings table
     };
+
     res.json(createApiResponse(true, stats));
   } catch (error) {
     res

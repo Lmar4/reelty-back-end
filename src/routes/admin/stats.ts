@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, SubscriptionStatus } from "@prisma/client";
 import express from "express";
 import { isAdmin as requireAdmin } from "../../middleware/auth.js";
 
@@ -12,7 +12,20 @@ async function getUserStats(_req: express.Request, res: express.Response) {
     const users = await prisma.user.findMany({
       include: {
         subscriptionLogs: true,
-        currentTier: true,
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            tier: true,
+          },
+        },
       },
     });
 
@@ -21,32 +34,57 @@ async function getUserStats(_req: express.Request, res: express.Response) {
 
     // Calculate active users (users with active subscription)
     const activeUsers = users.filter(
-      (user) => user.subscriptionStatus === "ACTIVE"
+      (user) => user.subscriptions[0]?.status === SubscriptionStatus.ACTIVE
     ).length;
 
     // Calculate users by tier
     const usersByTier = users.reduce((acc: any[], user) => {
-      if (!user.currentTier) return acc;
+      const activeTier = user.subscriptions[0]?.tier;
+      if (!activeTier) return acc;
 
-      const existing = acc.find((t) => t.tier === user.currentTier?.name);
+      const existing = acc.find((t) => t.tier === activeTier.name);
       if (existing) {
         existing.count++;
       } else {
         acc.push({
-          tier: user.currentTier.name,
+          tier: activeTier.name,
           count: 1,
         });
       }
-
       return acc;
     }, []);
 
+    // Calculate users by status
+    const usersByStatus = users.reduce((acc: any[], user) => {
+      const status = user.subscriptions[0]?.status || "NO_SUBSCRIPTION";
+      const existing = acc.find((s) => s.status === status);
+      if (existing) {
+        existing.count++;
+      } else {
+        acc.push({
+          status,
+          count: 1,
+        });
+      }
+      return acc;
+    }, []);
+
+    // Calculate new users in the last 30 days
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const newUsers = users.filter(
+      (user) => user.createdAt >= thirtyDaysAgo
+    ).length;
+
+    // Return stats
     res.json({
       success: true,
       data: {
         totalUsers,
         activeUsers,
+        newUsers,
         usersByTier,
+        usersByStatus,
       },
     });
   } catch (error) {

@@ -49,13 +49,13 @@ export async function createPaymentIntent(
       return;
     }
 
-    if (!tier.monthlyPrice || tier.monthlyPrice < 0) {
+    if (!tier.monthlyPriceCents || tier.monthlyPriceCents < 0) {
       res.status(400).json({ error: "Invalid subscription price" });
       return;
     }
 
-    // Create PaymentIntent with safe price conversion
-    const amount = Math.round(tier.monthlyPrice * 100);
+    // Use the price in cents directly
+    const amount = tier.monthlyPriceCents;
     if (!Number.isFinite(amount) || amount <= 0) {
       res.status(400).json({ error: "Invalid price calculation" });
       return;
@@ -134,7 +134,7 @@ export async function syncSubscriptionTier(
 
     // Create or update price
     const priceData = {
-      unit_amount: Math.round(tier.monthlyPrice * 100),
+      unit_amount: tier.monthlyPriceCents, // Already in cents
       currency: "usd",
       recurring: { interval: "month" as const },
       product: product.id,
@@ -203,21 +203,43 @@ export async function createCheckoutSession(
       maxListings: tier.maxActiveListings,
       maxPhotosPerListing: tier.maxPhotosPerListing,
       maxVideosPerMonth: tier.maxReelDownloads || 0,
-      features: tier.features,
+      features: tier.features as unknown as string[], // Type assertion for JSON field
     };
 
+    // Get user's active subscription
+    const activeSubscription = await prisma.subscription.findFirst({
+      where: {
+        userId: user.id,
+        status: 'ACTIVE',
+      },
+    });
+    
     // Create or get Stripe customer
-    let customerId = user.stripeCustomerId;
+    let customerId = activeSubscription?.stripeCustomerId;
     if (!customerId) {
       const customer = await stripe.customers.create({
         email: user.email,
         metadata: { userId: user.id },
       });
       customerId = customer.id;
-      await prisma.user.update({
-        where: { id: userId },
-        data: { stripeCustomerId: customerId },
-      });
+      
+      // Update or create subscription with Stripe customer ID
+      if (activeSubscription) {
+        await prisma.subscription.update({
+          where: { id: activeSubscription.id },
+          data: { stripeCustomerId: customerId },
+        });
+      } else {
+        // Create a new subscription if none exists
+        await prisma.subscription.create({
+          data: {
+            userId: user.id,
+            stripeCustomerId: customerId,
+            status: 'INCOMPLETE',
+            tierId: tier.id,
+          },
+        });
+      }
     }
 
     // Create checkout session with metadata

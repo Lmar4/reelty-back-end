@@ -1,4 +1,8 @@
-import { PrismaClient, SubscriptionTierId } from "@prisma/client";
+import {
+  PrismaClient,
+  SubscriptionStatus,
+  SubscriptionTierId,
+} from "@prisma/client";
 import express, { Request, Response } from "express";
 import Stripe from "stripe";
 import { z } from "zod";
@@ -46,9 +50,9 @@ const updateSubscriptionSchema = z.object({
 // Validation schema for create checkout
 const createCheckoutSchema = z.object({
   body: z.object({
-    plan: z.string().min(1),
-    billingType: z.enum(["credits", "monthly"]),
-    returnUrl: z.string().url(),
+    tierId: z.string().uuid(),
+    successUrl: z.string().url(),
+    cancelUrl: z.string().url(),
   }),
 });
 
@@ -121,9 +125,21 @@ const updateTier = async (req: Request, res: Response) => {
     // Get current user data
     const currentUser = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        id: true,
-        currentTierId: true,
+      include: {
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            tier: true,
+          },
+        },
       },
     });
 
@@ -135,23 +151,45 @@ const updateTier = async (req: Request, res: Response) => {
       return;
     }
 
-    // Update user's tier
-    const user = await prisma.user.update({
-      where: { id: userId },
-      data: {
-        currentTierId: tier.tierId,
-      },
-      select: {
-        id: true,
-        currentTierId: true,
-      },
-    });
+    // Get the active subscription
+    const activeSubscription = currentUser.subscriptions[0];
+
+    // Create or update subscription
+    let subscription;
+
+    // Check if user already has an active subscription
+    if (activeSubscription) {
+      // Update existing subscription
+      subscription = await prisma.subscription.update({
+        where: { id: activeSubscription.id },
+        data: {
+          tierId: tier.tierId,
+        },
+      });
+    } else {
+      // Create new subscription
+      subscription = await prisma.subscription.create({
+        data: {
+          userId: userId,
+          tierId: tier.tierId,
+          status: "ACTIVE",
+        },
+      });
+
+      // Update user's active subscription reference
+      await prisma.user.update({
+        where: { id: userId },
+        data: {
+          activeSubscriptionId: subscription.id,
+        },
+      });
+    }
 
     // Log the tier change
     await prisma.tierChange.create({
       data: {
-        userId: user.id,
-        oldTier: currentUser.currentTierId || tierId,
+        userId: userId,
+        oldTier: activeSubscription?.tierId || tierId,
         newTier: tier.tierId,
         reason: "User initiated change",
       },
@@ -160,8 +198,8 @@ const updateTier = async (req: Request, res: Response) => {
     res.json({
       success: true,
       data: {
-        userId: user.id,
-        tier: user.currentTierId,
+        userId: userId,
+        tier: tier.tierId,
       },
     });
   } catch (error) {
@@ -176,75 +214,83 @@ const updateTier = async (req: Request, res: Response) => {
 // Create checkout session
 const createCheckout = async (req: Request, res: Response) => {
   try {
-    // Get user ID from the request body since it's passed from the frontend
-    const { userId, plan, billingType, returnUrl } = req.body;
+    const { tierId, successUrl, cancelUrl } = req.body;
+    const userId = req.user?.id;
 
     if (!userId) {
-      res.status(400).json({
-        success: false,
-        error: "User ID is required",
-      });
+      res.status(401).json(createApiResponse(false, null, "Unauthorized"));
       return;
     }
 
-    // Get the user to check if they have a Stripe customer ID
+    // Get the tier
+    const tier = await prisma.subscriptionTier.findUnique({
+      where: { tierId: tierId as SubscriptionTierId },
+    });
+
+    if (!tier) {
+      res.status(404).json(createApiResponse(false, null, "Tier not found"));
+      return;
+    }
+
+    // Get the user
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        id: true,
-        email: true,
-        stripeCustomerId: true,
+      include: {
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+        },
       },
     });
 
     if (!user) {
-      res.status(404).json({
-        success: false,
-        error: "User not found",
-      });
+      res.status(404).json(createApiResponse(false, null, "User not found"));
       return;
     }
 
-    // Get the subscription tier for the selected plan
-    const tier = await prisma.subscriptionTier.findFirst({
-      where: {
-        AND: [
-          { name: plan }, // Exact match since we're now sending the correct plan name
-          { planType: billingType === "monthly" ? "MONTHLY" : "PAY_AS_YOU_GO" },
-        ],
-      },
-    });
+    // Get the active subscription
+    const activeSubscription = user.subscriptions[0];
 
-    if (!tier) {
-      console.error("Plan not found:", { plan, billingType });
-      res.status(404).json({
-        success: false,
-        error: "Plan not found",
-      });
-      return;
-    }
+    // Create or get Stripe customer
+    let stripeCustomerId = activeSubscription?.stripeCustomerId;
 
-    // Create or retrieve Stripe customer
-    let stripeCustomerId = user.stripeCustomerId;
+    // If no customer ID from subscription, check if we need to create one
     if (!stripeCustomerId) {
-      const customer = await stripe.customers.create({
+      // Check if we already have customers with this email
+      const existingCustomers = await stripe.customers.list({
         email: user.email,
-        metadata: {
-          userId: user.id,
-        },
+        limit: 1,
       });
-      stripeCustomerId = customer.id;
 
-      // Update user with Stripe customer ID
-      await prisma.user.update({
-        where: { id: userId },
-        data: { stripeCustomerId },
-      });
+      if (existingCustomers.data.length > 0) {
+        stripeCustomerId = existingCustomers.data[0].id;
+      } else {
+        // Create a new customer
+        const customer = await stripe.customers.create({
+          email: user.email,
+          name:
+            `${user.firstName || ""} ${user.lastName || ""}`.trim() ||
+            user.email,
+          metadata: {
+            userId: user.id,
+          },
+        });
+
+        stripeCustomerId = customer.id;
+      }
     }
 
     // Create checkout session
     const session = await stripe.checkout.sessions.create({
       customer: stripeCustomerId,
+      payment_method_types: ["card"],
       line_items: [
         {
           price: tier.stripePriceId,
@@ -252,29 +298,22 @@ const createCheckout = async (req: Request, res: Response) => {
         },
       ],
       mode: "subscription",
-      success_url: `${returnUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: returnUrl,
-      subscription_data: {
-        metadata: {
-          userId,
-          tierId: tier.id,
-        },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: {
+        userId: user.id,
+        tierId: tier.tierId,
       },
     });
 
-    res.json({
-      success: true,
-      data: {
-        sessionId: session.id,
-        url: session.url,
-      },
-    });
+    res.json(createApiResponse(true, { url: session.url }));
   } catch (error) {
-    console.error("Create checkout error:", error);
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
-    });
+    console.error("Error creating checkout:", error);
+    res
+      .status(500)
+      .json(
+        createApiResponse(false, null, "Failed to create checkout session")
+      );
   }
 };
 
@@ -290,15 +329,58 @@ const updateSubscriptionFromStripe = async (req: Request, res: Response) => {
       currentPeriodEnd,
     } = req.body;
 
-    // Update user's subscription
+    // Find the subscription tier by Stripe price ID
+    const tier = await prisma.subscriptionTier.findFirst({
+      where: { stripePriceId },
+    });
+
+    if (!tier) {
+      return res.status(404).json({
+        success: false,
+        error: "Subscription tier not found",
+      });
+    }
+
+    // Find existing subscription or create a new one
+    let subscription = await prisma.subscription.findFirst({
+      where: {
+        userId,
+        stripeSubscriptionId,
+      },
+    });
+
+    if (subscription) {
+      // Update existing subscription
+      subscription = await prisma.subscription.update({
+        where: { id: subscription.id },
+        data: {
+          stripeSubscriptionId,
+          stripePriceId,
+          tierId: tier.id,
+          status: status as SubscriptionStatus,
+          currentPeriodEnd: new Date(currentPeriodEnd * 1000),
+          updatedAt: new Date(),
+        },
+      });
+    } else {
+      // Create new subscription
+      subscription = await prisma.subscription.create({
+        data: {
+          userId,
+          tierId: tier.id,
+          stripeSubscriptionId,
+          stripePriceId,
+          status: status as SubscriptionStatus,
+          currentPeriodEnd: new Date(currentPeriodEnd * 1000),
+        },
+      });
+    }
+
+    // Update user's active subscription
     const updatedUser = await prisma.user.update({
       where: { id: userId },
       data: {
-        stripeSubscriptionId,
-        stripePriceId,
-        stripeProductId,
-        subscriptionStatus: status,
-        subscriptionPeriodEnd: new Date(currentPeriodEnd * 1000),
+        activeSubscriptionId: subscription.id,
         updatedAt: new Date(),
       },
     });
@@ -335,19 +417,33 @@ const cancelSubscription = async (req: Request, res: Response) => {
     const userId = req.user!.id;
     const { stripeSubscriptionId } = req.body;
 
-    // Update user's subscription status
-    const updatedUser = await prisma.user.update({
+    // Find the user with their active subscription
+    const user = await prisma.user.findUnique({
       where: { id: userId },
+      include: {
+        activeSubscription: true,
+      },
+    });
+
+    if (!user || !user.activeSubscription) {
+      return res.status(404).json({
+        success: false,
+        error: "User or active subscription not found",
+      });
+    }
+
+    // Update the subscription status
+    await prisma.subscription.update({
+      where: { id: user.activeSubscription.id },
       data: {
-        subscriptionStatus: "CANCELED",
-        updatedAt: new Date(),
+        status: "CANCELED",
       },
     });
 
     // Log the cancellation
     await prisma.subscriptionLog.create({
       data: {
-        userId: updatedUser.id,
+        userId: user.id,
         action: "cancel",
         stripeSubscriptionId,
         status: "canceled",
@@ -355,11 +451,7 @@ const cancelSubscription = async (req: Request, res: Response) => {
     });
 
     res.json(
-      createApiResponse(
-        true,
-        updatedUser,
-        "Subscription cancelled successfully"
-      )
+      createApiResponse(true, user, "Subscription cancelled successfully")
     );
   } catch (error) {
     console.error("Cancel subscription error:", error);
@@ -376,13 +468,21 @@ const getCurrentSubscription = async (req: Request, res: Response) => {
     const userId = req.user!.id;
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        id: true,
-        currentTierId: true,
-        stripeSubscriptionId: true,
-        subscriptionStatus: true,
-        subscriptionPeriodEnd: true,
-        stripePriceId: true,
+      include: {
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            tier: true,
+          },
+        },
       },
     });
 
@@ -393,14 +493,37 @@ const getCurrentSubscription = async (req: Request, res: Response) => {
       return;
     }
 
+    // Get the active subscription
+    const activeSubscription = user.subscriptions[0];
+
+    // Access subscription fields safely with correct field names
+    const currentPeriodEnd = activeSubscription?.currentPeriodEnd || new Date();
+    const stripeCustomerId = activeSubscription?.stripeCustomerId;
+
+    // If no active subscription, return a default "free" subscription
+    if (!activeSubscription) {
+      res.json(
+        createApiResponse(true, {
+          id: user.id,
+          plan: SubscriptionTierId.FREE,
+          status: "free",
+          currentPeriodEnd: new Date().toISOString(),
+          cancelAtPeriodEnd: false,
+        })
+      );
+      return;
+    }
+
     res.json(
       createApiResponse(true, {
-        id: user.stripeSubscriptionId || user.id,
-        plan: user.currentTierId,
-        status: user.subscriptionStatus?.toLowerCase() || "free",
+        id: activeSubscription.id,
+        plan: activeSubscription.tierId,
+        status: activeSubscription.status.toLowerCase(),
         currentPeriodEnd:
-          user.subscriptionPeriodEnd?.toISOString() || new Date().toISOString(),
-        cancelAtPeriodEnd: user.subscriptionStatus === "CANCELED",
+          activeSubscription.currentPeriodEnd?.toISOString() ||
+          new Date().toISOString(),
+        cancelAtPeriodEnd: activeSubscription.status === "CANCELED",
+        tierName: activeSubscription.tier.name,
       })
     );
   } catch (error) {
@@ -424,35 +547,45 @@ const getInvoices = async (req: Request, res: Response) => {
     const limit = parseInt(req.query.limit as string) || 10;
     const starting_after = req.query.starting_after as string;
 
-    // Get user's Stripe customer ID
+    // Get user's active subscription with Stripe customer ID
     const user = await prisma.user.findUnique({
       where: { id: userId },
-      select: {
-        stripeCustomerId: true,
+      include: {
+        activeSubscription: true,
       },
     });
 
-    if (!user?.stripeCustomerId) {
+    if (
+      !user ||
+      !user.activeSubscription ||
+      !user.activeSubscription.stripeCustomerId
+    ) {
       res.status(404).json({
         success: false,
-        error: "User not found or no Stripe customer ID",
+        error:
+          "User not found or no active subscription with Stripe customer ID",
       });
       return;
     }
 
     // Fetch invoices from Stripe with pagination
     const invoices = await stripe.invoices.list({
-      customer: user.stripeCustomerId,
+      customer: user.activeSubscription.stripeCustomerId,
       limit: Math.min(limit, 100), // Cap at 100 to prevent abuse
       starting_after,
     });
 
+    // Format the response
     const formattedInvoices = invoices.data.map((invoice) => ({
       id: invoice.id,
-      created: invoice.created,
-      amount_paid: invoice.amount_paid,
+      number: invoice.number,
+      created: new Date(invoice.created * 1000).toISOString(),
+      period_start: new Date(invoice.period_start * 1000).toISOString(),
+      period_end: new Date(invoice.period_end * 1000).toISOString(),
+      amount_due: invoice.amount_due / 100, // Convert from cents to dollars
+      amount_paid: invoice.amount_paid / 100,
       status: invoice.status,
-      invoice_pdf: invoice.invoice_pdf,
+      hosted_invoice_url: invoice.hosted_invoice_url,
     }));
 
     res.json({
@@ -463,10 +596,11 @@ const getInvoices = async (req: Request, res: Response) => {
       },
     });
   } catch (error) {
-    console.error("Get invoices error:", error);
+    console.error("Error fetching invoices:", error);
     res.status(500).json({
       success: false,
-      error: error instanceof Error ? error.message : "Unknown error occurred",
+      error:
+        error instanceof Error ? error.message : "Failed to fetch invoices",
     });
   }
 };
@@ -480,7 +614,20 @@ const getUsageStats = async (req: Request, res: Response) => {
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
-        currentTier: true,
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            tier: true,
+          },
+        },
         listings: {
           select: {
             id: true,
@@ -504,6 +651,9 @@ const getUsageStats = async (req: Request, res: Response) => {
       return;
     }
 
+    // Get the active subscription
+    const activeSubscription = user.subscriptions[0];
+
     // Calculate usage statistics
     const activeListings = user.listings.filter(
       (listing: ListingWithCounts) => listing.status === "ACTIVE"
@@ -515,36 +665,38 @@ const getUsageStats = async (req: Request, res: Response) => {
         sum + listing._count.videoJobs,
       0
     );
+
     const totalPhotos = user.listings.reduce(
       (sum: number, listing: ListingWithCounts) => sum + listing._count.photos,
       0
     );
 
-    // Calculate storage used (assuming each photo is ~2MB and each video is ~10MB)
-    const storageUsed = totalPhotos * 2 + totalVideosGenerated * 10;
-
-    // Get credits used from the credit logs table
-    const creditsUsed = await prisma.creditLog.aggregate({
-      where: {
-        userId,
-        amount: { lt: 0 }, // Only count negative amounts (used credits)
-        createdAt: {
-          gte: new Date(new Date().setDate(1)), // Start of current month
-        },
-      },
-      _sum: {
-        amount: true,
-      },
-    });
+    // Get subscription tier limits
+    const tierLimits = activeSubscription?.tier
+      ? {
+          maxActiveListings: activeSubscription.tier.maxActiveListings,
+          name: activeSubscription.tier.name,
+          maxPhotosPerListing: activeSubscription.tier.maxPhotosPerListing,
+          maxVideosPerListing: activeSubscription.tier.maxPhotosPerListing || 1,
+        }
+      : {
+          maxActiveListings: 1,
+          name: "Free",
+          maxPhotosPerListing: 5,
+          maxVideosPerListing: 1,
+        };
 
     res.json({
       success: true,
       data: {
-        creditsUsed: Math.abs(creditsUsed._sum.amount || 0),
-        activeListings,
-        totalListings,
-        totalVideosGenerated,
-        storageUsed,
+        usage: {
+          activeListings,
+          totalListings,
+          totalVideosGenerated,
+          totalPhotos,
+        },
+        limits: tierLimits,
+        currentCount: activeListings,
       },
     });
   } catch (error) {
@@ -559,103 +711,95 @@ const getUsageStats = async (req: Request, res: Response) => {
 // Ensure user has a subscription tier
 const ensureTier = async (req: Request, res: Response) => {
   try {
-    const { userId } = req.body;
+    const userId = req.user?.id;
+    if (!userId) {
+      res.status(401).json(createApiResponse(false, null, "Unauthorized"));
+      return;
+    }
 
-    // Get user with their current tier
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
-        currentTier: true,
-        listings: {
-          where: { status: "ACTIVE" },
-          select: { id: true },
+        subscriptions: {
+          where: {
+            status: {
+              not: SubscriptionStatus.INACTIVE,
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          take: 1,
+          include: {
+            tier: true,
+          },
         },
+        listings: true,
       },
     });
 
     if (!user) {
-      res
-        .status(404)
-        .json(createApiResponse(false, undefined, undefined, "User not found"));
+      res.status(404).json(createApiResponse(false, null, "User not found"));
       return;
     }
 
-    // If user has no tier, assign free trial tier
-    if (!user.currentTierId) {
-      const freeTier = await prisma.subscriptionTier.findFirst({
+    // Get the active subscription
+    const activeSubscription = user.subscriptions[0];
+
+    // If user doesn't have an active subscription, assign the free tier
+    if (!activeSubscription) {
+      const freeTier = await prisma.subscriptionTier.findUnique({
         where: { tierId: SubscriptionTierId.FREE },
       });
 
       if (!freeTier) {
         res
           .status(500)
-          .json(
-            createApiResponse(
-              false,
-              undefined,
-              undefined,
-              "Free tier not found"
-            )
-          );
+          .json(createApiResponse(false, null, "Free tier not found"));
         return;
       }
 
-      await prisma.user.update({
-        where: { id: userId },
+      // Create a new subscription with the free tier
+      const newSubscription = await prisma.subscription.create({
         data: {
-          currentTierId: freeTier.tierId,
-          subscriptionStatus: "TRIALING",
+          userId: user.id,
+          tierId: freeTier.id,
+          status: SubscriptionStatus.ACTIVE,
         },
       });
 
+      // Update the user's active subscription
+      await prisma.user.update({
+        where: { id: user.id },
+        data: {
+          activeSubscriptionId: newSubscription.id,
+        },
+      });
+
+      // Return the tier info
       res.json(
         createApiResponse(true, {
-          tier: {
-            maxActiveListings: freeTier.maxActiveListings,
-            name: freeTier.name,
-            currentCount: user.listings.length,
-          },
+          maxActiveListings: freeTier.maxActiveListings,
+          name: freeTier.name,
+          currentCount: user.listings.length,
         })
       );
       return;
     }
 
-    // Return current tier info
-    if (!user.currentTier) {
-      res
-        .status(500)
-        .json(
-          createApiResponse(
-            false,
-            undefined,
-            undefined,
-            "Current tier not found"
-          )
-        );
-      return;
-    }
-
+    // User has an active subscription, return the tier info
     res.json(
       createApiResponse(true, {
-        tier: {
-          maxActiveListings: user.currentTier.maxActiveListings,
-          name: user.currentTier.name,
-          currentCount: user.listings.length,
-        },
+        maxActiveListings: activeSubscription.tier.maxActiveListings,
+        name: activeSubscription.tier.name,
+        currentCount: user.listings.length,
       })
     );
   } catch (error) {
-    console.error("Ensure tier error:", error);
+    console.error("Error ensuring tier:", error);
     res
       .status(500)
-      .json(
-        createApiResponse(
-          false,
-          undefined,
-          undefined,
-          error instanceof Error ? error.message : "Failed to ensure tier"
-        )
-      );
+      .json(createApiResponse(false, null, "Failed to ensure tier"));
   }
 };
 
@@ -676,9 +820,25 @@ router.post(
 router.post(
   "/update",
   validateRequest(updateSubscriptionSchema),
-  updateSubscriptionFromStripe
+  (req: Request, res: Response) => {
+    updateSubscriptionFromStripe(req, res).catch((err) => {
+      console.error("Error in updateSubscriptionFromStripe:", err);
+      res.status(500).json({
+        success: false,
+        error: err instanceof Error ? err.message : "Unknown error occurred",
+      });
+    });
+  }
 );
-router.post("/cancel", isAuthenticated, cancelSubscription);
+router.post("/cancel", isAuthenticated, (req: Request, res: Response) => {
+  cancelSubscription(req, res).catch((err) => {
+    console.error("Error in cancelSubscription:", err);
+    res.status(500).json({
+      success: false,
+      error: err instanceof Error ? err.message : "Unknown error occurred",
+    });
+  });
+});
 router.get("/current", isAuthenticated, getCurrentSubscription);
 router.get("/invoices", isAuthenticated, getInvoices);
 router.get("/usage", isAuthenticated, getUsageStats);

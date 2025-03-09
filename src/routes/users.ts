@@ -72,8 +72,12 @@ router.post(
             lastName: data.lastName || null,
             password: "", // Empty password since we're using Clerk for auth
             role: "USER", // Default role
-            subscriptionStatus: "TRIALING", // Default status
-            currentTierId: SubscriptionTierId.FREE, // Set initial tier
+            subscriptions: {
+              create: {
+                tierId: SubscriptionTierId.FREE,
+                status: "TRIALING",
+              },
+            },
           },
         });
 
@@ -229,7 +233,11 @@ const getUserData = async (
     const user = await prisma.user.findUnique({
       where: { id: userId },
       include: {
-        currentTier: true,
+        activeSubscription: {
+          include: {
+            tier: true,
+          },
+        },
         listingCredits: true,
         listings: {
           select: {

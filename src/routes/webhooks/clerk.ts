@@ -226,27 +226,41 @@ router.post(
               throw new Error("Free tier not found");
             }
 
-            const user = await tx.user.upsert({
-              where: { id: id as string },
-              update: {
-                email,
-                firstName: first_name || null,
-                lastName: last_name || null,
-              },
-              create: {
-                id: id as string,
-                email,
+            const user = await tx.user.create({
+              data: {
+                id: id,
+                email: email,
                 firstName: first_name || null,
                 lastName: last_name || null,
                 password: "",
                 role: "USER",
-                subscriptionStatus: "TRIALING",
-                currentTierId: SubscriptionTierId.FREE,
+                subscriptions: {
+                  create: {
+                    tierId: SubscriptionTierId.FREE,
+                    status: "TRIALING",
+                  },
+                },
               },
               include: {
-                currentTier: true,
+                subscriptions: true,
+                activeSubscription: {
+                  include: {
+                    tier: true,
+                  },
+                },
               },
             });
+
+            // Set the active subscription reference
+            if (user.subscriptions && user.subscriptions.length > 0) {
+              const subscription = user.subscriptions[0];
+              await tx.user.update({
+                where: { id: user.id },
+                data: {
+                  activeSubscriptionId: subscription.id,
+                },
+              });
+            }
 
             // Only create initial credit for new users (not updates)
             if (eventType === "user.created") {

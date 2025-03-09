@@ -43,12 +43,17 @@ export async function updateSubscription(
     const updatedUser = await prisma.user.update({
       where: { id: validatedData.userId },
       data: {
-        stripeSubscriptionId: validatedData.stripeSubscriptionId,
-        stripePriceId: validatedData.stripePriceId,
-        stripeProductId: validatedData.stripeProductId,
-        subscriptionStatus:
-          validatedData.status.toUpperCase() as SubscriptionStatus,
-        subscriptionPeriodEnd: new Date(validatedData.currentPeriodEnd * 1000),
+        subscriptions: {
+          update: {
+            where: {
+              id: validatedData.stripeSubscriptionId,
+            },
+            data: {
+              status: validatedData.status.toUpperCase() as SubscriptionStatus,
+              currentPeriodEnd: new Date(validatedData.currentPeriodEnd * 1000),
+            },
+          },
+        },
         updatedAt: new Date(),
       },
     });
@@ -107,7 +112,12 @@ export async function cancelSubscription(
     const updatedUser = await prisma.user.update({
       where: { id: validatedData.userId },
       data: {
-        subscriptionStatus: "CANCELED",
+        subscriptions: {
+          update: {
+            where: { id: validatedData.stripeSubscriptionId },
+            data: { status: "CANCELED" as SubscriptionStatus },
+          },
+        },
         updatedAt: new Date(),
       },
     });
@@ -157,7 +167,6 @@ export async function getSubscriptionTiers(
         stripePriceId: true,
         stripeProductId: true,
         features: true,
-        monthlyPrice: true,
       },
     });
 

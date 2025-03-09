@@ -148,8 +148,6 @@ export async function isAuthenticated(
                 lastName: null,
                 password: "", // Empty password since we're using Clerk for auth
                 role: "USER", // Default role
-                subscriptionStatus: "TRIALING", // Default status
-                // Skip currentTierId since the tier doesn't exist
               },
             });
 
@@ -186,33 +184,57 @@ export async function isAuthenticated(
             });
             throw new Error("Free tier not found and fallback creation failed");
           }
+        } else {
+          // Only create subscription if freeTier exists
+          try {
+            user = await prisma.user.create({
+              data: {
+                id: userId,
+                email: email,
+                firstName: null,
+                lastName: null,
+                password: "", // Empty password since we're using Clerk for auth
+                role: "USER", // Default role
+                subscriptions: {
+                  create: {
+                    tierId: freeTier!.id,
+                    status: "TRIALING",
+                  },
+                },
+              },
+            });
+
+            logger.info(
+              `Successfully created user ${userId} in database without tier reference`
+            );
+
+            // Create initial listing credit for new user
+            await prisma.listingCredit.create({
+              data: {
+                userId: user.id,
+                creditsRemaining: 1, // Default to 1 since we don't have tier info
+              },
+            });
+
+            logger.info(
+              `Successfully created listing credit for user ${userId}`
+            );
+          } catch (error) {
+            logger.error(`Failed to create user ${userId} in database`, {
+              error: error instanceof Error ? error.message : "Unknown error",
+              stack: error instanceof Error ? error.stack : undefined,
+            });
+
+            // EMERGENCY FALLBACK: Allow the request to proceed even if user creation fails
+            // This is a temporary measure to prevent blocking users in production
+            logger.warn(
+              `EMERGENCY FALLBACK: Allowing request to proceed for user ${userId} despite creation failure`
+            );
+            req.user = { id: userId };
+            next();
+            return; // Exit early since we've already called next()
+          }
         }
-
-        // Create the user with minimal information
-        user = await prisma.user.create({
-          data: {
-            id: userId,
-            email: email,
-            firstName: null,
-            lastName: null,
-            password: "", // Empty password since we're using Clerk for auth
-            role: "USER", // Default role
-            subscriptionStatus: "TRIALING", // Default status
-            currentTierId: SubscriptionTierId.FREE, // Use the enum value instead of string
-          },
-        });
-
-        logger.info(`Successfully created user ${userId} in database`);
-
-        // Create initial listing credit for new user
-        await prisma.listingCredit.create({
-          data: {
-            userId: user.id,
-            creditsRemaining: freeTier.creditsPerInterval || 1,
-          },
-        });
-
-        logger.info(`Successfully created listing credit for user ${userId}`);
       } catch (createError) {
         logger.error(`Failed to create user ${userId} in database`, {
           error:

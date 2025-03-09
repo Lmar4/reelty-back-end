@@ -16,10 +16,16 @@ export class UserCreditsService {
     try {
       // Start a transaction to ensure all updates succeed or fail together
       return await prisma.$transaction(async (tx) => {
-        // 1. Find the user and their current tier
+        // 1. Find the user and their current subscription
         const user = await tx.user.findUnique({
           where: { id: userId },
-          include: { currentTier: true },
+          include: {
+            activeSubscription: {
+              include: {
+                tier: true,
+              },
+            },
+          },
         });
 
         if (!user) {

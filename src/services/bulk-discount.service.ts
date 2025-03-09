@@ -49,15 +49,15 @@ export class BulkDiscountService {
     }
 
     return await prisma.$transaction(async (tx) => {
-      // Update user with discount
       const updatedUser = await tx.user.update({
         where: { id: userId },
         data: {
-          bulkDiscountId: discountId,
+          bulkDiscounts: {
+            connect: { id: discountId },
+          },
         },
       });
 
-      // Increment discount usage
       await tx.bulkDiscount.update({
         where: { id: discountId },
         data: {
@@ -67,7 +67,6 @@ export class BulkDiscountService {
         },
       });
 
-      // If max users reached, deactivate discount
       if (discount.currentUsers + 1 >= discount.maxUsers) {
         await tx.bulkDiscount.update({
           where: { id: discountId },
@@ -91,32 +90,32 @@ export class BulkDiscountService {
   }
 
   async getDiscountStats(discountId: string) {
-    const [discount, users] = await Promise.all([
-      prisma.bulkDiscount.findUnique({
-        where: { id: discountId },
-      }),
-      prisma.user.findMany({
-        where: {
-          bulkDiscountId: discountId,
-        },
-        select: {
-          id: true,
-          email: true,
-          createdAt: true,
-        },
-      }),
-    ]);
+    const discount = await prisma.bulkDiscount.findUnique({
+      where: { id: discountId },
+    });
 
     if (!discount) {
       throw new Error("Discount not found");
     }
 
+    const users = await prisma.user.findMany({
+      where: {
+        bulkDiscounts: {
+          some: { id: discountId },
+        },
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+      },
+    });
+
     return {
       discount,
-      usersCount: users.length,
-      remainingSlots: discount.maxUsers - discount.currentUsers,
-      isActive: discount.isActive,
       users,
+      usagePercentage: (discount.currentUsers / discount.maxUsers) * 100,
     };
   }
 }

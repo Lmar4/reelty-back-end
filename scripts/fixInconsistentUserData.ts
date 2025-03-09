@@ -8,17 +8,17 @@ const prisma = new PrismaClient();
 
 async function fixInconsistentUserData() {
   try {
-    // Find users with paid tiers but non-ACTIVE status
-    const inconsistentUsers = await prisma.user.findMany({
+    // Find users with paid tier subscriptions but non-ACTIVE status
+    const inconsistentSubscriptions = await prisma.subscription.findMany({
       where: {
-        currentTierId: {
+        tierId: {
           in: [
             SubscriptionTierId.REELTY,
             SubscriptionTierId.REELTY_PRO,
             SubscriptionTierId.REELTY_PRO_PLUS,
           ],
         },
-        subscriptionStatus: {
+        status: {
           notIn: [
             SubscriptionStatus.ACTIVE,
             SubscriptionStatus.PAST_DUE,
@@ -26,55 +26,96 @@ async function fixInconsistentUserData() {
           ],
         },
       },
-      select: {
-        id: true,
-        email: true,
-        currentTierId: true,
-        subscriptionStatus: true,
+      include: {
+        user: true,
       },
     });
 
     console.log(
-      `Found ${inconsistentUsers.length} users with inconsistent tier/status`
+      `Found ${inconsistentSubscriptions.length} inconsistent subscriptions`
     );
 
-    // Fix inconsistent users
-    for (const user of inconsistentUsers) {
+    // Fix inconsistent subscriptions
+    for (const subscription of inconsistentSubscriptions) {
       console.log(
-        `Fixing user ${user.email} with tier ${user.currentTierId} and status ${user.subscriptionStatus}`
+        `Fixing subscription for user ${subscription.user.email} with tier ${subscription.tierId} and status ${subscription.status}`
       );
 
-      await prisma.user.update({
-        where: { id: user.id },
+      await prisma.subscription.update({
+        where: { id: subscription.id },
         data: {
-          subscriptionStatus: SubscriptionStatus.ACTIVE,
+          status: SubscriptionStatus.ACTIVE,
         },
       });
 
       await prisma.subscriptionLog.create({
         data: {
-          userId: user.id,
+          userId: subscription.userId,
           action: "STATUS_FIXED_BY_SCRIPT",
-          stripeSubscriptionId: "data_fix",
+          stripeSubscriptionId:
+            subscription.stripeSubscriptionId || "script_fix",
           status: SubscriptionStatus.ACTIVE,
         },
       });
     }
 
-    return inconsistentUsers;
+    // Find FREE tier subscriptions with ACTIVE status
+    const freeActiveSubscriptions = await prisma.subscription.findMany({
+      where: {
+        tierId: SubscriptionTierId.FREE,
+        status: SubscriptionStatus.ACTIVE,
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    console.log(
+      `Found ${freeActiveSubscriptions.length} FREE tier subscriptions with ACTIVE status`
+    );
+
+    // Fix FREE tier subscriptions with ACTIVE status
+    for (const subscription of freeActiveSubscriptions) {
+      console.log(
+        `Fixing FREE tier subscription for user ${subscription.user.email} with ACTIVE status to INACTIVE`
+      );
+
+      await prisma.subscription.update({
+        where: { id: subscription.id },
+        data: {
+          status: SubscriptionStatus.INACTIVE,
+        },
+      });
+
+      await prisma.subscriptionLog.create({
+        data: {
+          userId: subscription.userId,
+          action: "STATUS_FIXED_BY_SCRIPT",
+          stripeSubscriptionId:
+            subscription.stripeSubscriptionId || "script_fix",
+          status: SubscriptionStatus.INACTIVE,
+        },
+      });
+    }
+
+    console.log("Data consistency check completed");
+  } catch (error) {
+    console.error("Error fixing inconsistent user data:", error);
   } finally {
     await prisma.$disconnect();
   }
 }
 
 async function main() {
-  try {
-    console.log("Starting user data fix...");
-    const fixedUsers = await fixInconsistentUserData();
-    console.log(`Fix complete. Updated ${fixedUsers.length} users.`);
-  } catch (error) {
-    console.error("Error during fix:", error);
-  }
+  await fixInconsistentUserData();
+  console.log("Script completed");
 }
 
-main();
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
