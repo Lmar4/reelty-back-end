@@ -203,7 +203,7 @@ async function main() {
     },
     // Lifetime Access Plan
     {
-      tierId: "LIFETIME" as SubscriptionTierId,
+      tierId: SubscriptionTierId.LIFETIME,
       name: "Reelty Lifetime",
       description: "Lifetime access. Available to the first 100 users.",
       stripePriceId: "price_reelty_lifetime",
@@ -251,9 +251,9 @@ async function main() {
 
     // Use type assertion to bypass TypeScript errors
     await prisma.subscriptionTier.upsert({
-      where: { tierId: tier.tierId },
-      update: tierData as any,
-      create: tierData as any,
+      where: { tierId: tier.tierId as SubscriptionTierId },
+      update: tierData,
+      create: tierData,
     });
     console.log(`Created/updated subscription tier: ${tier.name}`);
   }
