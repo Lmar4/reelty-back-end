@@ -25,6 +25,32 @@ const port = Number(process.env.PORT) || 3001;
 // Trust proxy settings
 app.set("trust proxy", 1);
 
+// Special middleware to handle Railway.app proxy behavior
+app.use((req: Request, res: Response, next: Function) => {
+  // Check for Railway-specific headers
+  const railwayOrigin = req.headers["x-forwarded-host"] || req.headers.host;
+  const railwayProto = req.headers["x-forwarded-proto"] || req.protocol;
+
+  // Log Railway-specific headers for debugging
+  logger.info("Railway proxy headers", {
+    "x-forwarded-host": req.headers["x-forwarded-host"],
+    "x-forwarded-proto": req.headers["x-forwarded-proto"],
+    "x-forwarded-for": req.headers["x-forwarded-for"],
+    host: req.headers.host,
+    origin: req.headers.origin,
+  });
+
+  // If we're behind Railway's proxy and the origin header is missing,
+  // but we can reconstruct it from other headers, do so
+  if (!req.headers.origin && railwayOrigin && railwayProto) {
+    const reconstructedOrigin = `${railwayProto}://${railwayOrigin}`;
+    logger.info(`Reconstructing missing origin header: ${reconstructedOrigin}`);
+    req.headers.origin = reconstructedOrigin;
+  }
+
+  next();
+});
+
 // Security and performance middleware
 app.use(helmet());
 app.use(compression());
@@ -49,6 +75,60 @@ logger.info(
   `Configuring CORS for origins: ${JSON.stringify(validCorsOrigins)}`
 );
 
+// CORS configuration - more permissive for troubleshooting
+const corsOptions = {
+  origin: function (
+    origin: string | undefined,
+    callback: (err: Error | null, allow?: boolean) => void
+  ) {
+    // For development or testing - allow requests with no origin
+    if (!origin) {
+      logger.info("Request with no origin - allowing access");
+      return callback(null, true);
+    }
+
+    logger.info(`Checking CORS for origin: ${origin}`);
+
+    // First check exact match
+    if (validCorsOrigins.includes(origin)) {
+      logger.info(`Origin ${origin} is explicitly allowed`);
+      return callback(null, true);
+    }
+
+    // Then check for domain match (with or without www)
+    for (const allowedOrigin of validCorsOrigins) {
+      // Extract domain from allowed origin
+      const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
+      // Extract domain from request origin
+      const requestDomain = origin.replace(/^https?:\/\/(www\.)?/, "");
+
+      if (allowedDomain === requestDomain) {
+        logger.info(
+          `Origin ${origin} matches domain pattern for ${allowedOrigin}`
+        );
+        return callback(null, true);
+      }
+    }
+
+    // If we get here, the origin is not allowed
+    logger.warn(`Origin ${origin} is not allowed by CORS policy`);
+    return callback(null, false);
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-User-Id",
+    "Origin",
+    "Accept",
+  ],
+  exposedHeaders: ["Access-Control-Allow-Origin"],
+  maxAge: 86400, // 24 hours in seconds
+  preflightContinue: false,
+  optionsSuccessStatus: 204,
+};
+
 // Log CORS preflight requests for debugging
 app.use((req: Request, res: Response, next: Function) => {
   if (req.method === "OPTIONS") {
@@ -67,93 +147,48 @@ app.use((req: Request, res: Response, next: Function) => {
   next();
 });
 
-// Static CORS configuration
-app.use(
-  cors({
-    origin: function (origin, callback) {
-      // Allow requests with no origin (like mobile apps, curl requests)
-      if (!origin) {
-        logger.info("Allowing request with no origin");
-        return callback(null, true);
-      }
+// Apply CORS configuration
+app.use(cors(corsOptions));
 
-      // Log all incoming origins for debugging
-      logger.info(`Received request with origin: ${origin}`);
-
-      // Check if the origin is in our list of allowed origins
-      if (validCorsOrigins.indexOf(origin) !== -1) {
-        logger.info(`Origin ${origin} is allowed by CORS policy`);
-        return callback(null, true);
-      } else {
-        // Try to match with a more flexible approach (for subdomain handling)
-        const isAllowed = validCorsOrigins.some((allowedOrigin) => {
-          // Convert to regex pattern that would match the domain with or without www
-          const allowedDomain = allowedOrigin.replace(
-            /^https?:\/\/(www\.)?/,
-            ""
-          );
-          // Create a regex that matches the domain regardless of protocol and www prefix
-          const pattern = `^https?://(www\\.)?${allowedDomain.replace(
-            /\./g,
-            "\\."
-          )}$`;
-          const regex = new RegExp(pattern);
-          logger.info(`Checking origin ${origin} against pattern ${pattern}`);
-          return regex.test(origin);
-        });
-
-        if (isAllowed) {
-          logger.info(`Origin ${origin} is allowed by flexible CORS matching`);
-          return callback(null, true);
-        }
-
-        logger.warn(`Request from unauthorized origin rejected: ${origin}`);
-        return callback(
-          new Error(`Origin ${origin} not allowed by CORS policy`),
-          false
-        );
-      }
-    },
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-User-Id"],
-    exposedHeaders: ["Access-Control-Allow-Origin"],
-    preflightContinue: false,
-    optionsSuccessStatus: 204,
-  })
-);
-
-// Additional middleware to ensure CORS headers are set
+// Additional middleware to ensure CORS headers are set correctly
 app.use((req: Request, res: Response, next: Function) => {
   const origin = req.headers.origin;
 
-  // If the origin is allowed, set the header explicitly
-  if (origin && validCorsOrigins.includes(origin)) {
-    res.header("Access-Control-Allow-Origin", origin);
-  } else if (origin) {
-    // Check with the more flexible approach
-    const isAllowed = validCorsOrigins.some((allowedOrigin) => {
-      const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
-      const pattern = `^https?://(www\\.)?${allowedDomain.replace(
-        /\./g,
-        "\\."
-      )}$`;
-      const regex = new RegExp(pattern);
-      return regex.test(origin);
-    });
+  // If there's an origin header and it's allowed, set the CORS headers explicitly
+  if (origin) {
+    // Check if origin is allowed using the same logic as in corsOptions
+    let isAllowed = validCorsOrigins.includes(origin);
+
+    if (!isAllowed) {
+      // Check domain match
+      for (const allowedOrigin of validCorsOrigins) {
+        const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
+        const requestDomain = origin.replace(/^https?:\/\/(www\.)?/, "");
+
+        if (allowedDomain === requestDomain) {
+          isAllowed = true;
+          break;
+        }
+      }
+    }
 
     if (isAllowed) {
+      // Set explicit CORS headers
       res.header("Access-Control-Allow-Origin", origin);
+      res.header("Access-Control-Allow-Credentials", "true");
+      res.header(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+      );
+      res.header(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, X-User-Id, Origin, Accept"
+      );
+
+      // Log that we're setting headers
+      logger.info(`Explicitly setting CORS headers for origin: ${origin}`);
     }
   }
-
-  // Set other CORS headers
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-User-Id"
-  );
-  res.header("Access-Control-Allow-Credentials", "true");
 
   next();
 });
@@ -237,29 +272,76 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ success: true, message: "OK" });
 });
 
-// CORS test endpoint
-app.get("/cors-test", (req: Request, res: Response) => {
+// CORS diagnostic endpoint
+app.get("/api/cors-test", (req: Request, res: Response) => {
   const origin = req.headers.origin || "No origin";
-  const allowedOrigins = validCorsOrigins.join(", ");
+  const host = req.headers.host || "No host";
+  const referer = req.headers.referer || "No referer";
 
+  // Check if this origin would be allowed by our CORS rules
+  let isAllowed = false;
+  let matchType = "none";
+
+  if (typeof origin === "string") {
+    // Check exact match
+    if (validCorsOrigins.includes(origin)) {
+      isAllowed = true;
+      matchType = "exact";
+    } else {
+      // Check domain match
+      for (const allowedOrigin of validCorsOrigins) {
+        const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
+        const requestDomain = origin.replace(/^https?:\/\/(www\.)?/, "");
+
+        if (allowedDomain === requestDomain) {
+          isAllowed = true;
+          matchType = "domain";
+          break;
+        }
+      }
+    }
+  }
+
+  // Get all response headers for debugging
+  const responseHeaders: Record<
+    string,
+    string | string[] | number | undefined
+  > = {};
+  const headerNames = res.getHeaderNames();
+  for (const name of headerNames) {
+    responseHeaders[name] = res.getHeader(name);
+  }
+
+  // Return comprehensive diagnostic information
   res.json({
     success: true,
-    message: "CORS is working correctly if you can see this message",
-    requestOrigin: origin,
-    allowedOrigins: allowedOrigins,
-    corsHeadersSet: {
-      "access-control-allow-origin": res.getHeader(
-        "Access-Control-Allow-Origin"
-      ),
-      "access-control-allow-methods": res.getHeader(
-        "Access-Control-Allow-Methods"
-      ),
-      "access-control-allow-headers": res.getHeader(
-        "Access-Control-Allow-Headers"
-      ),
-      "access-control-allow-credentials": res.getHeader(
-        "Access-Control-Allow-Credentials"
-      ),
+    message: "CORS diagnostic information",
+    corsStatus: {
+      allowed: isAllowed,
+      matchType: matchType,
+    },
+    request: {
+      origin: origin,
+      host: host,
+      referer: referer,
+      ip: req.ip,
+      method: req.method,
+      path: req.path,
+      protocol: req.protocol,
+      secure: req.secure,
+    },
+    corsConfig: {
+      allowedOrigins: validCorsOrigins,
+      methods: corsOptions.methods,
+      allowedHeaders: corsOptions.allowedHeaders,
+      exposedHeaders: corsOptions.exposedHeaders,
+      credentials: corsOptions.credentials,
+      maxAge: corsOptions.maxAge,
+    },
+    responseHeaders: responseHeaders,
+    environment: {
+      nodeEnv: process.env.NODE_ENV || "Not set",
+      frontendUrl: process.env.FRONTEND_URL || "Not set",
     },
   });
 });
