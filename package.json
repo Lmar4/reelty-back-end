@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "pnpm prisma generate && tsc",
-    "start": "NODE_OPTIONS='--max-old-space-size=7680' node build/server.js",
+    "start": "NODE_OPTIONS='--max-old-space-size=7680' node build/src/server.js",
     "dev": "NODE_OPTIONS='--max-old-space-size=7680' tsx watch src/server.ts",
     "db:generate": "pnpm prisma generate",
     "db:push": "pnpm prisma db push",
