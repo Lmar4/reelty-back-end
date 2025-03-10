@@ -72,4 +72,4 @@ RUN pnpm run build
 EXPOSE 8080
 
 # Start the app with explicit Node.js command to ensure NODE_OPTIONS is applied
-CMD ["node", "--max-old-space-size=7680", "build/server.js"]
+CMD ["node", "--max-old-space-size=7680", "build/src/server.js"]
