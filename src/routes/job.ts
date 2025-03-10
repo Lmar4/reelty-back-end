@@ -21,70 +21,147 @@ if (!process.env.RUNWAYML_API_KEY) {
 async function recoverPendingJobs() {
   try {
     console.log("[RECOVERY] Looking for pending jobs...");
-    const pendingJobs = await prisma.videoJob.findMany({
-      where: {
-        status: VideoGenerationStatus.PENDING,
-        createdAt: {
-          // Only recover jobs from the last 24 hours
-          gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
-        },
-      },
-      include: {
-        listing: true,
-      },
-      orderBy: {
-        createdAt: "desc",
-      },
-      // Limit the number of jobs to recover
-      take: 5,
-    });
 
-    if (pendingJobs.length > 0) {
-      console.log(
-        `[RECOVERY] Found ${pendingJobs.length} pending jobs to recover`
-      );
-
-      // Process jobs one at a time to avoid overwhelming the system
-      for (const job of pendingJobs) {
-        // Check if there's already a processing job for this listing
-        const existingProcessingJob = await prisma.videoJob.findFirst({
-          where: {
-            listingId: job.listingId,
-            status: VideoGenerationStatus.PROCESSING,
+    // Try to use VideoJob first, but fall back to VideoGenerationJob if the table doesn't exist
+    try {
+      const pendingJobs = await prisma.videoJob.findMany({
+        where: {
+          status: VideoGenerationStatus.PENDING,
+          createdAt: {
+            // Only recover jobs from the last 24 hours
+            gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
           },
-        });
+        },
+        include: {
+          listing: true,
+        },
+        orderBy: {
+          createdAt: "desc",
+        },
+        // Limit the number of jobs to recover
+        take: 5,
+      });
 
-        if (existingProcessingJob) {
-          console.log(
-            `[RECOVERY] Skipping job ${job.id} as listing ${job.listingId} already has a processing job`
-          );
-          continue;
-        }
+      if (pendingJobs.length > 0) {
+        console.log(
+          `[RECOVERY] Found ${pendingJobs.length} pending VideoJob jobs to recover`
+        );
 
-        console.log(`[RECOVERY] Restarting job: ${job.id}`);
-        await productionPipeline
-          .execute({
-            jobId: job.id,
-            inputFiles: Array.isArray(job.inputFiles)
-              ? job.inputFiles.map(String)
-              : [],
-            template: (job.template as TemplateKey) || "googlezoomintro",
-            coordinates: job.listing?.coordinates as
-              | { lat: number; lng: number }
-              | undefined,
-          })
-          .catch((error) => {
-            console.error("[RECOVERY] Production pipeline error:", {
-              jobId: job.id,
-              error: error instanceof Error ? error.message : "Unknown error",
-            });
+        // Process jobs one at a time to avoid overwhelming the system
+        for (const job of pendingJobs) {
+          // Check if there's already a processing job for this listing
+          const existingProcessingJob = await prisma.videoJob.findFirst({
+            where: {
+              listingId: job.listingId,
+              status: VideoGenerationStatus.PROCESSING,
+            },
           });
 
-        // Wait a bit before processing the next job
-        await new Promise((resolve) => setTimeout(resolve, 5000));
+          if (existingProcessingJob) {
+            console.log(
+              `[RECOVERY] Skipping job ${job.id} as listing ${job.listingId} already has a processing job`
+            );
+            continue;
+          }
+
+          console.log(`[RECOVERY] Restarting job: ${job.id}`);
+          await productionPipeline
+            .execute({
+              jobId: job.id,
+              inputFiles: Array.isArray(job.inputFiles)
+                ? job.inputFiles.map(String)
+                : [],
+              template: (job.template as TemplateKey) || "googlezoomintro",
+              coordinates: job.listing?.coordinates as
+                | { lat: number; lng: number }
+                | undefined,
+            })
+            .catch((error) => {
+              console.error("[RECOVERY] Production pipeline error:", {
+                jobId: job.id,
+                error: error instanceof Error ? error.message : "Unknown error",
+              });
+            });
+        }
+      } else {
+        console.log("[RECOVERY] No pending VideoJob jobs found");
       }
-    } else {
-      console.log("[RECOVERY] No pending jobs found");
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("does not exist in the current database")
+      ) {
+        console.log(
+          "[RECOVERY] VideoJob table doesn't exist, falling back to VideoGenerationJob"
+        );
+
+        // Fall back to VideoGenerationJob
+        const pendingJobs = await prisma.videoGenerationJob.findMany({
+          where: {
+            status: VideoGenerationStatus.PENDING,
+            createdAt: {
+              // Only recover jobs from the last 24 hours
+              gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
+            },
+          },
+          include: {
+            user: true,
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+          // Limit the number of jobs to recover
+          take: 5,
+        });
+
+        if (pendingJobs.length > 0) {
+          console.log(
+            `[RECOVERY] Found ${pendingJobs.length} pending VideoGenerationJob jobs to recover`
+          );
+
+          // Process jobs one at a time to avoid overwhelming the system
+          for (const job of pendingJobs) {
+            // Check if there's already a processing job for this user
+            const existingProcessingJob =
+              await prisma.videoGenerationJob.findFirst({
+                where: {
+                  userId: job.userId,
+                  status: VideoGenerationStatus.PROCESSING,
+                },
+              });
+
+            if (existingProcessingJob) {
+              console.log(
+                `[RECOVERY] Skipping job ${job.id} as user ${job.userId} already has a processing job`
+              );
+              continue;
+            }
+
+            console.log(`[RECOVERY] Restarting job: ${job.id}`);
+            await productionPipeline
+              .execute({
+                jobId: job.id,
+                inputFiles: Array.isArray(job.inputFiles)
+                  ? job.inputFiles.map(String)
+                  : [],
+                template: (job.template as TemplateKey) || "googlezoomintro",
+                coordinates: undefined, // VideoGenerationJob doesn't have listing with coordinates
+              })
+              .catch((error) => {
+                console.error("[RECOVERY] Production pipeline error:", {
+                  jobId: job.id,
+                  error:
+                    error instanceof Error ? error.message : "Unknown error",
+                });
+              });
+          }
+        } else {
+          console.log("[RECOVERY] No pending VideoGenerationJob jobs found");
+        }
+      } else {
+        // Re-throw other errors
+        throw error;
+      }
     }
   } catch (error) {
     console.error("[RECOVERY] Error:", error);
