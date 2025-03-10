@@ -1,10 +1,10 @@
+import { WebhookEvent } from "@clerk/backend";
+import { SubscriptionTierId } from "@prisma/client";
 import express from "express";
 import { Webhook } from "svix";
-import { WebhookEvent } from "@clerk/backend";
 import { prisma } from "../../lib/prisma.js";
-import { logger } from "../../utils/logger.js";
-import { PrismaClient, SubscriptionTierId } from "@prisma/client";
 import { createApiResponse } from "../../types/api.js";
+import { logger } from "../../utils/logger.js";
 const router = express.Router();
 
 // Extend Express Request type to include webhookEvent
@@ -126,7 +126,7 @@ const validateClerkWebhook = async (
     }
 
     // Check if the timestamp is within a reasonable time window (15 minutes)
-    const timestampMs = parseInt(svix_timestamp, 10);
+    const timestampMs = parseInt(svix_timestamp, 10) * 1000; // Convert seconds to milliseconds
     const currentTimeMs = Date.now();
     const timeDifferenceMs = Math.abs(currentTimeMs - timestampMs);
     const fifteenMinutesMs = 15 * 60 * 1000;
