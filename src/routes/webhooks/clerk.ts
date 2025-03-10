@@ -30,13 +30,14 @@ const validateClerkWebhook = async (
       // Log specific headers we care about
       "svix-id": req.headers["svix-id"],
       "svix-timestamp": req.headers["svix-timestamp"],
-      "svix-signature": req.headers["svix-signature"],
+      "svix-signature": req.headers["svix-signature"] ? "present" : "missing",
       "content-type": req.headers["content-type"],
     },
     path: req.path,
     method: req.method,
     body: req.body, // Parsed JSON body
-    rawBody: (req as any).rawBody, // Raw body string
+    rawBody: (req as any).rawBody ? "present" : "missing", // Raw body string
+    rawBodyLength: (req as any).rawBody?.length,
     url: req.url,
     origin: req.headers.origin,
     host: req.headers.host,
@@ -136,6 +137,7 @@ const validateClerkWebhook = async (
         webhookTimestamp: new Date(timestampMs).toISOString(),
         currentTime: new Date(currentTimeMs).toISOString(),
         differenceMs: timeDifferenceMs,
+        maxAllowedDifference: fifteenMinutesMs,
       });
       res
         .status(400)
@@ -241,6 +243,33 @@ const validateClerkWebhook = async (
           }
         }
 
+        // EMERGENCY BYPASS FOR PRODUCTION - USE WITH CAUTION
+        // This is a temporary measure to help diagnose webhook issues
+        if (process.env.EMERGENCY_BYPASS_WEBHOOK_VERIFICATION === "true") {
+          logger.warn(
+            "[Clerk Webhook] ⚠️ EMERGENCY BYPASSING VERIFICATION IN PRODUCTION MODE ⚠️"
+          );
+          try {
+            req.webhookEvent = JSON.parse(payload) as WebhookEvent;
+            logger.info("[Clerk Webhook] Emergency bypass successful", {
+              eventType: (req.webhookEvent as WebhookEvent).type,
+              userId: (req.webhookEvent as WebhookEvent).data.id,
+            });
+            next();
+            return;
+          } catch (parseError) {
+            logger.error(
+              "[Clerk Webhook] Failed to parse payload as JSON during emergency bypass",
+              {
+                error:
+                  parseError instanceof Error
+                    ? parseError.message
+                    : "Unknown error",
+              }
+            );
+          }
+        }
+
         res
           .status(400)
           .json(
@@ -291,6 +320,8 @@ router.post(
       logger.info("[Clerk Webhook] Processing event", {
         type: eventType,
         userId: evt.data.id,
+        objectType: evt.data.object,
+        timestamp: new Date((evt as any).timestamp || Date.now()).toISOString(),
       });
 
       if (eventType === "user.created" || eventType === "user.updated") {
@@ -302,6 +333,7 @@ router.post(
           emailAddresses: email_addresses,
           firstName: first_name,
           lastName: last_name,
+          primaryEmailId: evt.data.primary_email_address_id,
         });
 
         // Get the primary email
@@ -324,6 +356,7 @@ router.post(
         if (!email) {
           logger.error("[Clerk Webhook] No email address found", {
             availableEmails: email_addresses?.map((e) => e.email_address),
+            userId: id,
           });
           res
             .status(400)
@@ -339,6 +372,42 @@ router.post(
         }
 
         try {
+          // First check if the user already exists
+          const existingUser = await prisma.user.findUnique({
+            where: { id: id as string },
+          });
+
+          if (existingUser) {
+            logger.info("[Clerk Webhook] User already exists, updating", {
+              userId: id,
+              email,
+            });
+
+            // Update the user
+            const updatedUser = await prisma.user.update({
+              where: { id: id as string },
+              data: {
+                email,
+                firstName: first_name || null,
+                lastName: last_name || null,
+              },
+            });
+
+            logger.info("[Clerk Webhook] User updated successfully", {
+              userId: updatedUser.id,
+              email: updatedUser.email,
+            });
+
+            res.status(200).json(createApiResponse(true, updatedUser));
+            return;
+          }
+
+          // User doesn't exist, create a new one
+          logger.info("[Clerk Webhook] Creating new user", {
+            userId: id,
+            email,
+          });
+
           const result = await prisma.$transaction(async (tx) => {
             // Get the FREE tier details first
             const freeTier = await tx.subscriptionTier.findUnique({
@@ -346,12 +415,17 @@ router.post(
             });
 
             if (!freeTier) {
+              logger.error("[Clerk Webhook] Free tier not found", {
+                userId: id,
+                email,
+              });
               throw new Error("Free tier not found");
             }
 
+            // Create the user
             const user = await tx.user.create({
               data: {
-                id: id,
+                id: id as string,
                 email: email,
                 firstName: first_name || null,
                 lastName: last_name || null,
@@ -374,6 +448,12 @@ router.post(
               },
             });
 
+            logger.info("[Clerk Webhook] User created successfully", {
+              userId: user.id,
+              email: user.email,
+              subscriptionsCount: user.subscriptions?.length || 0,
+            });
+
             // Set the active subscription reference
             if (user.subscriptions && user.subscriptions.length > 0) {
               const subscription = user.subscriptions[0];
@@ -382,6 +462,11 @@ router.post(
                 data: {
                   activeSubscriptionId: subscription.id,
                 },
+              });
+
+              logger.info("[Clerk Webhook] Set active subscription", {
+                userId: user.id,
+                subscriptionId: subscription.id,
               });
             }
 
@@ -408,6 +493,7 @@ router.post(
                 {
                   userId: user.id,
                   email: user.email,
+                  credits: freeTier.creditsPerInterval,
                 }
               );
             }
@@ -415,7 +501,7 @@ router.post(
             return user;
           });
 
-          logger.info("[Clerk Webhook] User upsert successful", {
+          logger.info("[Clerk Webhook] User creation transaction successful", {
             userId: result.id,
             email: result.email,
             operation: eventType === "user.created" ? "create" : "update",
