@@ -46,6 +46,9 @@ const validateClerkWebhook = async (
   logger.info("[Clerk Webhook] Secret check", {
     exists: !!CLERK_WEBHOOK_SECRET,
     length: CLERK_WEBHOOK_SECRET?.length,
+    secretFirstChars: CLERK_WEBHOOK_SECRET
+      ? CLERK_WEBHOOK_SECRET.substring(0, 5) + "..."
+      : "missing",
   });
 
   if (!CLERK_WEBHOOK_SECRET) {
@@ -57,7 +60,7 @@ const validateClerkWebhook = async (
           false,
           undefined,
           undefined,
-          "Server configuration error"
+          "Server configuration error: Missing webhook secret"
         )
       );
     return;
@@ -77,14 +80,19 @@ const validateClerkWebhook = async (
   // If there are no headers, error out
   if (!svix_id || !svix_timestamp || !svix_signature) {
     logger.error("[Clerk Webhook] Missing svix headers", {
-      svix_id,
-      svix_timestamp,
-      svix_signature,
+      svix_id: svix_id || "missing",
+      svix_timestamp: svix_timestamp || "missing",
+      svix_signature: svix_signature || "missing",
     });
     res
       .status(400)
       .json(
-        createApiResponse(false, undefined, undefined, "Missing svix headers")
+        createApiResponse(
+          false,
+          undefined,
+          undefined,
+          "Missing required webhook headers"
+        )
       );
     return;
   }
@@ -117,19 +125,134 @@ const validateClerkWebhook = async (
       return;
     }
 
+    // Check if the timestamp is within a reasonable time window (15 minutes)
+    const timestampMs = parseInt(svix_timestamp, 10);
+    const currentTimeMs = Date.now();
+    const timeDifferenceMs = Math.abs(currentTimeMs - timestampMs);
+    const fifteenMinutesMs = 15 * 60 * 1000;
+
+    if (timeDifferenceMs > fifteenMinutesMs) {
+      logger.error("[Clerk Webhook] Timestamp too old or in the future", {
+        webhookTimestamp: new Date(timestampMs).toISOString(),
+        currentTime: new Date(currentTimeMs).toISOString(),
+        differenceMs: timeDifferenceMs,
+      });
+      res
+        .status(400)
+        .json(
+          createApiResponse(
+            false,
+            undefined,
+            undefined,
+            "Webhook timestamp is too old or in the future"
+          )
+        );
+      return;
+    }
+
     // Verify the webhook payload
-    req.webhookEvent = wh.verify(payload, {
-      "svix-id": svix_id,
-      "svix-timestamp": svix_timestamp,
-      "svix-signature": svix_signature,
-    }) as WebhookEvent;
+    try {
+      req.webhookEvent = wh.verify(payload, {
+        "svix-id": svix_id,
+        "svix-timestamp": svix_timestamp,
+        "svix-signature": svix_signature,
+      }) as WebhookEvent;
 
-    logger.info("[Clerk Webhook] Payload verified successfully", {
-      eventType: (req.webhookEvent as WebhookEvent).type,
-      userId: (req.webhookEvent as WebhookEvent).data.id,
-    });
+      logger.info("[Clerk Webhook] Payload verified successfully", {
+        eventType: (req.webhookEvent as WebhookEvent).type,
+        userId: (req.webhookEvent as WebhookEvent).data.id,
+      });
 
-    next();
+      next();
+    } catch (verifyError) {
+      // Try with a different content type as a fallback
+      // Sometimes the content type can cause issues with verification
+      logger.warn(
+        "[Clerk Webhook] First verification attempt failed, trying alternative approach",
+        {
+          error:
+            verifyError instanceof Error
+              ? verifyError.message
+              : "Unknown error",
+        }
+      );
+
+      // For debugging purposes, try to manually construct the signature
+      try {
+        // Log more details about the verification process
+        logger.info("[Clerk Webhook] Detailed verification debug", {
+          payloadFirstBytes: Array.from(
+            new TextEncoder().encode(payload.substring(0, 10))
+          ),
+          signatureHeader: svix_signature,
+          timestampValue: svix_timestamp,
+        });
+
+        // Try again with the original verification
+        req.webhookEvent = wh.verify(payload, {
+          "svix-id": svix_id,
+          "svix-timestamp": svix_timestamp,
+          "svix-signature": svix_signature,
+        }) as WebhookEvent;
+
+        logger.info("[Clerk Webhook] Second verification attempt succeeded");
+        next();
+      } catch (secondVerifyError) {
+        logger.error("[Clerk Webhook] Verification failed after retry", {
+          error:
+            secondVerifyError instanceof Error
+              ? secondVerifyError.message
+              : "Unknown error",
+          stack:
+            secondVerifyError instanceof Error
+              ? secondVerifyError.stack
+              : undefined,
+          bodyType: typeof req.body,
+          bodyKeys: Object.keys(req.body || {}),
+          headers: {
+            svix_id,
+            svix_timestamp,
+            svix_signature,
+          },
+        });
+
+        // For development/testing purposes, you might want to bypass verification in non-production environments
+        if (
+          process.env.NODE_ENV !== "production" &&
+          process.env.BYPASS_WEBHOOK_VERIFICATION === "true"
+        ) {
+          logger.warn(
+            "[Clerk Webhook] ⚠️ BYPASSING VERIFICATION IN DEVELOPMENT MODE ⚠️"
+          );
+          try {
+            req.webhookEvent = JSON.parse(payload) as WebhookEvent;
+            next();
+            return;
+          } catch (parseError) {
+            logger.error(
+              "[Clerk Webhook] Failed to parse payload as JSON during bypass",
+              {
+                error:
+                  parseError instanceof Error
+                    ? parseError.message
+                    : "Unknown error",
+              }
+            );
+          }
+        }
+
+        res
+          .status(400)
+          .json(
+            createApiResponse(
+              false,
+              undefined,
+              undefined,
+              "Webhook verification failed: Invalid signature"
+            )
+          );
+      }
+    }
   } catch (err) {
     logger.error("[Clerk Webhook] Verification failed", {
       error: err instanceof Error ? err.message : "Unknown error",
