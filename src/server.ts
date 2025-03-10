@@ -28,9 +28,60 @@ app.set("trust proxy", 1);
 // Security and performance middleware
 app.use(helmet());
 app.use(compression());
+
+// Parse FRONTEND_URL to handle multiple origins
+const corsOrigins = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.split(",").map((origin) => origin.trim())
+  : ["http://localhost:3000"];
+
+// Validate each origin to ensure they don't contain invalid characters
+const validCorsOrigins = corsOrigins.filter((origin) => {
+  // Basic URL validation - should start with http:// or https://
+  const isValid =
+    /^https?:\/\/[a-zA-Z0-9-_.]+(\.[a-zA-Z0-9-_.]+)*(:[0-9]+)?$/.test(origin);
+  if (!isValid) {
+    logger.warn(`Invalid CORS origin detected and will be ignored: ${origin}`);
+  }
+  return isValid;
+});
+
+logger.info(
+  `Configuring CORS for origins: ${JSON.stringify(validCorsOrigins)}`
+);
+
+// Log CORS preflight requests for debugging
+app.use((req: Request, res: Response, next: Function) => {
+  if (req.method === "OPTIONS") {
+    logger.info("CORS Preflight Request", {
+      origin: req.headers.origin,
+      method: req.method,
+      path: req.path,
+      headers: {
+        "access-control-request-method":
+          req.headers["access-control-request-method"],
+        "access-control-request-headers":
+          req.headers["access-control-request-headers"],
+      },
+    });
+  }
+  next();
+});
+
+// Static CORS configuration
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like mobile apps, curl requests)
+      if (!origin) return callback(null, true);
+
+      // Check if the origin is in our list of allowed origins
+      if (validCorsOrigins.indexOf(origin) !== -1) {
+        return callback(null, true);
+      } else {
+        logger.warn(`Request from unauthorized origin: ${origin}`);
+        return callback(null, false);
+      }
+    },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-User-Id"],
@@ -103,6 +154,7 @@ app.use((err: Error, _req: Request, res: Response, _next: Function) => {
 // Start server
 app.listen(port, "0.0.0.0", () => {
   logger.info(`Server started on port ${port}`);
+  // We already log CORS origins at configuration time, so we don't need to log it again here
 
   // Initialize scheduled jobs
   initializeJobs();
