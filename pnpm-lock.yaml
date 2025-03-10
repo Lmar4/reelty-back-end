@@ -172,7 +172,7 @@ importers:
         specifier: ^29.7.0
         version: 29.7.0
       node-fetch:
-        specifier: '2'
+        specifier: ^2.7.0
         version: 2.7.0
       prisma:
         specifier: ^6.4.1

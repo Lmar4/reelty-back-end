@@ -372,9 +372,20 @@ router.post(
         }
 
         try {
+          // Log the user ID we're trying to find/create
+          logger.info("[Clerk Webhook] Looking for user", {
+            userId: id,
+            eventType,
+          });
+          
           // First check if the user already exists
           const existingUser = await prisma.user.findUnique({
             where: { id: id as string },
+          });
+          
+          logger.info("[Clerk Webhook] User lookup result", {
+            userExists: !!existingUser,
+            userId: id,
           });
 
           if (existingUser) {
@@ -573,6 +584,15 @@ router.post(
       logger.error("[Clerk Webhook] Error processing webhook", {
         error: error instanceof Error ? error.message : "Unknown error",
         stack: error instanceof Error ? error.stack : undefined,
+        eventType: req.webhookEvent?.type || 'unknown',
+        userId: req.webhookEvent?.data?.id || 'unknown',
+        requestBody: req.body ? JSON.stringify(req.body).substring(0, 200) : 'missing',
+        requestHeaders: {
+          'svix-id': req.headers['svix-id'] || 'missing',
+          'svix-timestamp': req.headers['svix-timestamp'] || 'missing',
+          'svix-signature': req.headers['svix-signature'] ? 'present' : 'missing',
+          'content-type': req.headers['content-type'] || 'missing'
+        }
       });
       res
         .status(500)

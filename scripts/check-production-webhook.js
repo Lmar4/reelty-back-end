@@ -8,11 +8,18 @@
  * CLERK_SECRET_KEY=your_clerk_secret_key node scripts/check-production-webhook.js
  */
 
-const fetch = require("node-fetch");
-const dotenv = require("dotenv");
+import fetch from "node-fetch";
+import dotenv from "dotenv";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import path from "path";
+
+// Get the directory of the current module
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 // Load environment variables
-dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
 
@@ -42,7 +49,7 @@ async function checkWebhooks() {
     console.log(`Using Clerk instance: ${instanceId}`);
 
     // Make a request to the Clerk API to get the webhooks
-    const response = await fetch(`https://api.clerk.dev/v1/webhooks`, {
+    const response = await fetch(`https://api.clerk.com/v1/webhooks`, {
       headers: {
         Authorization: `Bearer ${CLERK_SECRET_KEY}`,
         "Content-Type": "application/json",
@@ -83,7 +90,7 @@ async function checkWebhooks() {
 
       // Get the signing secret for this webhook
       const secretResponse = await fetch(
-        `https://api.clerk.dev/v1/webhooks/${webhook.id}/secret`,
+        `https://api.clerk.com/v1/webhooks/${webhook.id}/secret`,
         {
           headers: {
             Authorization: `Bearer ${CLERK_SECRET_KEY}`,
