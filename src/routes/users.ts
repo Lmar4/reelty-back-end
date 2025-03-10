@@ -14,16 +14,33 @@ const verifyWebhook = (
   res: express.Response,
   next: express.NextFunction
 ) => {
+  // Check for API key first
   const apiKey = req.headers["x-api-key"];
-  if (apiKey !== process.env.REELTY_API_KEY) {
-    logger.error("[Users] Invalid API key for webhook request");
-    res.status(401).json({
-      success: false,
-      error: "Unauthorized",
-    });
-    return;
+  if (apiKey === process.env.REELTY_API_KEY) {
+    return next();
   }
-  next();
+  
+  // If no API key, check for Authorization header (from frontend webhook)
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const userId = authHeader.split(' ')[1];
+    if (userId) {
+      // Store userId for use in the handler
+      req.body.id = req.body.id || userId;
+      logger.info("[Users] Request authenticated via Authorization header", { userId });
+      return next();
+    }
+  }
+  
+  // If neither authentication method works, return 401
+  logger.error("[Users] Invalid authentication for user creation request", {
+    hasApiKey: !!apiKey,
+    hasAuthHeader: !!req.headers.authorization,
+  });
+  res.status(401).json({
+    success: false,
+    error: "Unauthorized",
+  });
 };
 
 // Validation schema for user creation
