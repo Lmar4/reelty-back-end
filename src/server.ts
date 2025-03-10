@@ -72,21 +72,91 @@ app.use(
   cors({
     origin: function (origin, callback) {
       // Allow requests with no origin (like mobile apps, curl requests)
-      if (!origin) return callback(null, true);
+      if (!origin) {
+        logger.info("Allowing request with no origin");
+        return callback(null, true);
+      }
+
+      // Log all incoming origins for debugging
+      logger.info(`Received request with origin: ${origin}`);
 
       // Check if the origin is in our list of allowed origins
       if (validCorsOrigins.indexOf(origin) !== -1) {
+        logger.info(`Origin ${origin} is allowed by CORS policy`);
         return callback(null, true);
       } else {
-        logger.warn(`Request from unauthorized origin: ${origin}`);
-        return callback(null, false);
+        // Try to match with a more flexible approach (for subdomain handling)
+        const isAllowed = validCorsOrigins.some((allowedOrigin) => {
+          // Convert to regex pattern that would match the domain with or without www
+          const allowedDomain = allowedOrigin.replace(
+            /^https?:\/\/(www\.)?/,
+            ""
+          );
+          // Create a regex that matches the domain regardless of protocol and www prefix
+          const pattern = `^https?://(www\\.)?${allowedDomain.replace(
+            /\./g,
+            "\\."
+          )}$`;
+          const regex = new RegExp(pattern);
+          logger.info(`Checking origin ${origin} against pattern ${pattern}`);
+          return regex.test(origin);
+        });
+
+        if (isAllowed) {
+          logger.info(`Origin ${origin} is allowed by flexible CORS matching`);
+          return callback(null, true);
+        }
+
+        logger.warn(`Request from unauthorized origin rejected: ${origin}`);
+        return callback(
+          new Error(`Origin ${origin} not allowed by CORS policy`),
+          false
+        );
       }
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-User-Id"],
+    exposedHeaders: ["Access-Control-Allow-Origin"],
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
   })
 );
+
+// Additional middleware to ensure CORS headers are set
+app.use((req: Request, res: Response, next: Function) => {
+  const origin = req.headers.origin;
+
+  // If the origin is allowed, set the header explicitly
+  if (origin && validCorsOrigins.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+  } else if (origin) {
+    // Check with the more flexible approach
+    const isAllowed = validCorsOrigins.some((allowedOrigin) => {
+      const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
+      const pattern = `^https?://(www\\.)?${allowedDomain.replace(
+        /\./g,
+        "\\."
+      )}$`;
+      const regex = new RegExp(pattern);
+      return regex.test(origin);
+    });
+
+    if (isAllowed) {
+      res.header("Access-Control-Allow-Origin", origin);
+    }
+  }
+
+  // Set other CORS headers
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-User-Id"
+  );
+  res.header("Access-Control-Allow-Credentials", "true");
+
+  next();
+});
 
 // Parse JSON bodies with raw body access for webhooks
 app.use(
@@ -165,6 +235,33 @@ app.use(limiter);
 // Health check endpoint
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ success: true, message: "OK" });
+});
+
+// CORS test endpoint
+app.get("/cors-test", (req: Request, res: Response) => {
+  const origin = req.headers.origin || "No origin";
+  const allowedOrigins = validCorsOrigins.join(", ");
+
+  res.json({
+    success: true,
+    message: "CORS is working correctly if you can see this message",
+    requestOrigin: origin,
+    allowedOrigins: allowedOrigins,
+    corsHeadersSet: {
+      "access-control-allow-origin": res.getHeader(
+        "Access-Control-Allow-Origin"
+      ),
+      "access-control-allow-methods": res.getHeader(
+        "Access-Control-Allow-Methods"
+      ),
+      "access-control-allow-headers": res.getHeader(
+        "Access-Control-Allow-Headers"
+      ),
+      "access-control-allow-credentials": res.getHeader(
+        "Access-Control-Allow-Credentials"
+      ),
+    },
+  });
 });
 
 // Routes
