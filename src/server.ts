@@ -78,6 +78,28 @@ app.use((req: Request, res: Response, next: NextFunction) => {
           req.headers["access-control-request-headers"],
       },
     });
+
+    // Add response header logging for verification
+    res.on("finish", () => {
+      logger.info("CORS Preflight Response", {
+        statusCode: res.statusCode,
+        headers: {
+          "access-control-allow-origin": res.getHeader(
+            "access-control-allow-origin"
+          ),
+          "access-control-allow-methods": res.getHeader(
+            "access-control-allow-methods"
+          ),
+          "access-control-allow-headers": res.getHeader(
+            "access-control-allow-headers"
+          ),
+          "access-control-allow-credentials": res.getHeader(
+            "access-control-allow-credentials"
+          ),
+          "access-control-max-age": res.getHeader("access-control-max-age"),
+        },
+      });
+    });
   }
   next();
 });
@@ -211,7 +233,26 @@ app.get("/api/cors-test", (req: Request, res: Response) => {
       nodeEnv: process.env.NODE_ENV || "Not set",
       frontendUrl: process.env.FRONTEND_URL || "Not set",
     },
+    verification: {
+      preflightTest:
+        "To test preflight, send an OPTIONS request to this endpoint",
+      preflightUrl: `${req.protocol}://${req.headers.host}/api/cors-test`,
+      curlCommand: `curl -X OPTIONS -H "Origin: ${origin}" -H "Access-Control-Request-Method: GET" -H "Access-Control-Request-Headers: Content-Type" -v ${req.protocol}://${req.headers.host}/api/cors-test`,
+    },
   });
+});
+
+// Add explicit OPTIONS handler for the test endpoint
+app.options("/api/cors-test", (req: Request, res: Response) => {
+  // This will be handled by the CORS middleware, but we can add extra verification
+  logger.info("Explicit OPTIONS handler for CORS test endpoint", {
+    origin: req.headers.origin,
+    requestMethod: req.headers["access-control-request-method"],
+    requestHeaders: req.headers["access-control-request-headers"],
+  });
+
+  // The response will be sent by the CORS middleware
+  // This just ensures we have a specific handler for the test endpoint
 });
 
 // Routes
