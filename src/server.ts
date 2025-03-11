@@ -200,58 +200,10 @@ app.use(
       // Store the raw body for webhook verification
       const rawBody = buf.toString();
       (req as any).rawBody = rawBody;
-
-      // Debug log for webhook requests
-      if (req.path.includes("/webhooks/")) {
-        logger.info("[Express JSON Parser]", {
-          path: req.path,
-          method: req.method,
-          contentType: req.headers["content-type"],
-          contentLength: req.headers["content-length"],
-          rawBodyLength: rawBody.length,
-          // Log the first 50 characters of the raw body for debugging
-          rawBodyPreview:
-            rawBody.substring(0, 50) + (rawBody.length > 50 ? "..." : ""),
-          // Log important webhook headers
-          webhookHeaders: {
-            "svix-id": req.headers["svix-id"] || "missing",
-            "svix-timestamp": req.headers["svix-timestamp"] || "missing",
-            "svix-signature": req.headers["svix-signature"]
-              ? "present"
-              : "missing",
-          },
-        });
-      }
     },
     limit: "10mb", // Increase payload size limit
   })
 );
-
-// Add a special raw body parser for webhook routes
-app.use("/webhooks", (req, res, next) => {
-  // If we already have the raw body from the JSON parser, continue
-  if ((req as any).rawBody) {
-    next();
-    return;
-  }
-
-  // For non-JSON content types, we need to manually capture the raw body
-  let data = "";
-  req.on("data", (chunk) => {
-    data += chunk;
-  });
-
-  req.on("end", () => {
-    (req as any).rawBody = data;
-    logger.info("[Webhook Raw Body Parser]", {
-      path: req.path,
-      method: req.method,
-      contentType: req.headers["content-type"],
-      rawBodyLength: data.length,
-    });
-    next();
-  });
-});
 
 // Add Clerk webhook route (before Clerk middleware to keep it public)
 app.use("/webhooks/clerk", clerkWebhookRouter);

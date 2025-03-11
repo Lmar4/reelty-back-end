@@ -23,49 +23,14 @@ const validateClerkWebhook = async (
   res: express.Response,
   next: express.NextFunction
 ) => {
-  // Log request details
+  // Log basic request info
   logger.info("[Clerk Webhook] Received webhook request", {
-    headers: {
-      "svix-id": req.headers["svix-id"],
-      "svix-timestamp": req.headers["svix-timestamp"],
-      "svix-signature": req.headers["svix-signature"] ? "present" : "missing",
-      "content-type": req.headers["content-type"],
-    },
     path: req.path,
     method: req.method,
-    rawBodyPresent: (req as any).rawBody ? "yes" : "no",
-    rawBodyLength: (req as any).rawBody?.length,
+    contentType: req.headers["content-type"],
   });
 
-  // Check for BYPASS_CLERK_WEBHOOK_VERIFICATION environment variable
-  const bypassVerification =
-    process.env.BYPASS_CLERK_WEBHOOK_VERIFICATION === "true";
-
-  if (bypassVerification) {
-    logger.warn("[Clerk Webhook] ⚠️ BYPASSING WEBHOOK VERIFICATION ⚠️");
-    try {
-      req.webhookEvent = JSON.parse((req as any).rawBody) as WebhookEvent;
-      logger.info("[Clerk Webhook] Bypass successful", {
-        eventType: req.webhookEvent.type,
-        userId: req.webhookEvent.data.id,
-      });
-      next();
-      return;
-    } catch (parseError) {
-      logger.error("[Clerk Webhook] Failed to parse payload during bypass", {
-        error:
-          parseError instanceof Error ? parseError.message : "Unknown error",
-      });
-      res
-        .status(400)
-        .json(
-          createApiResponse(false, undefined, undefined, "Invalid JSON payload")
-        );
-      return;
-    }
-  }
-
-  // Normal verification path
+  // Get the webhook secret
   const CLERK_WEBHOOK_SECRET = process.env.CLERK_WEBHOOK_SECRET;
 
   if (!CLERK_WEBHOOK_SECRET) {
@@ -80,7 +45,7 @@ const validateClerkWebhook = async (
           "Server configuration error: Missing webhook secret"
         )
       );
-    return;
+    return; // Return without a value
   }
 
   // Get the headers
@@ -105,7 +70,7 @@ const validateClerkWebhook = async (
           "Missing required webhook headers"
         )
       );
-    return;
+    return; // Return without a value
   }
 
   // Get the raw body
@@ -118,7 +83,7 @@ const validateClerkWebhook = async (
       .json(
         createApiResponse(false, undefined, undefined, "Missing request body")
       );
-    return;
+    return; // Return without a value
   }
 
   try {
@@ -140,12 +105,6 @@ const validateClerkWebhook = async (
   } catch (err) {
     logger.error("[Clerk Webhook] Verification failed", {
       error: err instanceof Error ? err.message : "Unknown error",
-      stack: err instanceof Error ? err.stack : undefined,
-      headers: {
-        svix_id,
-        svix_timestamp,
-        svix_signature,
-      },
       payloadSample: payload.substring(0, 100) + "...", // Log first 100 chars
     });
 
@@ -159,6 +118,7 @@ const validateClerkWebhook = async (
           "Webhook verification failed: Invalid signature"
         )
       );
+    // No return value
   }
 };
 
