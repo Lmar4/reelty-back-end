@@ -82,13 +82,10 @@ const validCorsOrigins = [
   }),
   "https://reelty.io",
   "https://www.reelty.io",
+  "https://api.reelty.io",
 ];
 
-logger.info(
-  `Configuring CORS for origins: ${JSON.stringify(validCorsOrigins)}`
-);
-
-// Apply CORS middleware early in the middleware chain
+// IMPORTANT: Apply CORS middleware FIRST before any other middleware
 app.use(
   configureCors({
     allowedOrigins: validCorsOrigins,
@@ -105,6 +102,12 @@ app.use(
     credentials: true,
   }) as express.RequestHandler
 );
+
+// Add a universal OPTIONS handler to respond to all preflight requests
+app.options("*", (req: Request, res: Response) => {
+  // This will handle all OPTIONS requests globally
+  res.status(204).end();
+});
 
 // Log CORS preflight requests for debugging
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -163,8 +166,15 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Security and performance middleware
-app.use(helmet());
+// Configure helmet with CORS-friendly settings
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    crossOriginOpenerPolicy: { policy: "unsafe-none" },
+    contentSecurityPolicy: false,
+  })
+);
+
 app.use(compression());
 
 // Parse JSON bodies with raw body access for webhooks
@@ -183,13 +193,29 @@ app.use(
 app.use("/webhooks/clerk", clerkWebhookRouter);
 logger.info("Registered Clerk webhook route at /webhooks/clerk");
 
-// Add Clerk middleware for all other routes
-app.use(clerkMiddleware());
+// Define public routes that don't need authentication
+const publicPaths = ["/health", "/api/health", "/api/cors-test", "/webhooks/"];
 
-// Rate limiting
+// Apply Clerk middleware selectively - skip for OPTIONS requests and public paths
+app.use((req: Request, res: Response, next: NextFunction) => {
+  // Skip Clerk middleware for OPTIONS requests and public paths
+  if (
+    req.method === "OPTIONS" ||
+    publicPaths.some((path) => req.path.startsWith(path))
+  ) {
+    return next();
+  }
+
+  // Apply Clerk middleware for all other routes
+  return clerkMiddleware()(req, res, next);
+});
+
+// Rate limiting - apply after CORS and OPTIONS handling
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // limit each IP to 100 requests per windowMs
+  // Don't apply to OPTIONS requests
+  skip: (req) => req.method === "OPTIONS",
 });
 app.use(limiter);
 
