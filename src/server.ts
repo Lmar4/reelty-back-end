@@ -23,9 +23,6 @@ logger.info("V8 Heap Space Statistics", v8.getHeapSpaceStatistics());
 const app = express();
 const port = Number(process.env.PORT) || 3001;
 
-// Trust proxy settings
-app.set("trust proxy", 1);
-
 // Parse FRONTEND_URL to handle multiple origins
 const corsOrigins = process.env.FRONTEND_URL
   ? process.env.FRONTEND_URL.split(",").map((origin) => origin.trim())
