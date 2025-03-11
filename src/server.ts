@@ -1,23 +1,57 @@
 import { clerkMiddleware } from "@clerk/express";
 import compression from "compression";
-import cors from "cors";
-import express, { Request, Response, NextFunction } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
+import v8 from "v8";
+import { initializeJobs } from "./jobs/index.js";
+import { prisma } from "./lib/prisma.js";
+import { configureCors } from "./middleware/cors.js";
+import { dbHealthCheck } from "./middleware/dbHealthCheck.js";
 import adminRouter from "./routes/admin/index.js";
 import creditsRouter from "./routes/credits.js";
+import healthRoutes from "./routes/health.js";
 import jobsRouter from "./routes/job.js";
 import listingsRouter from "./routes/listings.js";
 import photosRouter from "./routes/photos.js";
 import subscriptionRouter from "./routes/subscription.js";
 import templatesRouter from "./routes/templates.js";
 import usersRouter from "./routes/users.js";
-import clerkWebhookRouter from "./routes/webhooks/clerk.js";
 import { videosRouter } from "./routes/videos.js";
+import clerkWebhookRouter from "./routes/webhooks/clerk.js";
 import { logger } from "./utils/logger.js";
-import v8 from "v8";
-import { initializeJobs } from "./jobs/index.js";
-import { configureCors } from "./middleware/cors.js";
+
+// Enhance DATABASE_URL with connection pool parameters if not already present
+if (
+  process.env.DATABASE_URL &&
+  !process.env.DATABASE_URL.includes("pool_timeout")
+) {
+  try {
+    const dbUrl = new URL(process.env.DATABASE_URL);
+
+    // Add connection pool parameters to the URL
+    dbUrl.searchParams.set(
+      "pool_timeout",
+      process.env.PRISMA_CONNECTION_TIMEOUT || "30000"
+    );
+    dbUrl.searchParams.set(
+      "connection_limit",
+      process.env.PRISMA_CONNECTION_POOL_MAX || "10"
+    );
+    dbUrl.searchParams.set("statement_timeout", "60000");
+    dbUrl.searchParams.set("idle_in_transaction_session_timeout", "60000");
+
+    // Update the environment variable
+    process.env.DATABASE_URL = dbUrl.toString();
+
+    logger.info("Enhanced DATABASE_URL with connection pool parameters");
+  } catch (error) {
+    logger.error(
+      "Failed to enhance DATABASE_URL with connection pool parameters:",
+      error
+    );
+  }
+}
 
 logger.info("V8 Heap Space Statistics", v8.getHeapSpaceStatistics());
 const app = express();
@@ -148,6 +182,9 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+// Health check endpoints (no auth required)
+app.use("/api", healthRoutes);
+
 // Health check endpoint
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ success: true, message: "OK" });
@@ -252,6 +289,9 @@ app.options("/api/cors-test", (req: Request, res: Response) => {
   // This just ensures we have a specific handler for the test endpoint
 });
 
+// Apply database health check middleware to all API routes
+app.use("/api", dbHealthCheck);
+
 // Routes
 app.use("/api/listings", listingsRouter);
 app.use("/api/users", usersRouter);
@@ -272,6 +312,25 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   });
   res.status(500).json({ success: false, error: err.message });
 });
+
+// Graceful shutdown function
+const gracefulShutdown = async () => {
+  logger.info("Received shutdown signal, closing connections...");
+
+  // Close database connections
+  try {
+    await prisma.$disconnect();
+    logger.info("Database connections closed successfully");
+  } catch (error) {
+    logger.error("Error closing database connections:", error);
+  }
+
+  process.exit(0);
+};
+
+// Register shutdown handlers
+process.on("SIGINT", gracefulShutdown);
+process.on("SIGTERM", gracefulShutdown);
 
 // Start server
 app.listen(port, "0.0.0.0", () => {

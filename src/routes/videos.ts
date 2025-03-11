@@ -4,6 +4,7 @@ import { logger } from "../utils/logger.js";
 import { prisma } from "../lib/prisma.js";
 import { isAuthenticated } from "../middleware/auth.js";
 import { Prisma } from "@prisma/client";
+import { withDbRetry } from "../utils/dbRetry.js";
 
 const router = express.Router();
 
@@ -44,20 +45,22 @@ router.post(
       const userIdToUse = userId || req.user!.id;
 
       // Check if the user exists and get their subscription tier
-      const user = await prisma.user.findUnique({
-        where: { id: userIdToUse },
-        include: {
-          activeSubscription: {
-            include: {
-              tier: true,
+      const user = await withDbRetry(async () => {
+        return prisma.user.findUnique({
+          where: { id: userIdToUse },
+          include: {
+            activeSubscription: {
+              include: {
+                tier: true,
+              },
+            },
+            videoDownloads: {
+              where: {
+                jobId,
+              },
             },
           },
-          videoDownloads: {
-            where: {
-              jobId,
-            },
-          },
-        },
+        });
       });
 
       if (!user) {
@@ -69,8 +72,10 @@ router.post(
       }
 
       // Check if the job exists and belongs to the user
-      const job = await prisma.videoJob.findUnique({
-        where: { id: jobId },
+      const job = await withDbRetry(async () => {
+        return prisma.videoJob.findUnique({
+          where: { id: jobId },
+        });
       });
 
       if (!job) {
@@ -104,10 +109,12 @@ router.post(
       const maxDownloads = user.activeSubscription?.tier?.maxReelDownloads;
 
       if (maxDownloads !== undefined && maxDownloads !== null) {
-        const downloadCount = await prisma.videoDownload.count({
-          where: {
-            userId: userIdToUse,
-          },
+        const downloadCount = await withDbRetry(async () => {
+          return prisma.videoDownload.count({
+            where: {
+              userId: userIdToUse,
+            },
+          });
         });
 
         if (downloadCount >= maxDownloads) {
@@ -126,12 +133,14 @@ router.post(
       }
 
       // Track the download
-      const download = await prisma.videoDownload.create({
-        data: {
-          userId: userIdToUse,
-          jobId,
-          templateKey,
-        },
+      const download = await withDbRetry(async () => {
+        return prisma.videoDownload.create({
+          data: {
+            userId: userIdToUse,
+            jobId,
+            templateKey,
+          },
+        });
       });
 
       logger.info("Video download tracked successfully", {
@@ -184,24 +193,28 @@ router.get("/download-count", isAuthenticated, async (req, res) => {
     }
 
     // Get the user's download count
-    const downloadCount = await prisma.videoDownload.count({
-      where: {
-        userId,
-      },
+    const downloadCount = await withDbRetry(async () => {
+      return prisma.videoDownload.count({
+        where: {
+          userId,
+        },
+      });
     });
 
     // Get the user's subscription tier
-    const user = await prisma.user.findUnique({
-      where: {
-        id: userId,
-      },
-      include: {
-        activeSubscription: {
-          include: {
-            tier: true,
+    const user = await withDbRetry(async () => {
+      return prisma.user.findUnique({
+        where: {
+          id: userId,
+        },
+        include: {
+          activeSubscription: {
+            include: {
+              tier: true,
+            },
           },
         },
-      },
+      });
     });
 
     const maxDownloads = user?.activeSubscription?.tier?.maxReelDownloads || 1;
