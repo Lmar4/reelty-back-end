@@ -63,15 +63,26 @@ const corsOrigins = process.env.FRONTEND_URL
   : ["http://localhost:3000"];
 
 // Validate each origin to ensure they don't contain invalid characters
-const validCorsOrigins = corsOrigins.filter((origin) => {
-  // Basic URL validation - should start with http:// or https://
-  const isValid =
-    /^https?:\/\/[a-zA-Z0-9-_.]+(\.[a-zA-Z0-9-_.]+)*(:[0-9]+)?$/.test(origin);
-  if (!isValid) {
-    logger.warn(`Invalid CORS origin detected and will be ignored: ${origin}`);
-  }
-  return isValid;
-});
+const validCorsOrigins = [
+  ...corsOrigins.filter((origin) => {
+    // Basic URL validation - should start with http:// or https://
+    const isValid =
+      /^https?:\/\/[a-zA-Z0-9-_.]+(\.[a-zA-Z0-9-_.]+)*(:[0-9]+)?$/.test(
+        origin
+      ) ||
+      origin === "https://reelty.io" ||
+      origin === "https://api.reelty.io" ||
+      origin === "https://www.reelty.io";
+    if (!isValid) {
+      logger.warn(
+        `Invalid CORS origin detected and will be ignored: ${origin}`
+      );
+    }
+    return isValid;
+  }),
+  "https://reelty.io",
+  "https://www.reelty.io",
+];
 
 logger.info(
   `Configuring CORS for origins: ${JSON.stringify(validCorsOrigins)}`
@@ -208,7 +219,11 @@ app.get("/api/cors-test", (req: Request, res: Response) => {
     } else {
       // Check domain match
       for (const allowedOrigin of validCorsOrigins) {
-        const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
+        // Ensure allowedOrigin is treated as a string
+        const allowedDomain = String(allowedOrigin).replace(
+          /^https?:\/\/(www\.)?/,
+          ""
+        );
         const requestDomain = origin.replace(/^https?:\/\/(www\.)?/, "");
 
         if (allowedDomain === requestDomain) {
