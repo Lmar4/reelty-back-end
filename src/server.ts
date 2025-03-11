@@ -1,7 +1,7 @@
 import { clerkMiddleware } from "@clerk/express";
 import compression from "compression";
 import cors from "cors";
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
 import { rateLimit } from "express-rate-limit";
 import helmet from "helmet";
 import adminRouter from "./routes/admin/index.js";
@@ -17,6 +17,7 @@ import { videosRouter } from "./routes/videos.js";
 import { logger } from "./utils/logger.js";
 import v8 from "v8";
 import { initializeJobs } from "./jobs/index.js";
+import { configureCors } from "./middleware/cors.js";
 
 logger.info("V8 Heap Space Statistics", v8.getHeapSpaceStatistics());
 const app = express();
@@ -24,36 +25,6 @@ const port = Number(process.env.PORT) || 3001;
 
 // Trust proxy settings
 app.set("trust proxy", 1);
-
-// Special middleware to handle Railway.app proxy behavior
-app.use((req: Request, res: Response, next: Function) => {
-  // Check for Railway-specific headers
-  const railwayOrigin = req.headers["x-forwarded-host"] || req.headers.host;
-  const railwayProto = req.headers["x-forwarded-proto"] || req.protocol;
-
-  // Log Railway-specific headers for debugging
-  logger.info("Railway proxy headers", {
-    "x-forwarded-host": req.headers["x-forwarded-host"],
-    "x-forwarded-proto": req.headers["x-forwarded-proto"],
-    "x-forwarded-for": req.headers["x-forwarded-for"],
-    host: req.headers.host,
-    origin: req.headers.origin,
-  });
-
-  // If we're behind Railway's proxy and the origin header is missing,
-  // but we can reconstruct it from other headers, do so
-  if (!req.headers.origin && railwayOrigin && railwayProto) {
-    const reconstructedOrigin = `${railwayProto}://${railwayOrigin}`;
-    logger.info(`Reconstructing missing origin header: ${reconstructedOrigin}`);
-    req.headers.origin = reconstructedOrigin;
-  }
-
-  next();
-});
-
-// Security and performance middleware
-app.use(helmet());
-app.use(compression());
 
 // Parse FRONTEND_URL to handle multiple origins
 const corsOrigins = process.env.FRONTEND_URL
@@ -75,62 +46,26 @@ logger.info(
   `Configuring CORS for origins: ${JSON.stringify(validCorsOrigins)}`
 );
 
-// CORS configuration - more permissive for troubleshooting
-const corsOptions = {
-  origin: function (
-    origin: string | undefined,
-    callback: (err: Error | null, allow?: boolean) => void
-  ) {
-    // For development or testing - allow requests with no origin
-    if (!origin) {
-      logger.info("Request with no origin - allowing access");
-      return callback(null, true);
-    }
-
-    logger.info(`Checking CORS for origin: ${origin}`);
-
-    // First check exact match
-    if (validCorsOrigins.includes(origin)) {
-      logger.info(`Origin ${origin} is explicitly allowed`);
-      return callback(null, true);
-    }
-
-    // Then check for domain match (with or without www)
-    for (const allowedOrigin of validCorsOrigins) {
-      // Extract domain from allowed origin
-      const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
-      // Extract domain from request origin
-      const requestDomain = origin.replace(/^https?:\/\/(www\.)?/, "");
-
-      if (allowedDomain === requestDomain) {
-        logger.info(
-          `Origin ${origin} matches domain pattern for ${allowedOrigin}`
-        );
-        return callback(null, true);
-      }
-    }
-
-    // If we get here, the origin is not allowed
-    logger.warn(`Origin ${origin} is not allowed by CORS policy`);
-    return callback(null, false);
-  },
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "X-User-Id",
-    "Origin",
-    "Accept",
-  ],
-  exposedHeaders: ["Access-Control-Allow-Origin"],
-  maxAge: 86400, // 24 hours in seconds
-  preflightContinue: false,
-  optionsSuccessStatus: 204,
-};
+// Apply CORS middleware early in the middleware chain
+app.use(
+  configureCors({
+    allowedOrigins: validCorsOrigins,
+    allowedMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-User-Id",
+      "Origin",
+      "Accept",
+    ],
+    exposedHeaders: ["Access-Control-Allow-Origin"],
+    maxAge: 86400, // 24 hours in seconds
+    credentials: true,
+  }) as express.RequestHandler
+);
 
 // Log CORS preflight requests for debugging
-app.use((req: Request, res: Response, next: Function) => {
+app.use((req: Request, res: Response, next: NextFunction) => {
   if (req.method === "OPTIONS") {
     logger.info("CORS Preflight Request", {
       origin: req.headers.origin,
@@ -147,51 +82,26 @@ app.use((req: Request, res: Response, next: Function) => {
   next();
 });
 
-// Apply CORS configuration
-app.use(cors(corsOptions));
+// Special middleware to handle Railway.app proxy behavior
+app.use((req: Request, res: Response, next: NextFunction) => {
+  // Check for Railway-specific headers
+  const railwayOrigin = req.headers["x-forwarded-host"] || req.headers.host;
+  const railwayProto = req.headers["x-forwarded-proto"] || req.protocol;
 
-// Additional middleware to ensure CORS headers are set correctly
-app.use((req: Request, res: Response, next: Function) => {
-  const origin = req.headers.origin;
-
-  // If there's an origin header and it's allowed, set the CORS headers explicitly
-  if (origin) {
-    // Check if origin is allowed using the same logic as in corsOptions
-    let isAllowed = validCorsOrigins.includes(origin);
-
-    if (!isAllowed) {
-      // Check domain match
-      for (const allowedOrigin of validCorsOrigins) {
-        const allowedDomain = allowedOrigin.replace(/^https?:\/\/(www\.)?/, "");
-        const requestDomain = origin.replace(/^https?:\/\/(www\.)?/, "");
-
-        if (allowedDomain === requestDomain) {
-          isAllowed = true;
-          break;
-        }
-      }
-    }
-
-    if (isAllowed) {
-      // Set explicit CORS headers
-      res.header("Access-Control-Allow-Origin", origin);
-      res.header("Access-Control-Allow-Credentials", "true");
-      res.header(
-        "Access-Control-Allow-Methods",
-        "GET, POST, PUT, DELETE, OPTIONS, PATCH"
-      );
-      res.header(
-        "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-User-Id, Origin, Accept"
-      );
-
-      // Log that we're setting headers
-      logger.info(`Explicitly setting CORS headers for origin: ${origin}`);
-    }
+  // If we're behind Railway's proxy and the origin header is missing,
+  // but we can reconstruct it from other headers, do so
+  if (!req.headers.origin && railwayOrigin && railwayProto) {
+    const reconstructedOrigin = `${railwayProto}://${railwayOrigin}`;
+    logger.info(`Reconstructing missing origin header: ${reconstructedOrigin}`);
+    req.headers.origin = reconstructedOrigin;
   }
 
   next();
 });
+
+// Security and performance middleware
+app.use(helmet());
+app.use(compression());
 
 // Parse JSON bodies with raw body access for webhooks
 app.use(
@@ -284,11 +194,17 @@ app.get("/api/cors-test", (req: Request, res: Response) => {
     },
     corsConfig: {
       allowedOrigins: validCorsOrigins,
-      methods: corsOptions.methods,
-      allowedHeaders: corsOptions.allowedHeaders,
-      exposedHeaders: corsOptions.exposedHeaders,
-      credentials: corsOptions.credentials,
-      maxAge: corsOptions.maxAge,
+      methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+      allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-User-Id",
+        "Origin",
+        "Accept",
+      ],
+      exposedHeaders: ["Access-Control-Allow-Origin"],
+      credentials: true,
+      maxAge: 86400,
     },
     responseHeaders: responseHeaders,
     environment: {
@@ -311,7 +227,7 @@ app.use("/api/credits", creditsRouter);
 app.use("/api/videos", videosRouter);
 
 // Error handling middleware
-app.use((err: Error, _req: Request, res: Response, _next: Function) => {
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   logger.error("Unhandled error:", {
     error: err.message,
     stack: err.stack,
