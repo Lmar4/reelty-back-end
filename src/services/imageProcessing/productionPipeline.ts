@@ -1183,7 +1183,24 @@ export class ProductionPipeline {
           }
         }
       } else if (template.toLowerCase() === "wesanderson") {
-        clips = runwayVideos.map((path, i) => ({
+        // Limit the number of clips to match the number of durations available
+        const durationsCount = Array.isArray(templateConfig.durations)
+          ? templateConfig.durations.length
+          : Object.keys(templateConfig.durations).length;
+
+        // Ensure we don't use more clips than we have durations for
+        const limitedRunwayVideos = runwayVideos.slice(0, durationsCount);
+
+        logger.info(
+          `[${jobId}] Limiting Wes Anderson clips to match durations`,
+          {
+            originalCount: runwayVideos.length,
+            durationsCount,
+            limitedCount: limitedRunwayVideos.length,
+          }
+        );
+
+        clips = limitedRunwayVideos.map((path, i) => ({
           path,
           duration: Array.isArray(templateConfig.durations)
             ? templateConfig.durations[i] || 5

@@ -1461,6 +1461,31 @@ export class VideoProcessingService {
         }
       }
 
+      // Special handling for Wes Anderson template
+      // Similar to googlezoomintro, ensure we only use as many clips as we have durations for
+      if (
+        isReelTemplate &&
+        reelTemplate.name.toLowerCase() === "wesanderson" &&
+        Array.isArray(durations)
+      ) {
+        // For Wes Anderson, we have an array of durations
+        const durationsCount = durations.length;
+
+        // If we have more clips than durations, limit them
+        if (processedClips.length > durationsCount) {
+          processedClips = processedClips.slice(0, durationsCount);
+
+          logger.info(
+            `[${jobId}] Special handling for Wes Anderson: limited to ${processedClips.length} clips`,
+            {
+              durationsCount,
+              originalClipCount: clips.length,
+              finalClipCount: processedClips.length,
+            }
+          );
+        }
+      }
+
       // The clips are already selected and ordered in productionPipeline.ts
       // Here we just need to ensure the durations are applied correctly
       sequenceClips = processedClips.map((clip, index) => {
