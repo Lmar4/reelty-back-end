@@ -9,14 +9,14 @@ async function seedUser() {
 
     // Create or update user using Prisma client
     const user = await prisma.user.upsert({
-      where: { id: "user_2uC2Psx4KWyYtFeWOuGg7FohB3t" },
+      where: { id: "user_2txphAtnvJC6BDsUE7jSd6UmD4d" },
       update: {
-        email: "antonio.correa@gmail.com",
+        email: "lucasmartinbuilding@gmail.com",
         role: "ADMIN",
       },
       create: {
-        id: "user_2uC2Psx4KWyYtFeWOuGg7FohB3t",
-        email: "antonio.correa@gmail.com",
+        id: "user_2txphAtnvJC6BDsUE7jSd6UmD4d",
+        email: "lucasmartinbuilding@gmail.com",
         firstName: null,
         lastName: null,
         password: "",

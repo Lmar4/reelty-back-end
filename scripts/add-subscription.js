@@ -10,7 +10,7 @@ async function addSubscription() {
     // Create subscription
     const subscription = await prisma.subscription.create({
       data: {
-        userId: "user_2uC2Psx4KWyYtFeWOuGg7FohB3t",
+        userId: "user_2txphAtnvJC6BDsUE7jSd6UmD4d",
         tierId: "b078709f-4cdd-4e11-8ab6-f750b69705dc", // REELTY_PRO_PLUS
         status: "ACTIVE",
         startDate: new Date(),
@@ -27,7 +27,7 @@ async function addSubscription() {
 
     // Update user with active subscription
     const updatedUser = await prisma.user.update({
-      where: { id: "user_2uC2Psx4KWyYtFeWOuGg7FohB3t" },
+      where: { id: "user_2txphAtnvJC6BDsUE7jSd6UmD4d" },
       data: {
         activeSubscriptionId: subscription.id,
       },
@@ -38,7 +38,7 @@ async function addSubscription() {
     // Create listing credit
     const listingCredit = await prisma.listingCredit.create({
       data: {
-        userId: "user_2uC2Psx4KWyYtFeWOuGg7FohB3t",
+        userId: "user_2txphAtnvJC6BDsUE7jSd6UmD4d",
         creditsRemaining: 100,
       },
     });
@@ -48,7 +48,7 @@ async function addSubscription() {
     // Create credit log
     const creditLog = await prisma.creditLog.create({
       data: {
-        userId: "user_2uC2Psx4KWyYtFeWOuGg7FohB3t",
+        userId: "user_2txphAtnvJC6BDsUE7jSd6UmD4d",
         amount: 100,
         reason: "Initial credit (REELTY_PRO_PLUS)",
       },

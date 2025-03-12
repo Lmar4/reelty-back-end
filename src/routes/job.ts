@@ -511,6 +511,108 @@ const regenerateJob: RequestHandler = async (req, res) => {
   }
 };
 
+// Get job progress
+const getJobProgress: RequestHandler = async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const job = await prisma.videoJob.findUnique({
+      where: {
+        id: jobId,
+        userId: req.user!.id,
+      },
+    });
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: "Job not found",
+      });
+    }
+
+    // Determine stage based on status
+    let stage: "runway" | "template" | "upload" | "vision" = "runway";
+    switch (job.status) {
+      case VideoGenerationStatus.PENDING:
+        stage = "runway";
+        break;
+      case VideoGenerationStatus.PROCESSING:
+        stage = "template";
+        break;
+      case VideoGenerationStatus.COMPLETED:
+        stage = "upload";
+        break;
+      case VideoGenerationStatus.FAILED:
+        stage = "vision";
+        break;
+    }
+
+    // Determine message based on status
+    let message = "Processing your video";
+    switch (job.status) {
+      case VideoGenerationStatus.PENDING:
+        message = "Preparing to process your video";
+        break;
+      case VideoGenerationStatus.PROCESSING:
+        message = "Creating your video";
+        break;
+      case VideoGenerationStatus.COMPLETED:
+        message = "Video processing complete";
+        break;
+      case VideoGenerationStatus.FAILED:
+        message = "There was an issue processing your video";
+        break;
+    }
+
+    // Calculate progress based on status
+    let progress = 0;
+    switch (job.status) {
+      case VideoGenerationStatus.PENDING:
+        progress = 10;
+        break;
+      case VideoGenerationStatus.PROCESSING:
+        progress = 50;
+        break;
+      case VideoGenerationStatus.COMPLETED:
+        progress = 100;
+        break;
+      case VideoGenerationStatus.FAILED:
+        progress = 0;
+        break;
+    }
+
+    // If there's metadata with more specific progress info, use that
+    if (job.metadata && typeof job.metadata === "object") {
+      const metadata = job.metadata as any;
+      if (metadata.progress !== undefined) {
+        progress = metadata.progress;
+      }
+      if (metadata.stage) {
+        stage = metadata.stage as any;
+      }
+      if (metadata.userMessage) {
+        message = metadata.userMessage;
+      }
+    }
+
+    return res.json({
+      stage,
+      progress,
+      message,
+      error:
+        job.status === VideoGenerationStatus.FAILED
+          ? job.error || "Unknown error"
+          : undefined,
+    });
+  } catch (error) {
+    console.error("[JOB_PROGRESS_ERROR]", error);
+    return res.status(500).json({
+      success: false,
+      error:
+        error instanceof Error ? error.message : "Failed to fetch job progress",
+    });
+  }
+};
+
 // Route handlers
 router.get("/", isAuthenticated, getAllJobs);
 router.post("/", isAuthenticated, validateRequest(createJobSchema), createJob);
@@ -523,5 +625,6 @@ router.patch(
 );
 router.delete("/:jobId", isAuthenticated, deleteJob);
 router.post("/:jobId/regenerate", isAuthenticated, regenerateJob);
+router.get("/:jobId/progress", isAuthenticated, getJobProgress);
 
 export default router;
