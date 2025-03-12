@@ -3,6 +3,8 @@ import express, { RequestHandler } from "express";
 import { z } from "zod";
 import { isAdmin as requireAdmin } from "../../middleware/auth.js";
 import { validateRequest } from "../../middleware/validate.js";
+import { logger } from "../../utils/logger.js";
+import { clerkClient } from "@clerk/express";
 
 const router = express.Router();
 const prisma = new PrismaClient();
@@ -216,6 +218,153 @@ const updateUserStatus: RequestHandler = async (req, res) => {
   }
 };
 
+// Sync users from Clerk
+const syncUsersFromClerk: RequestHandler = async (req, res) => {
+  try {
+    logger.info("[SYNC_USERS] Starting user sync process");
+
+    // Get the total number of users to determine pagination
+    const userCount = await clerkClient.users.getCount();
+    logger.info(`[SYNC_USERS] Total users in Clerk: ${userCount}`);
+
+    // Define batch size for processing
+    const batchSize = 100;
+    const totalBatches = Math.ceil(userCount / batchSize);
+
+    let syncedCount = 0;
+    let failedCount = 0;
+    const failedUsers: string[] = [];
+
+    // Process users in batches to avoid memory issues
+    for (let batch = 0; batch < totalBatches; batch++) {
+      logger.info(`[SYNC_USERS] Processing batch ${batch + 1}/${totalBatches}`);
+
+      // Fetch users for this batch
+      const usersResponse = await clerkClient.users.getUserList({
+        limit: batchSize,
+        offset: batch * batchSize,
+      });
+
+      // Process each user in the batch
+      for (const user of usersResponse.data) {
+        try {
+          // Get the primary email
+          const primaryEmailObj =
+            user.emailAddresses.find(
+              (email: any) => email.id === user.primaryEmailAddressId
+            ) || user.emailAddresses[0];
+
+          const email = primaryEmailObj?.emailAddress;
+
+          if (!email) {
+            logger.warn(
+              `[SYNC_USERS] User ${user.id} has no email address, skipping`
+            );
+            failedCount++;
+            failedUsers.push(user.id);
+            continue;
+          }
+
+          // Check if the user already exists
+          const existingUser = await prisma.user.findUnique({
+            where: { id: user.id },
+          });
+
+          if (existingUser) {
+            // Update the user
+            await prisma.user.update({
+              where: { id: user.id },
+              data: {
+                email,
+                firstName: user.firstName || null,
+                lastName: user.lastName || null,
+              },
+            });
+          } else {
+            // Create the user with a transaction
+            await prisma.$transaction(async (tx) => {
+              // Create the user
+              const newUser = await tx.user.create({
+                data: {
+                  id: user.id,
+                  email: email,
+                  firstName: user.firstName || null,
+                  lastName: user.lastName || null,
+                  password: "",
+                  role: "USER",
+                  subscriptions: {
+                    create: {
+                      tierId: "FREE",
+                      status: "TRIALING",
+                    },
+                  },
+                },
+                include: {
+                  subscriptions: true,
+                },
+              });
+
+              // Set the active subscription reference
+              if (newUser.subscriptions && newUser.subscriptions.length > 0) {
+                const subscription = newUser.subscriptions[0];
+                await tx.user.update({
+                  where: { id: newUser.id },
+                  data: {
+                    activeSubscriptionId: subscription.id,
+                  },
+                });
+              }
+
+              // Create initial listing credit for new user
+              await tx.listingCredit.create({
+                data: {
+                  userId: newUser.id,
+                  creditsRemaining: 1,
+                },
+              });
+
+              // Log the credit creation
+              await tx.creditLog.create({
+                data: {
+                  userId: newUser.id,
+                  amount: 1,
+                  reason: "Initial trial credit (FREE)",
+                },
+              });
+            });
+          }
+
+          syncedCount++;
+        } catch (error) {
+          logger.error(`[SYNC_USERS] Error syncing user ${user.id}:`, error);
+          failedCount++;
+          failedUsers.push(user.id);
+        }
+      }
+    }
+
+    logger.info(
+      `[SYNC_USERS] Sync completed. Synced: ${syncedCount}, Failed: ${failedCount}`
+    );
+
+    res.json({
+      success: true,
+      data: {
+        totalUsers: userCount,
+        syncedUsers: syncedCount,
+        failedUsers: failedCount,
+        failedUserIds: failedUsers,
+      },
+    });
+  } catch (error) {
+    logger.error("[SYNC_USERS_ERROR]", error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : "Internal server error",
+    });
+  }
+};
+
 // Apply admin middleware to all routes
 router.use(requireAdmin);
 
@@ -231,5 +380,6 @@ router.patch(
   validateRequest(statusUpdateSchema),
   updateUserStatus
 );
+router.post("/sync", syncUsersFromClerk);
 
 export default router;
