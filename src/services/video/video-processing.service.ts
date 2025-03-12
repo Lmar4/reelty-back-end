@@ -1391,15 +1391,20 @@ export class VideoProcessingService {
         maxClips = Math.min(durations.length, processedClips.length);
       } else if (durations && typeof durations === "object") {
         // Handle object-based durations (e.g., googlezoomintro)
-        const durationValues = Object.keys(durations)
-          .filter((key) => key !== "map") // Exclude 'map' for now, handle separately
-          .map((key) => durations[key as keyof typeof durations]);
-        targetDuration =
-          durationValues.reduce((sum, d) => sum + d, 0) + (durations.map || 0);
+        const durationValues = Object.values(durations);
+        targetDuration = durationValues.reduce((sum, d) => sum + Number(d), 0);
         maxClips = Math.min(
-          durationValues.length + (durations.map ? 1 : 0),
+          Object.keys(durations).length,
           processedClips.length
         );
+
+        // Log the durations object and calculated values for debugging
+        logger.debug(`[${jobId}] Object-based durations`, {
+          durationKeys: Object.keys(durations),
+          durationValues,
+          targetDuration,
+          maxClips,
+        });
       }
 
       // Mejorar el logging para mostrar más información sobre la secuencia y los clips disponibles
@@ -1410,6 +1415,51 @@ export class VideoProcessingService {
         targetDuration,
         sequence: reelTemplate.sequence.slice(0, 20).join(","), // Mostrar parte de la secuencia para depuración
       });
+
+      // Limit processedClips to maxClips to ensure we only use clips with defined durations
+      // This is the key fix for all templates - ensure we only use as many clips as we have durations for
+      if (isReelTemplate && processedClips.length > maxClips) {
+        logger.info(`[${jobId}] Limiting clips to match duration count`, {
+          originalCount: processedClips.length,
+          limitedCount: maxClips,
+        });
+        processedClips = processedClips.slice(0, maxClips);
+      }
+
+      // Special handling for googlezoomintro template
+      // This ensures we only use the exact number of clips that have durations defined
+      if (
+        isReelTemplate &&
+        reelTemplate.name.toLowerCase().includes("googlezoomintro")
+      ) {
+        const durationKeys = Object.keys(durations as Record<string, number>);
+        const numericKeys = durationKeys.filter(
+          (key) => key !== "map" && !isNaN(Number(key))
+        );
+        const numericKeysCount = numericKeys.length;
+
+        // If we have more clips than numeric keys in durations, limit them
+        if (processedClips.length > numericKeysCount + 1) {
+          // +1 for map
+          const mapClip = processedClips.find((clip) => clip.isMapVideo);
+          const nonMapClips = processedClips
+            .filter((clip) => !clip.isMapVideo)
+            .slice(0, numericKeysCount);
+
+          // Reconstruct the clips array with map first (if exists) followed by limited non-map clips
+          processedClips = mapClip ? [mapClip, ...nonMapClips] : nonMapClips;
+
+          logger.info(
+            `[${jobId}] Special handling for googlezoomintro: limited to ${processedClips.length} clips`,
+            {
+              numericDurationKeys: numericKeys,
+              numericKeysCount,
+              hasMapClip: !!mapClip,
+              finalClipCount: processedClips.length,
+            }
+          );
+        }
+      }
 
       // The clips are already selected and ordered in productionPipeline.ts
       // Here we just need to ensure the durations are applied correctly
