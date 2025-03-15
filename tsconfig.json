@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2020", // Set to a modern ECMAScript version
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2020"], // Include the necessary library features
+    "outDir": "./build", // Output directory for compiled files
+    "preserveConstEnums": true,
+    "rootDir": "./",
+    "strict": true, // Enable all strict type-checking options
+    "esModuleInterop": true, // Enable interoperability between CommonJS and ES modules
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true, // Ensure consistent casing in file names
+    "skipLibCheck": true, // Skip type checking of declaration files
+    "resolveJsonModule": true, // Allow importing JSON files
+    "types": ["node"], // Include type definitions for Node.js
+    "typeRoots": ["./node_modules/@types", "./src/types"]
+  },
+  "include": ["src/**/*", "scripts/**/*", "prisma/**/*"],
+  "exclude": ["node_modules", "build"]
+}

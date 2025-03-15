@@ -1,0 +1,120 @@
+# Node.js dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Build output
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# IDE and editor specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Prisma files
+prisma/migrations/
+prisma/dev.db
+prisma/dev.db-journal
+
+# Coverage reports
+coverage/
+*.lcov
+
+# TypeScript cache
+*.tsbuildinfo
+.tscache/
+
+# Miscellaneous
+*.tgz
+*.zip
+
+.cursorrules
+.aider*
+
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+.windsurfrules
+.cursor/*
+
+default_output
+
+/output
+/temp
+/temp/*
+/temp/**/*
+/assets
+*.mp4
+
+# Build artifacts
+/dist
+/build
+/.build
+
+# Dependencies
+/node_modules
+/.pnpm-store
+
+# Environment files
+.env.*
+!.env.example
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated Prisma files
+/prisma/generated/
+/prisma/client/
+
+# AWS credentials
+.aws/
+
+# Debug files
+*.debug
+debug/
+
+# Test coverage
+/coverage
+
+# Sharp cache
+.sharp.cache/
+
+# Puppeteer cache
+.cache/puppeteer/
+
+# Output files
+default_output/
+default_output/**/*.mp4
+*.mp4
+
+.aider.chat.history.md
+.aider.input.history

@@ -1,0 +1,870 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                         String                @id
+  email                      String                @unique
+  firstName                  String?
+  lastName                   String?
+  password                   String
+  role                       UserRole              @default(USER)
+  lastLoginAt                DateTime?
+  createdAt                  DateTime              @default(now())
+  updatedAt                  DateTime              @updatedAt
+  deletedAt                  DateTime?             @map("deleted_at")
+  notificationProductUpdates Boolean               @default(true) @map("notification_product_updates")
+  notificationReelsReady     Boolean               @default(true) @map("notification_reels_ready")
+  activeSubscriptionId       String?               @unique @map("active_subscription_id") @db.Uuid
+  agencyId                   String?               @map("agency_id")
+  agencyName                 String?               @map("agency_name")
+  timeZone                   String?               @map("time_zone")
+  adminActions               AdminAction[]         @relation("AdminActions")
+  targetedAdminActions       AdminAction[]         @relation("TargetUserActions")
+  agencyInvitations          AgencyInvitation[]
+  ownedAgencies              AgencyMembership[]    @relation("AgencyOwner")
+  agencyMemberships          AgencyMembership[]    @relation("AgencyMember")
+  adminCreditLogs            CreditLog[]           @relation("AdminCreditLogs")
+  userCreditLogs             CreditLog[]           @relation("UserCreditLogs")
+  errorLogs                  ErrorLog[]
+  listingCredits             ListingCredit[]
+  listings                   Listing[]
+  photos                     Photo[]
+  searchHistory              SearchHistory[]
+  subscriptionHistory        SubscriptionHistory[]
+  subscriptionLogs           SubscriptionLog[]
+  subscriptions              Subscription[]        @relation("UserSubscriptions")
+  tempUploads                TempUpload[]
+  adminTierChanges           TierChange[]          @relation("AdminTierChanges")
+  userTierChanges            TierChange[]          @relation("UserTierChanges")
+  consentHistory             UserConsent[]
+  activeSubscription         Subscription?         @relation("UserActiveSubscription", fields: [activeSubscriptionId], references: [id])
+  agency                     User?                 @relation("AgencyUsers", fields: [agencyId], references: [id])
+  agencyUsers                User[]                @relation("AgencyUsers")
+  videoDownloads             VideoDownload[]
+  agencyVideoJobs            VideoGenerationJob[]  @relation("AgencyUsers")
+  videoGenerationJobs        VideoGenerationJob[]  @relation("UserVideoJobs")
+  videoJobs                  VideoJob[]
+  bulkDiscounts              BulkDiscount[]        @relation("BulkDiscountToUser")
+  subscriptionTiers          SubscriptionTier[]    @relation("SubscriptionTierToUser")
+
+  @@index([agencyId])
+  @@index([email])
+  @@index([role])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model Subscription {
+  id                       String                 @id @default(uuid()) @db.Uuid
+  userId                   String                 @map("user_id")
+  tierId                   String                 @map("tier_id") @db.Uuid
+  status                   SubscriptionStatus     @default(ACTIVE)
+  stripeCustomerId         String?                @map("stripe_customer_id")
+  stripeSubscriptionId     String?                @map("stripe_subscription_id")
+  stripePriceId            String?                @map("stripe_price_id")
+  customPriceCents         Int?                   @map("custom_price_cents")
+  isGrandfathered          Boolean                @default(false) @map("is_grandfathered")
+  customFeatures           Json?                  @default("{}") @map("custom_features")
+  customMaxListings        Int?                   @map("custom_max_listings")
+  customMaxDownloads       Int?                   @map("custom_max_downloads")
+  customWatermarkUrl       String?                @map("custom_watermark_url")
+  startDate                DateTime               @default(now()) @map("start_date")
+  startDateUtc             DateTime               @default(now()) @map("start_date_utc")
+  currentPeriodEnd         DateTime?              @map("current_period_end")
+  currentPeriodEndUtc      DateTime?              @map("current_period_end_utc")
+  canceledAt               DateTime?              @map("canceled_at")
+  pausedAt                 DateTime?              @map("paused_at")
+  scheduledResumeAt        DateTime?              @map("scheduled_resume_at")
+  deletedAt                DateTime?              @map("deleted_at")
+  isTrialPeriod            Boolean                @default(false) @map("is_trial_period")
+  trialStartDate           DateTime?              @map("trial_start_date")
+  trialEndDate             DateTime?              @map("trial_end_date")
+  convertedFromTrial       Boolean                @default(false) @map("converted_from_trial")
+  creditsBalance           Int                    @default(0) @map("credits_balance")
+  creditsPerPeriod         Int                    @default(0) @map("credits_per_period")
+  isAgencySubscription     Boolean                @default(false) @map("is_agency_subscription")
+  seatsAllocated           Int                    @default(1) @map("seats_allocated")
+  seatsUsed                Int                    @default(0) @map("seats_used")
+  isBetaTester             Boolean                @default(false) @map("is_beta_tester")
+  replacedBySubscriptionId String?                @map("replaced_by_subscription_id") @db.Uuid
+  replacedSubscriptionId   String?                @map("replaced_subscription_id") @db.Uuid
+  changeReason             String?                @map("change_reason")
+  hasWatermark             Boolean?               @map("has_watermark")
+  premiumTemplatesEnabled  Boolean?               @map("premium_templates_enabled")
+  version                  Int                    @default(0) @map("version")
+  lastModifiedBy           String?                @map("last_modified_by")
+  lastModifiedReason       String?                @map("last_modified_reason")
+  creditOperationLock      String?                @map("credit_operation_lock")
+  creditLockExpiresAt      DateTime?              @map("credit_lock_expires_at")
+  lastWebhookId            String?                @map("last_webhook_id")
+  lastWebhookType          String?                @map("last_webhook_type")
+  lastWebhookTimestamp     DateTime?              @map("last_webhook_timestamp")
+  resourceTransferDetails  Json?                  @default("{}") @map("resource_transfer_details")
+  isCorrective             Boolean                @default(false) @map("is_corrective")
+  priority                 Int                    @default(0) @map("priority")
+  timeZone                 String?                @map("time_zone")
+  createdAt                DateTime               @default(now()) @map("created_at")
+  updatedAt                DateTime               @updatedAt @map("updated_at")
+  billingRecords           BillingRecord[]
+  creditTransactions       CreditTransaction[]
+  resourceAllocations      ResourceAllocation[]
+  overrides                SubscriptionOverride[]
+  tier                     SubscriptionTier       @relation(fields: [tierId], references: [id])
+  user                     User                   @relation("UserSubscriptions", fields: [userId], references: [id])
+  usageRecords             UsageRecord[]
+  activeForUser            User?                  @relation("UserActiveSubscription")
+
+  @@index([userId])
+  @@index([tierId])
+  @@index([status])
+  @@index([deletedAt])
+  @@index([stripeSubscriptionId])
+  @@index([status, currentPeriodEnd])
+  @@index([userId, status])
+  @@index([customFeatures], type: Gin)
+  @@map("subscriptions")
+}
+
+model SubscriptionTier {
+  id                      String                @id @default(uuid()) @db.Uuid
+  name                    String                @unique
+  description             String
+  tierId                  SubscriptionTierId    @unique
+  stripePriceId           String                @unique @map("stripe_price_id")
+  stripeProductId         String                @unique @map("stripe_product_id")
+  monthlyPriceCents       Int                   @map("monthly_price_cents")
+  planType                PlanType              @default(PAY_AS_YOU_GO) @map("plan_type")
+  creditsPerInterval      Int                   @default(0) @map("credits_per_interval")
+  maxActiveListings       Int                   @default(1) @map("max_active_listings")
+  maxPhotosPerListing     Int                   @default(20) @map("max_photos_per_listing")
+  maxReelDownloads        Int?                  @map("max_reel_downloads")
+  hasWatermark            Boolean               @default(true) @map("has_watermark")
+  premiumTemplatesEnabled Boolean               @default(false) @map("premium_templates_enabled")
+  features                Json                  @default("[]")
+  metadata                Json?                 @default("{}")
+  createdAt               DateTime              @default(now()) @map("created_at")
+  updatedAt               DateTime              @updatedAt @map("updated_at")
+  assets                  Asset[]
+  subscriptionHistory     SubscriptionHistory[]
+  subscriptions           Subscription[]
+  users                   User[]                @relation("SubscriptionTierToUser")
+  templates               Template[]            @relation("TemplateToSubscriptionTier")
+
+  @@map("subscription_tiers")
+}
+
+model Template {
+  id                String             @id @default(cuid())
+  key               String
+  name              String
+  description       String
+  tiers             String[]
+  order             Int                @default(0)
+  thumbnailUrl      String?            @map("thumbnail_url")
+  sequence          Json
+  durations         Json
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  subscriptionTiers SubscriptionTier[] @relation("TemplateToSubscriptionTier")
+
+  @@map("templates")
+}
+
+model CreditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id")
+  amount    Int
+  reason    String
+  adminId   String?  @map("admin_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  admin     User?    @relation("AdminCreditLogs", fields: [adminId], references: [id])
+  user      User     @relation("UserCreditLogs", fields: [userId], references: [id])
+
+  @@map("credit_logs")
+}
+
+model TierChange {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id")
+  oldTier   String   @map("old_tier") @db.Uuid
+  newTier   String   @map("new_tier") @db.Uuid
+  reason    String
+  adminId   String?  @map("admin_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  admin     User?    @relation("AdminTierChanges", fields: [adminId], references: [id])
+  user      User     @relation("UserTierChanges", fields: [userId], references: [id])
+
+  @@map("tier_changes")
+}
+
+model Asset {
+  id                 String           @id @default(uuid()) @db.Uuid
+  name               String
+  description        String?
+  filePath           String           @map("file_path")
+  type               AssetType
+  subscriptionTierId String           @map("subscription_tier") @db.Uuid
+  isActive           Boolean          @default(true) @map("is_active")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  updatedAt          DateTime         @updatedAt @map("updated_at")
+  isDefault          Boolean          @default(false) @map("is_default")
+  subscriptionTier   SubscriptionTier @relation(fields: [subscriptionTierId], references: [id])
+
+  @@index([type, subscriptionTierId])
+  @@map("assets")
+}
+
+model ListingCredit {
+  id               String   @id @default(uuid()) @db.Uuid
+  userId           String   @map("user_id")
+  creditsRemaining Int      @map("credits_remaining")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+  user             User     @relation(fields: [userId], references: [id])
+
+  @@map("listing_credits")
+}
+
+model Listing {
+  id          String     @id @default(uuid()) @db.Uuid
+  userId      String     @map("user_id")
+  address     String
+  description String?
+  status      String
+  photoLimit  Int        @default(10) @map("photo_limit")
+  createdAt   DateTime   @default(now()) @map("created_at")
+  updatedAt   DateTime   @updatedAt @map("updated_at")
+  coordinates Json?      @default("{}")
+  metadata    Json?      @default("{}")
+  user        User       @relation(fields: [userId], references: [id])
+  photos      Photo[]
+  videoJobs   VideoJob[]
+
+  @@map("listings")
+}
+
+model Photo {
+  id                String   @id @default(cuid())
+  userId            String   @map("user_id")
+  listingId         String   @map("listing_id") @db.Uuid
+  filePath          String   @map("file_path")
+  order             Int      @default(0)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+  processedFilePath String?  @map("processed_file_path")
+  error             String?
+  runwayVideoPath   String?  @map("runway_video_path")
+  status            String   @default("pending")
+  metadata          Json?    @default("{}")
+  s3Key             String   @map("s3_key")
+  listing           Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  user              User     @relation(fields: [userId], references: [id])
+
+  @@unique([listingId, order])
+  @@map("photos")
+}
+
+model VideoJob {
+  id           String                @id @default(uuid()) @db.Uuid
+  userId       String                @map("user_id")
+  listingId    String                @map("listing_id") @db.Uuid
+  template     String?
+  inputFiles   Json?                 @map("input_files")
+  outputFile   String?               @map("output_file")
+  error        String?
+  createdAt    DateTime              @default(now()) @map("created_at")
+  updatedAt    DateTime              @updatedAt @map("updated_at")
+  progress     Float                 @default(0) @map("progress")
+  completedAt  DateTime?             @map("completed_at")
+  position     Int                   @default(0)
+  status       VideoGenerationStatus @default(PENDING)
+  metadata     Json?                 @map("metadata")
+  priority     Int                   @default(1)
+  startedAt    DateTime?             @map("started_at")
+  thumbnailUrl String?               @map("thumbnail_url")
+  downloads    VideoDownload[]
+  listing      Listing               @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  user         User                  @relation(fields: [userId], references: [id])
+
+  @@index([status, position])
+  @@map("video_jobs")
+}
+
+model VideoDownload {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id")
+  jobId       String   @map("job_id") @db.Uuid
+  templateKey String   @map("template_key")
+  createdAt   DateTime @default(now()) @map("created_at")
+  job         VideoJob @relation(fields: [jobId], references: [id])
+  user        User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([jobId])
+  @@map("video_downloads")
+}
+
+model SearchHistory {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id")
+  query     String
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@map("search_history")
+}
+
+model ErrorLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String?  @map("user_id")
+  error     String
+  stack     String?
+  createdAt DateTime @default(now()) @map("created_at")
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@map("error_logs")
+}
+
+model TempUpload {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id")
+  address   String?
+  files     Json     @default("[]")
+  createdAt DateTime @default(now()) @map("created_at")
+  expiresAt DateTime @map("expires_at")
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@map("temp_uploads")
+}
+
+model SubscriptionLog {
+  id                   String    @id @default(uuid()) @db.Uuid
+  userId               String
+  action               String
+  stripeSubscriptionId String
+  stripePriceId        String?
+  stripeProductId      String?
+  status               String
+  periodEnd            DateTime?
+  createdAt            DateTime  @default(now())
+  user                 User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("subscription_logs")
+}
+
+model BulkDiscount {
+  id              String    @id @default(uuid()) @db.Uuid
+  name            String
+  description     String
+  discountPercent Float
+  maxUsers        Int
+  currentUsers    Int       @default(0)
+  isActive        Boolean   @default(true)
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  users           User[]    @relation("BulkDiscountToUser")
+
+  @@map("bulk_discounts")
+}
+
+model SubscriptionHistory {
+  id        String             @id @default(uuid()) @db.Uuid
+  userId    String
+  status    SubscriptionStatus
+  tierId    String             @db.Uuid
+  startDate DateTime
+  endDate   DateTime?
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+  tier      SubscriptionTier   @relation(fields: [tierId], references: [id])
+  user      User               @relation(fields: [userId], references: [id])
+
+  @@map("subscription_history")
+}
+
+model ProcessedAsset {
+  id        String   @id @default(cuid())
+  type      String
+  path      String
+  hash      String
+  settings  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  cacheKey  String   @unique
+  metadata  Json?
+
+  @@index([type])
+  @@index([cacheKey])
+  @@index([hash])
+}
+
+model VideoGenerationJob {
+  id          String                @id @default(uuid())
+  userId      String
+  agencyId    String?
+  inputFiles  Json
+  template    String
+  status      VideoGenerationStatus @default(PENDING)
+  position    Int
+  priority    Int                   @default(1)
+  error       String?
+  result      String?
+  createdAt   DateTime              @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+  agency      User?                 @relation("AgencyUsers", fields: [agencyId], references: [id])
+  user        User                  @relation("UserVideoJobs", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("video_generation_jobs")
+}
+
+model CachedAsset {
+  id        String   @id @default(cuid())
+  type      String
+  path      String
+  cacheKey  String   @unique
+  metadata  Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([type])
+  @@index([cacheKey])
+}
+
+model CacheLock {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  owner     String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([key])
+  @@index([expiresAt])
+}
+
+model ListingLock {
+  id        String   @id @default(cuid())
+  listingId String   @unique @db.Uuid
+  jobId     String   @db.Uuid
+  processId String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([listingId])
+  @@index([expiresAt])
+  @@map("listing_locks")
+}
+
+model AgencyMembership {
+  id                      String                 @id @default(uuid()) @db.Uuid
+  agencyId                String                 @map("agency_id")
+  userId                  String                 @map("user_id")
+  role                    AgencyRole             @default(MEMBER)
+  status                  MembershipStatus       @default(ACTIVE)
+  isLastOwner             Boolean                @default(false) @map("is_last_owner")
+  canManageCredits        Boolean                @default(false) @map("can_manage_credits")
+  canInviteMembers        Boolean                @default(false) @map("can_invite_members")
+  accessibleResourceTypes String[]               @default([]) @map("accessible_resource_types")
+  departureHandled        Boolean                @default(false) @map("departure_handled")
+  departureNotes          String?                @map("departure_notes")
+  creditAllocation        Int                    @default(0) @map("credit_allocation")
+  resourceAllocations     Json?                  @default("{}") @map("resource_allocations")
+  joinedAt                DateTime               @default(now()) @map("joined_at")
+  leftAt                  DateTime?              @map("left_at")
+  updatedAt               DateTime               @updatedAt @map("updated_at")
+  creditTransfers         AgencyCreditTransfer[] @relation("SourceMembership")
+  creditReceived          AgencyCreditTransfer[] @relation("TargetMembership")
+  agency                  User                   @relation("AgencyOwner", fields: [agencyId], references: [id])
+  user                    User                   @relation("AgencyMember", fields: [userId], references: [id])
+  roleHistory             AgencyRoleHistory[]
+
+  @@unique([agencyId, userId])
+  @@index([agencyId])
+  @@index([userId])
+  @@index([status])
+  @@map("agency_memberships")
+}
+
+model AgencyInvitation {
+  id        String           @id @default(uuid()) @db.Uuid
+  agencyId  String           @map("agency_id")
+  email     String
+  token     String           @unique
+  role      AgencyRole       @default(MEMBER)
+  status    InvitationStatus @default(PENDING)
+  expiresAt DateTime         @map("expires_at")
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+  agency    User             @relation(fields: [agencyId], references: [id])
+
+  @@index([agencyId])
+  @@index([token])
+  @@index([email])
+  @@index([status])
+  @@map("agency_invitations")
+}
+
+model AgencyCreditTransfer {
+  id                 String           @id @default(uuid()) @db.Uuid
+  sourceMembershipId String           @map("source_membership_id") @db.Uuid
+  targetMembershipId String           @map("target_membership_id") @db.Uuid
+  amount             Int
+  reason             String
+  initiatedById      String           @map("initiated_by_id")
+  createdAt          DateTime         @default(now()) @map("created_at")
+  sourceMembership   AgencyMembership @relation("SourceMembership", fields: [sourceMembershipId], references: [id])
+  targetMembership   AgencyMembership @relation("TargetMembership", fields: [targetMembershipId], references: [id])
+
+  @@index([sourceMembershipId])
+  @@index([targetMembershipId])
+  @@map("agency_credit_transfers")
+}
+
+model AgencyRoleHistory {
+  id           String           @id @default(uuid()) @db.Uuid
+  membershipId String           @map("membership_id") @db.Uuid
+  previousRole AgencyRole       @map("previous_role")
+  newRole      AgencyRole       @map("new_role")
+  changedById  String           @map("changed_by_id")
+  reason       String?
+  createdAt    DateTime         @default(now()) @map("created_at")
+  membership   AgencyMembership @relation(fields: [membershipId], references: [id])
+
+  @@index([membershipId])
+  @@map("agency_role_history")
+}
+
+model AgencyActivityLog {
+  id            String   @id @default(uuid()) @db.Uuid
+  agencyId      String   @map("agency_id")
+  activityType  String   @map("activity_type")
+  performedById String   @map("performed_by_id")
+  targetId      String?  @map("target_id")
+  details       Json     @default("{}")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@index([agencyId, activityType])
+  @@index([performedById])
+  @@map("agency_activity_logs")
+}
+
+model AdminAction {
+  id           String          @id @default(uuid()) @db.Uuid
+  adminId      String          @map("admin_id")
+  targetUserId String?         @map("target_user_id")
+  actionType   AdminActionType @map("action_type")
+  details      Json
+  createdAt    DateTime        @default(now()) @map("created_at")
+  admin        User            @relation("AdminActions", fields: [adminId], references: [id])
+  targetUser   User?           @relation("TargetUserActions", fields: [targetUserId], references: [id])
+
+  @@index([adminId])
+  @@index([targetUserId])
+  @@index([actionType])
+  @@map("admin_actions")
+}
+
+model UserConsent {
+  id             String   @id @default(uuid()) @db.Uuid
+  userId         String   @map("user_id")
+  consentType    String   @map("consent_type")
+  consentVersion String   @map("consent_version")
+  consentGiven   Boolean
+  ipAddress      String?  @map("ip_address")
+  userAgent      String?  @map("user_agent")
+  createdAt      DateTime @default(now()) @map("created_at")
+  user           User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@map("user_consents")
+}
+
+model CreditTransaction {
+  id                    String              @id @default(uuid()) @db.Uuid
+  subscriptionId        String              @map("subscription_id") @db.Uuid
+  amount                Int
+  balanceAfter          Int                 @map("balance_after")
+  source                CreditSource        @default(REGULAR)
+  reason                String
+  transactionReference  String?             @unique @map("transaction_reference")
+  expiresAt             DateTime?           @map("expires_at")
+  expiredAmount         Int?                @map("expired_amount")
+  adminId               String?             @map("admin_id")
+  resourceType          ResourceType?       @map("resource_type")
+  resourceId            String?             @map("resource_id")
+  isAdjustment          Boolean             @default(false) @map("is_adjustment")
+  adjustmentType        AdjustmentType?     @map("adjustment_type")
+  originalTransactionId String?             @map("original_transaction_id") @db.Uuid
+  isFinalized           Boolean             @default(true) @map("is_finalized")
+  version               Int                 @default(0)
+  metadata              Json?               @default("{}")
+  createdAt             DateTime            @default(now()) @map("created_at")
+  originalTransaction   CreditTransaction?  @relation("AdjustmentHistory", fields: [originalTransactionId], references: [id])
+  adjustments           CreditTransaction[] @relation("AdjustmentHistory")
+  subscription          Subscription        @relation(fields: [subscriptionId], references: [id])
+
+  @@index([subscriptionId])
+  @@index([source])
+  @@index([expiresAt])
+  @@index([isAdjustment])
+  @@index([originalTransactionId])
+  @@index([expiresAt, isFinalized])
+  @@map("credit_transactions")
+}
+
+model ResourceAllocation {
+  id                   String         @id @default(uuid()) @db.Uuid
+  subscriptionId       String         @map("subscription_id") @db.Uuid
+  allocationType       AllocationType @map("allocation_type")
+  resourceType         ResourceType   @map("resource_type")
+  totalAllocated       Int            @map("total_allocated")
+  remaining            Int            @map("remaining")
+  periodStart          DateTime       @map("period_start")
+  periodEnd            DateTime       @map("period_end")
+  periodStartUtc       DateTime       @map("period_start_utc")
+  periodEndUtc         DateTime       @map("period_end_utc")
+  allowRollover        Boolean        @default(false) @map("allow_rollover")
+  rolledOverAmount     Int            @default(0) @map("rolled_over_amount")
+  maxRolloverAmount    Int?           @map("max_rollover_amount")
+  processingLock       String?        @map("processing_lock")
+  processingLockExpiry DateTime?      @map("processing_lock_expiry")
+  createdAt            DateTime       @default(now()) @map("created_at")
+  updatedAt            DateTime       @updatedAt @map("updated_at")
+  subscription         Subscription   @relation(fields: [subscriptionId], references: [id])
+
+  @@unique([subscriptionId, resourceType, periodStart, periodEnd])
+  @@index([subscriptionId])
+  @@index([resourceType])
+  @@index([periodEnd])
+  @@index([subscriptionId, resourceType, remaining])
+  @@index([periodEnd, allowRollover])
+  @@map("resource_allocations")
+}
+
+model UsageRecord {
+  id                String       @id @default(uuid()) @db.Uuid
+  subscriptionId    String       @map("subscription_id") @db.Uuid
+  billingCycleId    String       @map("billing_cycle_id") @db.Uuid
+  resourceType      ResourceType @map("resource_type")
+  quantity          Int
+  isBilled          Boolean      @default(false) @map("is_billed")
+  thresholdCategory String?      @map("threshold_category")
+  thresholdValue    Int?         @map("threshold_value")
+  partiallyBilled   Boolean      @default(false) @map("partially_billed")
+  billedAmount      Int          @default(0) @map("billed_amount")
+  resourceId        String?      @map("resource_id")
+  recordedAt        DateTime     @default(now()) @map("recorded_at")
+  billingCycle      BillingCycle @relation(fields: [billingCycleId], references: [id])
+  subscription      Subscription @relation(fields: [subscriptionId], references: [id])
+
+  @@index([subscriptionId])
+  @@index([billingCycleId])
+  @@index([resourceType])
+  @@index([isBilled])
+  @@map("usage_records")
+}
+
+model BillingCycle {
+  id           String        @id @default(uuid()) @db.Uuid
+  name         String        @unique
+  startDate    DateTime      @map("start_date")
+  endDate      DateTime      @map("end_date")
+  status       CycleStatus   @default(ACTIVE)
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+  usageRecords UsageRecord[]
+
+  @@index([startDate, endDate])
+  @@index([status])
+  @@map("billing_cycles")
+}
+
+model BillingRecord {
+  id              String              @id @default(uuid()) @db.Uuid
+  subscriptionId  String              @map("subscription_id") @db.Uuid
+  amountCents     Int                 @map("amount_cents")
+  currency        String              @default("USD")
+  status          BillingStatus       @default(PENDING)
+  invoiceId       String?             @map("invoice_id")
+  paymentIntentId String?             @map("payment_intent_id")
+  billingDate     DateTime            @map("billing_date")
+  paidAt          DateTime?           @map("paid_at")
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+  adjustments     BillingAdjustment[]
+  subscription    Subscription        @relation(fields: [subscriptionId], references: [id])
+
+  @@index([subscriptionId])
+  @@index([status])
+  @@index([billingDate])
+  @@map("billing_records")
+}
+
+model BillingAdjustment {
+  id              String           @id @default(uuid()) @db.Uuid
+  billingRecordId String           @map("billing_record_id") @db.Uuid
+  amountCents     Int              @map("amount_cents")
+  reason          String
+  status          AdjustmentStatus @default(PENDING)
+  adminId         String           @map("admin_id")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  billingRecord   BillingRecord    @relation(fields: [billingRecordId], references: [id])
+
+  @@index([billingRecordId])
+  @@map("billing_adjustments")
+}
+
+model SubscriptionOverride {
+  id             String       @id @default(uuid()) @db.Uuid
+  subscriptionId String       @map("subscription_id") @db.Uuid
+  overrideType   String       @map("override_type")
+  resourceType   String?      @map("resource_type")
+  value          Json
+  reason         String
+  expiresAt      DateTime?    @map("expires_at")
+  adminId        String       @map("admin_id")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @updatedAt @map("updated_at")
+  subscription   Subscription @relation(fields: [subscriptionId], references: [id])
+
+  @@index([subscriptionId])
+  @@index([expiresAt])
+  @@map("subscription_overrides")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+  AGENCY
+  AGENCY_USER
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  PAUSED
+  CANCELED
+  PAST_DUE
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  TRIALING
+  UNPAID
+  INACTIVE
+}
+
+enum AssetType {
+  MUSIC
+  WATERMARK
+  LOTTIE
+}
+
+enum VideoGenerationStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum AgencyRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum MembershipStatus {
+  ACTIVE
+  SUSPENDED
+  INACTIVE
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+}
+
+enum AdminActionType {
+  CREDIT_ADJUSTMENT
+  SUBSCRIPTION_CHANGE
+  USER_ROLE_CHANGE
+  FEATURE_TOGGLE
+  ACCOUNT_SUSPENSION
+  MANUAL_OVERRIDE
+}
+
+enum CreditSource {
+  REGULAR
+  PROMOTIONAL
+  BETA_TESTING
+  COMPENSATION
+  ADMIN_GRANT
+  REFERRAL
+  SUBSCRIPTION_CHANGE
+}
+
+enum AdjustmentType {
+  REFUND
+  CORRECTION
+  REVERSAL
+  COMPENSATION
+}
+
+enum AllocationType {
+  MONTHLY
+  QUARTERLY
+  ANNUAL
+  ONE_TIME
+}
+
+enum ResourceType {
+  LISTING
+  DOWNLOAD
+  PHOTO
+  VIDEO
+  STORAGE
+  API_CALL
+}
+
+enum CycleStatus {
+  ACTIVE
+  CLOSED
+  PROCESSING
+}
+
+enum BillingStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum AdjustmentStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+
+enum PlanType {
+  PAY_AS_YOU_GO
+  MONTHLY
+}
+
+enum SubscriptionTierId {
+  FREE            @map("550e8400-e29b-41d4-a716-446655440000")
+  REELTY          @map("550e8400-e29b-41d4-a716-446655440001")
+  REELTY_PRO      @map("550e8400-e29b-41d4-a716-446655440002")
+  REELTY_PRO_PLUS @map("550e8400-e29b-41d4-a716-446655440003")
+  LIFETIME        @map("550e8400-e29b-41d4-a716-446655440004")
+}
